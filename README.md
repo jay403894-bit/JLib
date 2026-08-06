@@ -34,7 +34,7 @@ That supplies every include directory, the library path, and all nine `.lib` nam
 | **Renderer** | DirectX 12. 2D sprite/shape batching and a 3D PBR path: three shadow caster types, SSAO, IBL, skinning, GPU particles, glTF loading. |
 | **Physics3D** | [Jolt](https://github.com/jrouwe/JoltPhysics) wrapper with a plain-types PIMPL interface — no Jolt header reaches your code. Bodies, constraints, character controller, mesh shapes, raycasts, and a 2D-locked plane mode. |
 | **PlatformerPhysics2D** | Hand-written 2D solver for tile-based platformers. Deliberately *not* a rigid-body engine: animation-driven movement with the feel hand-tuned. |
-| **Input** | Raw Input + XInput. Gamepads read over HID, so **input contributes zero threads** to your process. No SDK, no NuGet. |
+| **Input** | Raw Input + XInput. Gamepads read over HID, so **input contributes zero threads** to your process unless it falls back to xinput for merged z-axis pads. No SDK, no NuGet. |
 | **Sound** | miniaudio-backed mixing, run as demand-driven pool work rather than a dedicated audio thread. |
 | **Scene** | Minimal scene stack. |
 | **Time** | Frame timing. |
