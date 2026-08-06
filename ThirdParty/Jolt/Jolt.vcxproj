@@ -1,0 +1,73 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Jolt Physics, built from vendored source inside the umbrella solution. MIT, (c) Jorrit Rouwe -
+  see THIRD-PARTY-NOTICES.md.
+
+  There is no CMake step. Jolt ships a CMake build, but nothing about the library requires it: it is
+  153 .cpp files with no code generation and no configure stage, so a wildcard does the whole job.
+  Written by hand for two reasons - it keeps `clone, open, press Build` true with no toolchain to
+  install, and it lets Jolt import the SAME Jolt.props its consumers do, which is what makes the
+  define set impossible to mismatch.
+
+  The wildcard is deliberate over an explicit file list: updating Jolt then means replacing the
+  folder, with nothing to re-enumerate and no chance of a new source file being silently skipped.
+-->
+<Project DefaultTargets="Build" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup Label="ProjectConfigurations">
+    <ProjectConfiguration Include="Debug|x64"><Configuration>Debug</Configuration><Platform>x64</Platform></ProjectConfiguration>
+    <ProjectConfiguration Include="Release|x64"><Configuration>Release</Configuration><Platform>x64</Platform></ProjectConfiguration>
+    <ProjectConfiguration Include="Development|x64"><Configuration>Development</Configuration><Platform>x64</Platform></ProjectConfiguration>
+  </ItemGroup>
+
+  <PropertyGroup Label="Globals">
+    <VCProjectVersion>18.0</VCProjectVersion>
+    <ProjectGuid>{B0D5F7A1-4C39-4E82-9F16-8D7A3B2E5C90}</ProjectGuid>
+    <RootNamespace>Jolt</RootNamespace>
+    <ProjectName>Jolt</ProjectName>
+    <WindowsTargetPlatformVersion>10.0</WindowsTargetPlatformVersion>
+  </PropertyGroup>
+
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
+
+  <PropertyGroup Condition="'$(Configuration)'=='Debug'" Label="Configuration">
+    <ConfigurationType>StaticLibrary</ConfigurationType><UseDebugLibraries>true</UseDebugLibraries>
+    <PlatformToolset>v145</PlatformToolset><CharacterSet>Unicode</CharacterSet>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)'=='Release'" Label="Configuration">
+    <ConfigurationType>StaticLibrary</ConfigurationType><UseDebugLibraries>false</UseDebugLibraries>
+    <PlatformToolset>v145</PlatformToolset><CharacterSet>Unicode</CharacterSet>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)'=='Development'" Label="Configuration">
+    <ConfigurationType>StaticLibrary</ConfigurationType><UseDebugLibraries>false</UseDebugLibraries>
+    <PlatformToolset>v145</PlatformToolset><CharacterSet>Unicode</CharacterSet>
+  </PropertyGroup>
+
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
+  <ImportGroup Label="PropertySheets">
+    <Import Project="$(SolutionDir)JLib.Common.props" Condition="exists('$(SolutionDir)JLib.Common.props')" />
+    <Import Project="$(MSBuildProjectDirectory)\Jolt.props" />
+  </ImportGroup>
+
+  <ItemDefinitionGroup>
+    <ClCompile>
+      <!-- Level3 rather than the stricter setting the JLib libraries use: this is third-party code
+           and its warnings are not ours to fix. Keep the diff to upstream at exactly zero. -->
+      <WarningLevel>Level3</WarningLevel>
+      <LanguageStandard>stdcpp20</LanguageStandard>
+      <ExceptionHandling>Sync</ExceptionHandling>
+    </ClCompile>
+  </ItemDefinitionGroup>
+  <ItemDefinitionGroup Condition="'$(Configuration)'=='Debug'">
+    <ClCompile><PreprocessorDefinitions>_DEBUG;%(PreprocessorDefinitions)</PreprocessorDefinitions><RuntimeLibrary>MultiThreadedDebugDLL</RuntimeLibrary></ClCompile>
+  </ItemDefinitionGroup>
+  <ItemDefinitionGroup Condition="'$(Configuration)'=='Release'">
+    <ClCompile><PreprocessorDefinitions>NDEBUG;%(PreprocessorDefinitions)</PreprocessorDefinitions><RuntimeLibrary>MultiThreadedDLL</RuntimeLibrary>
+      <Optimization>MaxSpeed</Optimization><FunctionLevelLinking>true</FunctionLevelLinking><IntrinsicFunctions>true</IntrinsicFunctions></ClCompile>
+  </ItemDefinitionGroup>
+
+  <ItemGroup>
+    <ClCompile Include="Jolt\**\*.cpp" />
+  </ItemGroup>
+
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+</Project>

@@ -1,0 +1,240 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<!--
+  JLib::Renderer (the DX12 2D + 3D renderer), as built inside the umbrella solution.
+
+  Differences from the standalone DirectX12.vcxproj it replaces:
+    * StaticLibrary, x64 only. The old file had Win32 configurations typed as Application, a VS
+      template leftover that could only ever have produced a broken build.
+    * src\main.cpp is NOT compiled. It is a dead standalone entry point; the live one is Game01's.
+    * Scheduler is a ProjectReference rather than a named Scheduler.lib.
+    * DirectXTex comes from ThirdParty\DirectXTex. It ships as a PREBUILT lib because no source tree
+      exists locally; replacing it with a vendored source build is a later cleanup, not a blocker.
+      Note the debug/release split is keyed on the CRT, not the configuration name: Development uses
+      /MD like Release, so it must link the RELEASE DirectXTex or the CRTs mismatch.
+    * Shader items carry NO per-configuration conditions. The originals were written for Debug|x64
+      and Release|x64 only, so under Development every shader would have lost its type, entry point
+      and model - silently producing nothing to load at runtime.
+
+  ImGui is vendored under include\imgui and compiled here rather than from ThirdParty, because that
+  is the path its own sources and every consumer already include it by.
+-->
+<Project DefaultTargets="Build" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup Label="ProjectConfigurations">
+    <ProjectConfiguration Include="Debug|x64"><Configuration>Debug</Configuration><Platform>x64</Platform></ProjectConfiguration>
+    <ProjectConfiguration Include="Release|x64"><Configuration>Release</Configuration><Platform>x64</Platform></ProjectConfiguration>
+    <ProjectConfiguration Include="Development|x64"><Configuration>Development</Configuration><Platform>x64</Platform></ProjectConfiguration>
+  </ItemGroup>
+
+  <PropertyGroup Label="Globals">
+    <VCProjectVersion>18.0</VCProjectVersion>
+    <ProjectGuid>{7C4E1A93-6D2B-4A55-B8E1-2F9A0C374DD8}</ProjectGuid>
+    <RootNamespace>JLibRenderer</RootNamespace>
+    <ProjectName>Renderer</ProjectName>
+    <WindowsTargetPlatformVersion>10.0</WindowsTargetPlatformVersion>
+  </PropertyGroup>
+
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
+
+  <PropertyGroup Condition="'$(Configuration)'=='Debug'" Label="Configuration">
+    <ConfigurationType>StaticLibrary</ConfigurationType><UseDebugLibraries>true</UseDebugLibraries>
+    <PlatformToolset>v145</PlatformToolset><CharacterSet>Unicode</CharacterSet>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)'=='Release'" Label="Configuration">
+    <ConfigurationType>StaticLibrary</ConfigurationType><UseDebugLibraries>false</UseDebugLibraries>
+    <PlatformToolset>v145</PlatformToolset><CharacterSet>Unicode</CharacterSet>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)'=='Development'" Label="Configuration">
+    <ConfigurationType>StaticLibrary</ConfigurationType><UseDebugLibraries>false</UseDebugLibraries>
+    <PlatformToolset>v145</PlatformToolset><CharacterSet>Unicode</CharacterSet>
+  </PropertyGroup>
+
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
+  <ImportGroup Label="PropertySheets">
+    <Import Project="$(SolutionDir)JLib.Common.props" Condition="exists('$(SolutionDir)JLib.Common.props')" />
+  </ImportGroup>
+
+  <ItemDefinitionGroup>
+    <ClCompile>
+      <WarningLevel>Level3</WarningLevel>
+      <LanguageStandard>stdcpp20</LanguageStandard>
+      <ConformanceMode>true</ConformanceMode>
+      <ExceptionHandling>Sync</ExceptionHandling>
+      <AdditionalIncludeDirectories>$(MSBuildProjectDirectory)\include;$(MSBuildProjectDirectory);$(SolutionDir)ThirdParty\DirectXTex\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+    </ClCompile>
+  </ItemDefinitionGroup>
+  <ItemDefinitionGroup Condition="'$(Configuration)'=='Debug'">
+    <ClCompile><PreprocessorDefinitions>_DEBUG;%(PreprocessorDefinitions)</PreprocessorDefinitions><RuntimeLibrary>MultiThreadedDebugDLL</RuntimeLibrary></ClCompile>
+  </ItemDefinitionGroup>
+  <ItemDefinitionGroup Condition="'$(Configuration)'=='Release'">
+    <ClCompile><PreprocessorDefinitions>NDEBUG;%(PreprocessorDefinitions)</PreprocessorDefinitions><RuntimeLibrary>MultiThreadedDLL</RuntimeLibrary>
+      <Optimization>MaxSpeed</Optimization><FunctionLevelLinking>true</FunctionLevelLinking><IntrinsicFunctions>true</IntrinsicFunctions></ClCompile>
+  </ItemDefinitionGroup>
+
+  <ItemGroup>
+    <ClCompile Include="src\ResourceManager.cpp" />
+    <ClCompile Include="src\Window.cpp" />
+    <ClCompile Include="src\ModelLoader.cpp" />
+    <ClCompile Include="src\Renderer2D.cpp" />
+    <ClCompile Include="src\Renderer3D.cpp" />
+    <ClCompile Include="src\RendererCore.cpp" />
+    <ClCompile Include="src\Font.cpp" />
+    <ClCompile Include="include\imgui\imgui.cpp" />
+    <ClCompile Include="include\imgui\imgui_demo.cpp" />
+    <ClCompile Include="include\imgui\imgui_draw.cpp" />
+    <ClCompile Include="include\imgui\imgui_impl_dx12.cpp" />
+    <ClCompile Include="include\imgui\imgui_impl_win32.cpp" />
+    <ClCompile Include="include\imgui\imgui_stdlib.cpp" />
+    <ClCompile Include="include\imgui\imgui_tables.cpp" />
+    <ClCompile Include="include\imgui\imgui_widgets.cpp" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <FxCompile Include="src\Basic3D_PS.hlsl">
+      <ShaderType>Pixel</ShaderType>
+      <EntryPointName>PSMain</EntryPointName>
+      <ShaderModel>6.1</ShaderModel>
+    </FxCompile>
+    <FxCompile Include="src\Basic3D_VS.hlsl">
+      <ShaderType>Vertex</ShaderType>
+      <EntryPointName>VSMain</EntryPointName>
+      <ShaderModel>6.1</ShaderModel>
+    </FxCompile>
+    <FxCompile Include="src\BuildDispatchArgs.hlsl">
+      <ShaderType>Compute</ShaderType>
+      <EntryPointName>main</EntryPointName>
+      <ShaderModel>6.1</ShaderModel>
+    </FxCompile>
+    <FxCompile Include="src\CirclePS.hlsl">
+      <ShaderType>Pixel</ShaderType>
+      <EntryPointName>PSMain</EntryPointName>
+      <ShaderModel>6.1</ShaderModel>
+    </FxCompile>
+    <FxCompile Include="src\CompactParticles.hlsl">
+      <ShaderType>Compute</ShaderType>
+      <EntryPointName>main</EntryPointName>
+      <ShaderModel>6.1</ShaderModel>
+    </FxCompile>
+    <FxCompile Include="src\EquirectToCube_PS.hlsl">
+      <ShaderType>Pixel</ShaderType>
+      <EntryPointName>PSMain</EntryPointName>
+      <ShaderModel>6.1</ShaderModel>
+    </FxCompile>
+    <FxCompile Include="src\GridOutlinePS.hlsl">
+      <ShaderType>Pixel</ShaderType>
+      <EntryPointName>PSMain</EntryPointName>
+      <ShaderModel>6.1</ShaderModel>
+    </FxCompile>
+    <FxCompile Include="src\IrradianceConv_PS.hlsl">
+      <ShaderType>Pixel</ShaderType>
+      <EntryPointName>PSMain</EntryPointName>
+      <ShaderModel>6.1</ShaderModel>
+    </FxCompile>
+    <FxCompile Include="src\Particle3D_PS.hlsl">
+      <ShaderType>Pixel</ShaderType>
+      <EntryPointName>PSMain</EntryPointName>
+      <ShaderModel>6.1</ShaderModel>
+    </FxCompile>
+    <FxCompile Include="src\Particle3D_VS.hlsl">
+      <ShaderType>Vertex</ShaderType>
+      <EntryPointName>VSMain</EntryPointName>
+      <ShaderModel>6.1</ShaderModel>
+    </FxCompile>
+    <FxCompile Include="src\ParticlePS.hlsl">
+      <ShaderType>Pixel</ShaderType>
+      <EntryPointName>PSMain</EntryPointName>
+      <ShaderModel>6.1</ShaderModel>
+    </FxCompile>
+    <FxCompile Include="src\ParticleVS.hlsl">
+      <ShaderType>Vertex</ShaderType>
+      <EntryPointName>VSMain</EntryPointName>
+      <ShaderModel>6.1</ShaderModel>
+    </FxCompile>
+    <FxCompile Include="src\PixelShader.hlsl">
+      <ShaderType>Pixel</ShaderType>
+      <EntryPointName>PSMain</EntryPointName>
+      <ShaderModel>6.1</ShaderModel>
+    </FxCompile>
+    <FxCompile Include="src\PrefilterEnv_PS.hlsl">
+      <ShaderType>Pixel</ShaderType>
+      <EntryPointName>PSMain</EntryPointName>
+      <ShaderModel>6.1</ShaderModel>
+    </FxCompile>
+    <FxCompile Include="src\ResetAliveCounter.hlsl">
+      <ShaderType>Compute</ShaderType>
+      <EntryPointName>main</EntryPointName>
+      <ShaderModel>6.1</ShaderModel>
+    </FxCompile>
+    <FxCompile Include="src\RoundRectPS.hlsl">
+      <ShaderType>Pixel</ShaderType>
+      <EntryPointName>PSMain</EntryPointName>
+      <ShaderModel>6.1</ShaderModel>
+    </FxCompile>
+    <FxCompile Include="src\ShadowDepth_VS.hlsl">
+      <ShaderType>Vertex</ShaderType>
+      <EntryPointName>VSMain</EntryPointName>
+      <ShaderModel>6.1</ShaderModel>
+    </FxCompile>
+    <FxCompile Include="src\Skinned3D_VS.hlsl">
+      <ShaderType>Vertex</ShaderType>
+      <EntryPointName>VSMain</EntryPointName>
+      <ShaderModel>6.1</ShaderModel>
+    </FxCompile>
+    <FxCompile Include="src\Skybox_PS.hlsl">
+      <ShaderType>Pixel</ShaderType>
+      <EntryPointName>PSMain</EntryPointName>
+      <ShaderModel>6.1</ShaderModel>
+    </FxCompile>
+    <FxCompile Include="src\Skybox_VS.hlsl">
+      <ShaderType>Vertex</ShaderType>
+      <EntryPointName>VSMain</EntryPointName>
+      <ShaderModel>6.1</ShaderModel>
+    </FxCompile>
+    <FxCompile Include="src\SpawnBurst3D.hlsl">
+      <ShaderType>Compute</ShaderType>
+      <EntryPointName>main</EntryPointName>
+      <ShaderModel>6.1</ShaderModel>
+    </FxCompile>
+    <FxCompile Include="src\SpawnParticles.hlsl">
+      <ShaderType>Compute</ShaderType>
+      <EntryPointName>main</EntryPointName>
+      <ShaderModel>6.1</ShaderModel>
+    </FxCompile>
+    <FxCompile Include="src\SSAO_PS.hlsl">
+      <ShaderType>Pixel</ShaderType>
+      <EntryPointName>PSMain</EntryPointName>
+      <ShaderModel>6.1</ShaderModel>
+    </FxCompile>
+    <FxCompile Include="src\SSAO_VS.hlsl">
+      <ShaderType>Vertex</ShaderType>
+      <EntryPointName>VSMain</EntryPointName>
+      <ShaderModel>6.1</ShaderModel>
+    </FxCompile>
+    <FxCompile Include="src\UpdateParticles.hlsl">
+      <ShaderType>Compute</ShaderType>
+      <EntryPointName>main</EntryPointName>
+      <ShaderModel>6.1</ShaderModel>
+    </FxCompile>
+    <FxCompile Include="src\UpdateParticles3D.hlsl">
+      <ShaderType>Compute</ShaderType>
+      <EntryPointName>main</EntryPointName>
+      <ShaderModel>6.1</ShaderModel>
+    </FxCompile>
+    <FxCompile Include="src\VertexShader.hlsl">
+      <ShaderType>Vertex</ShaderType>
+      <EntryPointName>VSMain</EntryPointName>
+      <ShaderModel>6.1</ShaderModel>
+    </FxCompile>
+    <FxCompile Include="src\WaveParticles.hlsl">
+      <ShaderType>Compute</ShaderType>
+      <EntryPointName>main</EntryPointName>
+      <ShaderModel>6.1</ShaderModel>
+    </FxCompile>
+
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="$(SolutionDir)Scheduler\Scheduler.vcxproj" />
+  </ItemGroup>
+
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+</Project>

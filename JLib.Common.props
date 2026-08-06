@@ -1,0 +1,78 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Settings shared by every project in JLib.slnx. Imported by each .vcxproj rather than repeated in
+  it, so output layout is defined in exactly one place.
+
+  The important property here is OutDir. Every library and demo writes into one build\ folder, which
+  means a demo finds its dependencies' .libs without anyone configuring a library search path - and
+  it means the whole tree can be cleaned by deleting one directory. This is what replaces the old
+  C:\libs deploy convention: nothing is installed anywhere, because everything already lands
+  somewhere the linker looks.
+-->
+<Project xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <PropertyGroup>
+    <OutDir>$(SolutionDir)build\$(Platform)\$(Configuration)\</OutDir>
+    <IntDir>$(SolutionDir)build\obj\$(ProjectName)\$(Platform)\$(Configuration)\</IntDir>
+  </PropertyGroup>
+  <ItemDefinitionGroup>
+    <ClCompile>
+      <!-- Windows headers define min/max macros that collide with std::min/std::max and with Jolt.
+           Set once here so no individual project has to remember it. -->
+      <PreprocessorDefinitions>NOMINMAX;WIN32_LEAN_AND_MEAN;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <MultiProcessorCompilation>true</MultiProcessorCompilation>
+      <!-- Every JLib public include directory, declared once.
+
+           A ProjectReference gives a C++ project the LINK and the build ORDER, but MSVC does not
+           inherit include directories through it (unlike some build systems) - so without this, a
+           consumer compiles before it links and fails on a missing header. Listing them centrally
+           beats repeating paths in every consumer: adding a library to the suite is one line here,
+           and no project ever names another project's folder.
+
+           Blunt on purpose: every project sees every public include dir. For a cohesive suite that
+           is the normal monorepo trade, and it keeps the per-project files free of cross-references. -->
+      <AdditionalIncludeDirectories>$(SolutionDir)Scheduler\include;$(SolutionDir)Renderer\include;$(SolutionDir)Time\include;$(SolutionDir)Assets\include;$(SolutionDir)Geometry\include;$(SolutionDir)Scene\include;$(SolutionDir)Input\include;$(SolutionDir)Sound\include;$(SolutionDir)PlatformerPhysics2D\include;$(SolutionDir)Physics3D\include;$(SolutionDir)ThirdParty;$(SolutionDir)ThirdParty\DirectX-Headers\include;$(SolutionDir)ThirdParty\DirectXTex\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+    </ClCompile>
+  </ItemDefinitionGroup>
+
+  <!-- ============================ DEVELOPMENT CONFIGURATION ============================
+       Optimized, but with debug symbols and assertions: the configuration you actually PLAY in.
+
+       Full Debug is unusable once a project has real content - Game01's larger levels run at ~2 FPS
+       in Debug while Release holds hundreds. That is not a bug to hunt; it is what an unoptimized
+       build plus `_ITERATOR_DEBUG_LEVEL=2` costs when the per-frame work is iterating thousands of
+       tiles and bodies. Every engine ships a third configuration for exactly this reason (Unreal
+       calls it Development, CMake calls it RelWithDebInfo).
+
+       What you keep: symbols, line info, breakpoints, call stacks, assertions.
+       What you give up: some locals and stack frames to inlining. Far cheaper than a game that
+       cannot be run.
+
+       WHY THIS BELONGS HERE AND NOWHERE ELSE: `_ITERATOR_DEBUG_LEVEL` and the runtime library must
+       match across EVERY linked library. Mixing them is an ODR violation and shows up as heap
+       corruption or 0xC0000409, not a clean error - the same class of failure as the old /MDd vs /MD
+       mismatch. Setting it in one shared props file that every project imports makes a mismatch
+       structurally impossible; setting it per-project makes it inevitable.
+       (Add "Development" to JLib.slnx's <Configurations> to expose it in the IDE.) -->
+  <PropertyGroup Condition="'$(Configuration)'=='Development'">
+    <UseDebugLibraries>false</UseDebugLibraries>
+    <WholeProgramOptimization>false</WholeProgramOptimization>   <!-- keep link times sane while iterating -->
+  </PropertyGroup>
+  <ItemDefinitionGroup Condition="'$(Configuration)'=='Development'">
+    <ClCompile>
+      <Optimization>MaxSpeed</Optimization>
+      <FunctionLevelLinking>true</FunctionLevelLinking>
+      <IntrinsicFunctions>true</IntrinsicFunctions>
+      <RuntimeLibrary>MultiThreadedDLL</RuntimeLibrary>          <!-- /MD: release CRT, IDL=0 -->
+      <!-- NOT NDEBUG: assertions stay live. That is the entire point - this is the build you play in
+           while still wanting a Jolt assert or a static_assert to fire. -->
+      <PreprocessorDefinitions>JLIB_DEVELOPMENT;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <DebugInformationFormat>ProgramDatabase</DebugInformationFormat>
+      <BasicRuntimeChecks>Default</BasicRuntimeChecks>           <!-- /RTC is illegal with /O2 -->
+    </ClCompile>
+    <Link>
+      <GenerateDebugInformation>true</GenerateDebugInformation>
+    </Link>
+  </ItemDefinitionGroup>
+</Project>
+
+

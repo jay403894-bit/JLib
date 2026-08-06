@@ -1,0 +1,28 @@
+﻿<Solution>
+  <Configurations>
+    <!-- Development must be listed explicitly: once the set is not just Debug/Release, the solution
+         has to name every build type or MSBuild rejects it as an invalid configuration. -->
+    <BuildType Name="Debug" />
+    <BuildType Name="Development" />
+    <BuildType Name="Release" />
+    <Platform Name="x64" />
+  </Configurations>
+  <Folder Name="/Libraries/">
+    <Project Path="Scheduler/Scheduler.vcxproj" />
+    <Project Path="Renderer/Renderer.vcxproj" />
+    <Project Path="Time/Time.vcxproj" />
+    <Project Path="Scene/Scene.vcxproj" />
+    <Project Path="Input/Input.vcxproj" />
+    <Project Path="Sound/Sound.vcxproj" />
+    <Project Path="PlatformerPhysics2D/PlatformerPhysics2D.vcxproj" />
+    <Project Path="Physics3D/Physics3D.vcxproj" />
+  </Folder>
+  <Folder Name="/ThirdParty/">
+    <Project Path="ThirdParty/Jolt/Jolt.vcxproj" />
+  </Folder>
+  <Folder Name="/Tools/">
+    <Project Path="Scheduler/bench/Bench.vcxproj" />
+  </Folder>
+</Solution>
+
+

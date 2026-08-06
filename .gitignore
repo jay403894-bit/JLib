@@ -1,0 +1,64 @@
+# ============================ JLib ============================
+# Everything the build produces lives in exactly one place, so the ignore list is short.
+# See BUILD.md: OutDir/IntDir are set once in JLib.Common.props and point at build\.
+
+# All build output, for every project and every configuration.
+/build/
+
+# Visual Studio's per-user solution state (IntelliSense database, window layout, breakpoints).
+.vs/
+
+# Per-user project settings: local debugger arguments, working directory, which machine you
+# deployed to. Never the same for two people, and never worth a merge conflict.
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+
+# Stray per-project output, in case a project is ever built outside the umbrella (a bare
+# msbuild on a .vcxproj with no SolutionDir does exactly this - see the BUILD GOTCHA in BUILD.md
+# about $(SolutionDir) being empty, which lands output somewhere unexpected).
+x64/
+Win32/
+[Aa][Rr][Mm]64/
+
+# MSBuild incremental-build bookkeeping and linker leftovers.
+*.tlog
+*.ilk
+*.exp
+*.idb
+*.iobj
+*.ipdb
+*.pdb
+*.log
+*.lastbuildstate
+*.recipe
+
+# NuGet, if a project ever reintroduces it. (The DirectX headers came from a package originally;
+# they are vendored under ThirdParty/ now precisely so no restore step is needed.)
+packages/
+*.nupkg
+
+# OS / editor noise.
+Thumbs.db
+desktop.ini
+.vscode/
+
+
+# ==================== DELIBERATELY NOT IGNORED ====================
+#
+# There is no `*.lib` rule, and no bare `Debug/` or `Release/` rule. That is not an oversight:
+#
+#   ThirdParty/DirectXTex/lib/debug/DirectXTex.lib
+#   ThirdParty/DirectXTex/lib/release/DirectXTex.lib
+#
+# are VENDORED binaries that must be committed - DirectXTex has no local source tree, so a fresh
+# clone cannot link without them. A `Release/` rule would swallow that directory (git's ignore
+# matching is case-insensitive on Windows, so it catches `release/` too), and a negation such as
+# `!ThirdParty/**` CANNOT rescue it: git will not re-include a file whose parent directory is
+# excluded. Build output is caught by the `/build/` rule above instead, which is precise and has
+# no such collision.
+#
+# If you ever add a `*.lib` or `Release/` rule, run this first and expect two paths back:
+#   git check-ignore -v ThirdParty/DirectXTex/lib/release/DirectXTex.lib
+# Silence means it is about to be dropped from the repo.

@@ -1,0 +1,83 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  JLib::Physics3D (the Jolt wrapper), as built inside the umbrella solution.
+
+  Jolt is VENDORED and built from source (ThirdParty\Jolt), so this project has no external
+  prerequisite and no install step - like everything else in the solution.
+
+  It imports ThirdParty\Jolt\Jolt.props, THE SAME FILE Jolt.vcxproj imports. That is the whole
+  reason the source is vendored rather than linked as a prebuilt .lib: the JPH_* defines change
+  Jolt's structure layouts, and when both sides read one file the wrapper and the library cannot be
+  compiled against different definitions. The old arrangement duplicated that list in
+  deploy_lib.bat with nothing checking the two agreed - an ODR violation waiting on a typo, whose
+  good outcome is an LNK2001 vtable error and whose bad outcome is silent memory corruption.
+
+  Note it is a THIN wrapper - one translation unit. Its build cost is Jolt's headers, not its code.
+-->
+<Project DefaultTargets="Build" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup Label="ProjectConfigurations">
+    <ProjectConfiguration Include="Debug|x64"><Configuration>Debug</Configuration><Platform>x64</Platform></ProjectConfiguration>
+    <ProjectConfiguration Include="Release|x64"><Configuration>Release</Configuration><Platform>x64</Platform></ProjectConfiguration>
+    <ProjectConfiguration Include="Development|x64"><Configuration>Development</Configuration><Platform>x64</Platform></ProjectConfiguration>
+  </ItemGroup>
+
+  <PropertyGroup Label="Globals">
+    <VCProjectVersion>18.0</VCProjectVersion>
+    <ProjectGuid>{3E8B14C6-97A2-4D0F-B5E7-1A6C2F98D043}</ProjectGuid>
+    <RootNamespace>JLibPhysics3D</RootNamespace>
+    <ProjectName>Physics3D</ProjectName>
+    <WindowsTargetPlatformVersion>10.0</WindowsTargetPlatformVersion>
+  </PropertyGroup>
+
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
+
+  <PropertyGroup Condition="'$(Configuration)'=='Debug'" Label="Configuration">
+    <ConfigurationType>StaticLibrary</ConfigurationType><UseDebugLibraries>true</UseDebugLibraries>
+    <PlatformToolset>v145</PlatformToolset><CharacterSet>Unicode</CharacterSet>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)'=='Release'" Label="Configuration">
+    <ConfigurationType>StaticLibrary</ConfigurationType><UseDebugLibraries>false</UseDebugLibraries>
+    <PlatformToolset>v145</PlatformToolset><CharacterSet>Unicode</CharacterSet>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)'=='Development'" Label="Configuration">
+    <ConfigurationType>StaticLibrary</ConfigurationType><UseDebugLibraries>false</UseDebugLibraries>
+    <PlatformToolset>v145</PlatformToolset><CharacterSet>Unicode</CharacterSet>
+  </PropertyGroup>
+
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
+  <ImportGroup Label="PropertySheets">
+    <Import Project="$(SolutionDir)JLib.Common.props" Condition="exists('$(SolutionDir)JLib.Common.props')" />
+    <Import Project="$(SolutionDir)ThirdParty\Jolt\Jolt.props" />
+  </ImportGroup>
+
+  <ItemDefinitionGroup>
+    <ClCompile>
+      <WarningLevel>Level3</WarningLevel>
+      <LanguageStandard>stdcpp20</LanguageStandard>
+      <ConformanceMode>true</ConformanceMode>
+      <ExceptionHandling>Sync</ExceptionHandling>
+      <AdditionalIncludeDirectories>$(MSBuildProjectDirectory)\include;$(MSBuildProjectDirectory);%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+    </ClCompile>
+  </ItemDefinitionGroup>
+  <ItemDefinitionGroup Condition="'$(Configuration)'=='Debug'">
+    <ClCompile><PreprocessorDefinitions>_DEBUG;%(PreprocessorDefinitions)</PreprocessorDefinitions><RuntimeLibrary>MultiThreadedDebugDLL</RuntimeLibrary></ClCompile>
+  </ItemDefinitionGroup>
+  <ItemDefinitionGroup Condition="'$(Configuration)'=='Release'">
+    <ClCompile><PreprocessorDefinitions>NDEBUG;%(PreprocessorDefinitions)</PreprocessorDefinitions><RuntimeLibrary>MultiThreadedDLL</RuntimeLibrary>
+      <Optimization>MaxSpeed</Optimization><FunctionLevelLinking>true</FunctionLevelLinking><IntrinsicFunctions>true</IntrinsicFunctions></ClCompile>
+  </ItemDefinitionGroup>
+
+  <ItemGroup>
+    <ClCompile Include="src\Physics3D.cpp" />
+  </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="include\Physics3D.h" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="$(SolutionDir)Scheduler\Scheduler.vcxproj" />
+    <ProjectReference Include="$(SolutionDir)ThirdParty\Jolt\Jolt.vcxproj" />
+  </ItemGroup>
+
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+</Project>

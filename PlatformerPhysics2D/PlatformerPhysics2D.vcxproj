@@ -1,0 +1,113 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  JLib::PlatformerPhysics2D (the hand-written 2D platformer solver), as built inside the umbrella
+  solution. Modelled on Scheduler/Scheduler.vcxproj: x64 only, StaticLibrary, imports
+  JLib.Common.props, no absolute paths.
+
+  Depends on the Scheduler only (PhysicsSystem.cpp runs the world update through ParallelFor), hence
+  the ProjectReference. No renderer dependency: the solver is pure simulation and hands positions
+  back to whatever draws them.
+
+  C++20, NOT C++17 like the rest of the suite. PhysicsSystem.cpp uses std::numbers::pi_v, which is a
+  C++20 header. Kept as-is rather than downgraded to a local constant, because the standard level is
+  per-project here and only the Scheduler makes a public C++17 compatibility claim.
+-->
+<Project DefaultTargets="Build" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup Label="ProjectConfigurations">
+    <ProjectConfiguration Include="Debug|x64">
+      <Configuration>Debug</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+    <ProjectConfiguration Include="Release|x64">
+      <Configuration>Release</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+    <ProjectConfiguration Include="Development|x64">
+      <Configuration>Development</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+  </ItemGroup>
+
+  <PropertyGroup Label="Globals">
+    <VCProjectVersion>18.0</VCProjectVersion>
+    <ProjectGuid>{91C218AF-5FBE-4F3A-9948-7E3642B91737}</ProjectGuid>
+    <RootNamespace>JLibPlatformerPhysics2D</RootNamespace>
+    <ProjectName>PlatformerPhysics2D</ProjectName>
+    <WindowsTargetPlatformVersion>10.0</WindowsTargetPlatformVersion>
+  </PropertyGroup>
+
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
+
+  <PropertyGroup Condition="'$(Configuration)'=='Debug'" Label="Configuration">
+    <ConfigurationType>StaticLibrary</ConfigurationType>
+    <UseDebugLibraries>true</UseDebugLibraries>
+    <PlatformToolset>v145</PlatformToolset>
+    <CharacterSet>Unicode</CharacterSet>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)'=='Release'" Label="Configuration">
+    <ConfigurationType>StaticLibrary</ConfigurationType>
+    <UseDebugLibraries>false</UseDebugLibraries>
+    <PlatformToolset>v145</PlatformToolset>
+    <CharacterSet>Unicode</CharacterSet>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)'=='Development'" Label="Configuration">
+    <ConfigurationType>StaticLibrary</ConfigurationType>
+    <UseDebugLibraries>false</UseDebugLibraries>
+    <PlatformToolset>v145</PlatformToolset>
+    <CharacterSet>Unicode</CharacterSet>
+  </PropertyGroup>
+
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
+  <ImportGroup Label="PropertySheets">
+    <Import Project="$(SolutionDir)JLib.Common.props" Condition="exists('$(SolutionDir)JLib.Common.props')" />
+  </ImportGroup>
+
+  <ItemDefinitionGroup>
+    <ClCompile>
+      <WarningLevel>Level3</WarningLevel>
+      <LanguageStandard>stdcpp20</LanguageStandard>
+      <ConformanceMode>true</ConformanceMode>
+      <ExceptionHandling>Sync</ExceptionHandling>
+      <AdditionalIncludeDirectories>$(MSBuildProjectDirectory)\include;$(MSBuildProjectDirectory);%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+    </ClCompile>
+  </ItemDefinitionGroup>
+  <ItemDefinitionGroup Condition="'$(Configuration)'=='Debug'">
+    <ClCompile>
+      <PreprocessorDefinitions>_DEBUG;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <RuntimeLibrary>MultiThreadedDebugDLL</RuntimeLibrary>
+    </ClCompile>
+  </ItemDefinitionGroup>
+  <ItemDefinitionGroup Condition="'$(Configuration)'=='Release'">
+    <ClCompile>
+      <PreprocessorDefinitions>NDEBUG;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <RuntimeLibrary>MultiThreadedDLL</RuntimeLibrary>
+      <Optimization>MaxSpeed</Optimization>
+      <FunctionLevelLinking>true</FunctionLevelLinking>
+      <IntrinsicFunctions>true</IntrinsicFunctions>
+    </ClCompile>
+  </ItemDefinitionGroup>
+
+  <ItemGroup>
+    <ClCompile Include="src\PhysicsSystem.cpp" />
+    <ClCompile Include="src\PhysicsWorld.cpp" />
+    <ClCompile Include="src\SpatialGrid.cpp" />
+  </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="include\CollisionLayer.h" />
+    <ClInclude Include="include\Column.h" />
+    <ClInclude Include="include\EntityTable.h" />
+    <ClInclude Include="include\ParticleTable.h" />
+    <ClInclude Include="include\PhysicsSystem.h" />
+    <ClInclude Include="include\PhysicsTuning.h" />
+    <ClInclude Include="include\PhysicsWorld.h" />
+    <ClInclude Include="include\PlatformTable.h" />
+    <ClInclude Include="include\SpatialGrid.h" />
+    <ClInclude Include="include\TileMap.h" />
+    <ClInclude Include="include\Vec2.h" />
+  </ItemGroup>
+  <ItemGroup>
+    <ProjectReference Include="$(SolutionDir)Scheduler\Scheduler.vcxproj" />
+  </ItemGroup>
+
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+</Project>

@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  The JPH_* define set, in ONE place, imported by BOTH Jolt.vcxproj and Physics3D.vcxproj.
+
+  THIS FILE IS THE ENTIRE POINT OF VENDORING JOLT. These defines change Jolt's STRUCTURE LAYOUTS,
+  not merely which code paths compile. Compiling a consumer against a different set than the Jolt it
+  links is an ODR violation whose good outcome is an `LNK2001 GetSubmergedVolume`-style vtable error
+  and whose bad outcome is silent memory corruption at runtime.
+
+  Previously Jolt was a prebuilt .lib and this list was duplicated in deploy_lib.bat, with nothing
+  checking that the two agreed - the mismatch was possible, merely unlikely. Now both sides import
+  this file, so they cannot disagree: the failure mode is not "avoided", it is unrepresentable. That
+  is the same argument as JLib.Common.props owning _ITERATOR_DEBUG_LEVEL and the runtime library.
+
+  If you change ANYTHING here, every consumer rebuilds, which is exactly what you want.
+-->
+<Project xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemDefinitionGroup>
+    <ClCompile>
+      <PreprocessorDefinitions>NOMINMAX;JPH_FLOATING_POINT_EXCEPTIONS_ENABLED;JPH_USE_DX12;JPH_USE_CPU_COMPUTE;JPH_DEBUG_RENDERER;JPH_PROFILE_ENABLED;JPH_OBJECT_STREAM;JPH_USE_AVX2;JPH_USE_AVX;JPH_USE_SSE4_1;JPH_USE_SSE4_2;JPH_USE_LZCNT;JPH_USE_TZCNT;JPH_USE_F16C;JPH_USE_FMADD;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <!-- The defines above only DECLARE the instruction set; this switch is what makes the emitted
+           code match. Setting one without the other is the same ODR trap by a different route. -->
+      <EnableEnhancedInstructionSet>AdvancedVectorExtensions2</EnableEnhancedInstructionSet>
+      <!-- Jolt is included as <Jolt/Jolt.h>, so the directory ABOVE the Jolt folder goes on the path. -->
+      <AdditionalIncludeDirectories>$(SolutionDir)ThirdParty\Jolt;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+    </ClCompile>
+  </ItemDefinitionGroup>
+</Project>

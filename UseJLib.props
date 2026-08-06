@@ -1,0 +1,84 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  ============================ USING JLIB FROM YOUR OWN PROJECT ============================
+
+  Import this ONE file and your project can #include and link everything in the suite. Nothing to
+  install, no include directories to type, no list of .libs to keep in step with the suite.
+
+  In your .vcxproj, next to the other <Import> lines:
+
+      <Import Project="C:\JLib\UseJLib.props" />
+
+  or in Visual Studio: View > Property Manager, right-click your project, "Add Existing Property
+  Sheet", pick this file. That is the whole setup.
+
+  Then build JLib itself once (open JLib.slnx, Build) so build\x64\<Config>\ exists, and write:
+
+      #include <TaskScheduler.h>
+      #include <Renderer2D.h>
+      #include <Physics3D.h>
+
+  =============================================================================================
+  WHY A PROPERTY SHEET RATHER THAN ONE MERGED JLib.lib
+
+  A merged library only solves the LINK list. You would still be typing include directories by hand,
+  which is the larger half of the setup. It would also have to be regenerated on every build, and
+  merging Jolt in makes the artifact enormous for no benefit, since the linker already discards
+  objects nobody references. A property sheet solves includes, library paths, the .lib list and the
+  configuration mapping together, and it is what an SDK normally ships.
+
+  =============================================================================================
+  YOUR CONFIGURATION MUST MATCH A JLIB ONE - AND THE CRT IS THE REAL CONSTRAINT
+
+  JLib builds Debug (/MDd), Development (/MD) and Release (/MD). Your project must use the SAME
+  runtime library as the JLib configuration it links, because mixing /MDd and /MD is an ODR
+  violation that surfaces as heap corruption or 0xC0000409 rather than a clean error - the same trap
+  documented in BUILD.md and JLib.Common.props.
+
+  JLibConfig below maps your configuration name onto a JLib output folder. Names that match one of
+  the three just work. Anything else falls back to Release, which is correct for any optimized /MD
+  build - but if you invent a debug-flavoured configuration name, set JLibConfig yourself:
+
+      <PropertyGroup><JLibConfig>Debug</JLibConfig></PropertyGroup>
+
+  before importing this file.
+-->
+<Project xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+
+  <PropertyGroup>
+    <!-- Where JLib lives. Derived from this file's own location, so it is correct wherever the tree
+         is cloned and no absolute path is baked in. -->
+    <JLibRoot Condition="'$(JLibRoot)'==''">$(MSBuildThisFileDirectory)</JLibRoot>
+
+    <!-- Map the consumer's configuration onto a JLib one. Only set if the consumer did not. -->
+    <JLibConfig Condition="'$(JLibConfig)'=='' and '$(Configuration)'=='Debug'">Debug</JLibConfig>
+    <JLibConfig Condition="'$(JLibConfig)'=='' and '$(Configuration)'=='Development'">Development</JLibConfig>
+    <JLibConfig Condition="'$(JLibConfig)'==''">Release</JLibConfig>
+
+    <JLibBinDir>$(JLibRoot)build\$(Platform)\$(JLibConfig)\</JLibBinDir>
+  </PropertyGroup>
+
+  <ItemDefinitionGroup>
+    <ClCompile>
+      <!-- Same list as JLib.Common.props. Duplicated deliberately: that file is INTERNAL to the
+           suite and carries build settings a consumer must not inherit, so the two are kept apart
+           even though the include list overlaps. -->
+      <AdditionalIncludeDirectories>$(JLibRoot)Scheduler\include;$(JLibRoot)Renderer\include;$(JLibRoot)Time\include;$(JLibRoot)Assets\include;$(JLibRoot)Geometry\include;$(JLibRoot)Scene\include;$(JLibRoot)Input\include;$(JLibRoot)Sound\include;$(JLibRoot)PlatformerPhysics2D\include;$(JLibRoot)Physics3D\include;$(JLibRoot)ThirdParty;$(JLibRoot)ThirdParty\Jolt;$(JLibRoot)ThirdParty\DirectX-Headers\include;$(JLibRoot)ThirdParty\DirectXTex\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <PreprocessorDefinitions>NOMINMAX;WIN32_LEAN_AND_MEAN;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+    </ClCompile>
+
+    <Link>
+      <AdditionalLibraryDirectories>$(JLibBinDir);$(JLibRoot)ThirdParty\DirectXTex\lib\release;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
+      <!-- Every JLib library plus the system libraries they need. The linker discards objects from
+           libraries you never reference, so naming all of them costs nothing in your binary - a
+           project that only touches the scheduler does not pay for the renderer. -->
+      <AdditionalDependencies>Scheduler.lib;Renderer.lib;Time.lib;Scene.lib;Input.lib;Sound.lib;PlatformerPhysics2D.lib;Physics3D.lib;Jolt.lib;DirectXTex.lib;d3d12.lib;dxgi.lib;dxguid.lib;d3dcompiler.lib;%(AdditionalDependencies)</AdditionalDependencies>
+    </Link>
+  </ItemDefinitionGroup>
+
+  <!-- Fail with a sentence that says what to do, rather than 40 unresolved externals. -->
+  <Target Name="JLibCheckBuilt" BeforeTargets="Link" Condition="!Exists('$(JLibBinDir)Scheduler.lib')">
+    <Error Text="JLib has not been built for this configuration. Expected '$(JLibBinDir)Scheduler.lib'. Open $(JLibRoot)JLib.slnx and build $(JLibConfig)|$(Platform) first. (Your configuration '$(Configuration)' maps to JLib's '$(JLibConfig)'; override with the JLibConfig property if that is wrong.)" />
+  </Target>
+
+</Project>
