@@ -1,8 +1,29 @@
 # JLib — unified build
 
-**Clone, open `JLib.slnx`, press Build.** No install step, no `C:\libs`, no build order to get right.
+**Two front doors, both first-class.** No install step, no `C:\libs`, no build order to get right.
 
-Everything lands in `build\x64\<Config>\`. Delete `build\` to clean the whole tree.
+| | |
+|---|---|
+| **CMake** | `cmake -B build -A x64` then `cmake --build build --config Development` |
+| **Visual Studio** | open `JLib.sln` (classic) or `JLib.slnx` (new format) and press Build |
+
+MSBuild output lands in `build\x64\<Config>\`; the CMake tree lands wherever you point it. Delete
+either directory to clean.
+
+**Why both, and why that is not the usual trap.** Two build systems normally means two source lists
+that drift. These do not enumerate files at all — both **glob the same directories**
+(`Jolt.vcxproj` uses `Jolt\**\*.cpp`; CMake uses `file(GLOB CONFIGURE_DEPENDS)`), so adding a `.cpp`
+is picked up by both with nothing to update. Neither is generated from the other.
+
+CMake exists because `cmake -B build` is what a C++ developer expects to be able to type, and
+because it lets other CMake projects consume JLib through `add_subdirectory`/`FetchContent` with
+namespaced `JLib::` targets that carry their own include directories and definitions. It does **not**
+make JLib portable and does not claim to — this is Windows x64 + MSVC by construction, and the
+CMakeLists says so with a hard `FATAL_ERROR` rather than failing confusingly halfway through.
+
+**`JLib.sln` is shipped alongside `JLib.slnx` on purpose.** `.slnx` is the new XML solution format
+and only recent Visual Studio builds can open it; anyone on an older VS 2022 gets nothing at all.
+The classic `.sln` is the compatibility floor.
 
 ---
 

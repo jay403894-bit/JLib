@@ -5,6 +5,16 @@
 # All build output, for every project and every configuration.
 /build/
 
+# CMake. The generated tree, plus the files CMake drops beside the source when someone configures
+# in-place or uses the VS "Open Folder" CMake integration.
+/cmake-build*/
+/out/
+CMakeCache.txt
+CMakeFiles/
+CMakeUserPresets.json
+cmake_install.cmake
+*.cmake.stamp
+
 # Visual Studio's per-user solution state (IntelliSense database, window layout, breakpoints).
 .vs/
 

@@ -8,21 +8,34 @@ A C++ game engine stack for Windows — fiber scheduler, DirectX 12 renderer, 2D
 
 ## ⚡ Quick start
 
+Two ways in — both build the same nine libraries and their vendored dependencies from a clone, with nothing to install and no build order to get right.
+
+**CMake:**
+
 ```
-git clone <this repo>
-open JLib.slnx
-Build
-```
-
-That is the whole setup. No CMake, no package manager, no install step, no build order to get right, nothing to put in `C:\libs`. Nine libraries and their third-party dependencies build from the clone into `build\x64\<Config>\`.
-
-To use it from **your own** project in another solution, import one property sheet:
-
-```xml
-<Import Project="C:\JLib\UseJLib.props" />
+cmake -B build -A x64
+cmake --build build --config Development
 ```
 
-That supplies every include directory, the library path, and all nine `.lib` names. Then `#include <TaskScheduler.h>` and go. See [BUILD.md](BUILD.md).
+**Or Visual Studio:** open `JLib.sln` (or `JLib.slnx`) and press Build.
+
+Neither is generated from the other, and neither is second-class. They avoid the usual drift by **globbing the same directories** rather than enumerating files, so adding a `.cpp` is picked up by both with nothing to update.
+
+To use it from **your own** project:
+
+- **CMake** — `add_subdirectory(JLib)` or `FetchContent`, then link the namespaced targets. Include directories and compile definitions travel with them:
+
+  ```cmake
+  target_link_libraries(MyGame PRIVATE JLib::Scheduler JLib::Renderer JLib::Physics3D)
+  ```
+
+- **MSBuild** — import one property sheet, which supplies every include directory, the library path and all nine `.lib` names:
+
+  ```xml
+  <Import Project="C:\JLib\UseJLib.props" />
+  ```
+
+Then `#include <TaskScheduler.h>` and go. See [BUILD.md](BUILD.md).
 
 ---
 
