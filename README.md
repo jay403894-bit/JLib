@@ -76,7 +76,7 @@ Two findings that contradicted the received wisdom, including advice I had been 
 
 ## 🎯 Where this sits
 
-Closest in spirit to **raylib** — same "get something on screen without ceremony" goal — but this is *similar to* raylib, **not** a raylib API. Only the shape primitives are near-identical; sprites go through an explicit `BatchItem`. That is a design choice rather than a gap: raylib hides batching, JLib exposes it, which is why 256K instances work.
+Closest in spirit to **raylib** — same "get something on screen without ceremony" goal — but this is *similar to* raylib, **not** a raylib API. Only the shape primitives are near-identical; sprites go through an explicit `BatchItem`. That is a design choice rather than a gap: raylib hides batching, JLib exposes it, which is why 256K instances work (can be increased if needed as well).
 
 The honest use case is the migration: **prototype in raylib, move over when you hit the ceiling** — particle-heavy scenes, anything wanting real parallelism, anything that wants a modern explicit API. Ports of Pong, Space Invaders and Tetris exist as evidence that the move is a weekend, not a rewrite.
 
