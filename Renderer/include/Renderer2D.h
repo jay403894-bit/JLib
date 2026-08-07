@@ -305,7 +305,11 @@ namespace JLib {
         // SRV heap/resource manager/font against core's already-created device/queue.
         void Initialize(RendererCore& core);
 
-        void Submit(BatchItem& item);
+        // Takes a const reference and copies internally: Submit never modifies your item, so the
+        // same BatchItem can be filled once and submitted repeatedly in a loop (the natural way to
+        // draw a tile grid). It previously took BatchItem& and mutated it, which made repeated
+        // submits of one item apply the sRGB conversion cumulatively.
+        void Submit(const BatchItem& item);
         template<typename... Args>
         void SubmitText(Font& font, float x, float y, const std::string& fmt,
             float scale = 1.0f,

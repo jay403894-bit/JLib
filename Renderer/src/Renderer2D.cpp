@@ -234,8 +234,21 @@ static DirectX::XMFLOAT4 SrgbToLinear(DirectX::XMFLOAT4 c) {
 }
 
 void Renderer2D::Submit(
-	BatchItem& item)
+	const BatchItem& caller)
 {
+	// COPY, and take the original by const ref. This used to take BatchItem& and mutate it, which
+	// made Submit NOT IDEMPOTENT for a reused item: the sRGB conversion below wrote back into the
+	// caller's struct, so a loop that fills one BatchItem and submits it per cell converted the
+	// colour AGAIN each call. Cell 1 once, cell 2 twice, cell 3 three times -- same hue,
+	// progressively darker, which is exactly how it presented (Tetris pieces shaded differently
+	// per cell). The flipX/flipY handling below had the identical bug: a reused item flipped its
+	// UVs again on every submit.
+	//
+	// Reusing one BatchItem across a loop is the OBVIOUS way to write a tile/grid renderer, so the
+	// API has to be safe under it. Const ref also lets callers pass a temporary, which the old
+	// non-const reference rejected.
+	BatchItem item = caller;
+
 	item.color = SrgbToLinear(item.color);
 
 	// Mirroring is just reversing which edge of the UV sub-rect the mesh's 0->1 edge lands on --
