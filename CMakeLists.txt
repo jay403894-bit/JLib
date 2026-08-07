@@ -21,14 +21,30 @@
 
 cmake_minimum_required(VERSION 3.21)
 
-project(JLib LANGUAGES CXX ASM_MASM)
+# MASM only exists on Windows; the Linux context switch is GAS, which CMake handles as plain ASM.
+if(WIN32)
+    project(JLib LANGUAGES CXX ASM_MASM)
+else()
+    project(JLib LANGUAGES CXX ASM)
+endif()
 
-if(NOT WIN32 OR NOT MSVC)
+# The scheduler alone is portable (Windows x64 + Linux x86-64); everything above it -- the DX12
+# renderer and the libraries that depend on it -- is Windows-only by construction. On a non-Windows
+# host this file therefore builds JUST the scheduler and its bench, rather than failing outright.
+set(JLIB_SCHEDULER_ONLY OFF)
+if(NOT WIN32)
+    set(JLIB_SCHEDULER_ONLY ON)
+    message(STATUS "JLib: non-Windows host -- building JLib::Scheduler only (the renderer is DX12).")
+endif()
+
+if(WIN32 AND NOT MSVC)
     message(FATAL_ERROR
-        "JLib is Windows x64 + MSVC only, by construction: the scheduler's context switch is "
-        "hand-written x64 MASM and the renderer is DirectX 12. This is a design decision, not a "
-        "missing feature - see the README. A Linux port of the SCHEDULER ALONE is planned "
-        "(ucontext instead of MASM); nothing else is portable as written.")
+        "On Windows, JLib requires MSVC: the context switch is MASM and the renderer is DirectX 12.")
+endif()
+if(NOT WIN32 AND NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    message(FATAL_ERROR
+        "JLib::Scheduler supports Windows x64 and Linux x86-64. The context switch is hand-written "
+        "assembly per ABI, so a new platform needs a new ContextSwitch, not a compiler flag.")
 endif()
 
 # ---------------------------------------------------------------------------------------------
@@ -59,6 +75,11 @@ set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>DLL")
 
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+# Set explicitly so subdirectory targets land here too. Without it, anything added via
+# add_subdirectory (the scheduler) writes its .lib into a per-subdirectory folder instead, which
+# breaks the "one output directory, delete it to clean" property the MSBuild side advertises.
+set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib")
+set(CMAKE_LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib")
 
 # ---------------------------------------------------------------------------------------------
 # jlib_library(<name> DIR <dir> [STD <17|20>] [DEPS <targets...>] [EXTRA_INC <dirs...>])
@@ -72,12 +93,37 @@ function(jlib_library NAME)
         set(A_STD 17)
     endif()
     file(GLOB _srcs CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/${A_DIR}/src/*.cpp")
-    list(APPEND _srcs ${A_EXTRA_SRC})
+    # Platform sources live in src/win32 and src/posix. Exactly ONE directory is added, which is
+    # the reason the split is by DIRECTORY and not by filename suffix: the glob above would happily
+    # pick up both Topology_win32.cpp and Topology_posix.cpp and collide on duplicate symbols.
+    if(WIN32)
+        file(GLOB _plat CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/${A_DIR}/src/win32/*.cpp")
+    else()
+        file(GLOB _plat CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/${A_DIR}/src/posix/*.cpp")
+    endif()
+    list(APPEND _srcs ${_plat} ${A_EXTRA_SRC})
     add_library(${NAME} STATIC ${_srcs})
     add_library(JLib::${NAME} ALIAS ${NAME})
-    target_include_directories(${NAME} PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/${A_DIR}/include" ${A_EXTRA_INC})
+    # BUILD_INTERFACE / INSTALL_INTERFACE, not a bare path. A bare absolute source path would work
+    # fine when building in place and then be baked into the exported package, so an installed JLib
+    # would point every consumer back at the source tree it was built from - which breaks the moment
+    # that tree moves, and silently uses stale headers until then.
+    target_include_directories(${NAME} PUBLIC
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/${A_DIR}/include>
+        $<INSTALL_INTERFACE:include>)
+    foreach(_inc IN LISTS A_EXTRA_INC)
+        target_include_directories(${NAME} PUBLIC $<BUILD_INTERFACE:${_inc}>)
+    endforeach()
+    if(A_EXTRA_INC)
+        target_include_directories(${NAME} PUBLIC $<INSTALL_INTERFACE:include>)
+    endif()
     target_compile_features(${NAME} PUBLIC cxx_std_${A_STD})
-    target_compile_definitions(${NAME} PUBLIC NOMINMAX WIN32_LEAN_AND_MEAN)
+    # Windows-only: both exist purely to tame <windows.h>. Defining them on Linux is meaningless
+    # and collides with the headers that already #define NOMINMAX themselves, producing a
+    # "macro redefined" warning on every translation unit.
+    if(WIN32)
+        target_compile_definitions(${NAME} PUBLIC NOMINMAX WIN32_LEAN_AND_MEAN)
+    endif()
     if(A_DEPS)
         target_link_libraries(${NAME} PUBLIC ${A_DEPS})
     endif()
@@ -87,15 +133,27 @@ endfunction()
 # ---- header-only -----------------------------------------------------------------------------
 add_library(Assets INTERFACE)
 add_library(JLib::Assets ALIAS Assets)
-target_include_directories(Assets INTERFACE "${CMAKE_CURRENT_SOURCE_DIR}/Assets/include")
+target_include_directories(Assets INTERFACE
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/Assets/include> $<INSTALL_INTERFACE:include>)
 
 add_library(Geometry INTERFACE)
 add_library(JLib::Geometry ALIAS Geometry)
-target_include_directories(Geometry INTERFACE "${CMAKE_CURRENT_SOURCE_DIR}/Geometry/include")
+target_include_directories(Geometry INTERFACE
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/Geometry/include> $<INSTALL_INTERFACE:include>)
 
 # ---- Scheduler: the .asm is the fiber context switch, not optional ---------------------------
-jlib_library(Scheduler DIR Scheduler STD 17
-             EXTRA_SRC "${CMAKE_CURRENT_SOURCE_DIR}/Scheduler/src/ContextSwitch.asm")
+# The scheduler defines itself, in Scheduler/CMakeLists.txt -- one file that is ALSO the top-level
+# build of the standalone JLib-Scheduler repository. It is published in both places, and a Linux
+# user wanting only the scheduler clones that repo rather than this one, so its build rules cannot
+# live up here. It also brings SchedulerBench with it.
+add_subdirectory(Scheduler)
+
+# ---- Everything above the scheduler is Windows-only AS WRITTEN -------------------------------
+# Not all of it is inherently unportable -- Scene is plain C++ and PlatformerPhysics2D needs only
+# the scheduler -- but Renderer is DirectX 12, Input is Raw Input/XInput, and Time, Sound and
+# Physics3D all reach for <Windows.h> today. Rather than ship a half-ported subset that implies
+# more than it delivers, a non-Windows build produces exactly what actually works: the scheduler.
+if(NOT JLIB_SCHEDULER_ONLY)
 
 jlib_library(Time  DIR Time  STD 17)
 jlib_library(Scene DIR Scene STD 17)
@@ -112,7 +170,8 @@ jlib_library(PlatformerPhysics2D DIR PlatformerPhysics2D STD 20 DEPS Scheduler)
 file(GLOB_RECURSE JOLT_SRC CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/ThirdParty/Jolt/Jolt/*.cpp")
 add_library(Jolt STATIC ${JOLT_SRC})
 add_library(JLib::Jolt ALIAS Jolt)
-target_include_directories(Jolt PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/ThirdParty/Jolt")
+target_include_directories(Jolt PUBLIC
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/ThirdParty/Jolt> $<INSTALL_INTERFACE:include>)
 target_compile_features(Jolt PUBLIC cxx_std_20)
 target_compile_definitions(Jolt PUBLIC
     NOMINMAX JPH_FLOATING_POINT_EXCEPTIONS_ENABLED JPH_USE_DX12 JPH_USE_CPU_COMPUTE
@@ -132,8 +191,15 @@ jlib_library(Renderer DIR Renderer STD 20
              EXTRA_SRC ${IMGUI_SRC}
              EXTRA_INC "${CMAKE_CURRENT_SOURCE_DIR}/ThirdParty/DirectX-Headers/include"
                        "${CMAKE_CURRENT_SOURCE_DIR}/ThirdParty/DirectXTex/include")
+# DirectXTex is a prebuilt lib with no local source, so it becomes an IMPORTED target rather than a
+# raw path. A raw path cannot be exported: CMake refuses to bake a build-machine absolute path into
+# an installed package, and rightly so. The installed JLibConfig.cmake re-creates this target
+# pointing at the copy that ships alongside the libraries.
+add_library(JLib_DirectXTex STATIC IMPORTED GLOBAL)
+set_target_properties(JLib_DirectXTex PROPERTIES
+    IMPORTED_LOCATION "${CMAKE_CURRENT_SOURCE_DIR}/ThirdParty/DirectXTex/lib/release/DirectXTex.lib")
 target_link_libraries(Renderer PUBLIC
-    "${CMAKE_CURRENT_SOURCE_DIR}/ThirdParty/DirectXTex/lib/release/DirectXTex.lib"
+    $<BUILD_INTERFACE:JLib_DirectXTex>
     d3d12 dxgi dxguid d3dcompiler)
 
 # ---- Shaders ---------------------------------------------------------------------------------
@@ -184,17 +250,95 @@ else()
         "runtime. The libraries still build. Install the Windows 10/11 SDK, or set JLIB_DXC.")
 endif()
 
-# ---- Bench -----------------------------------------------------------------------------------
-add_executable(SchedulerBench "${CMAKE_CURRENT_SOURCE_DIR}/Scheduler/bench/bench.cpp")
-target_link_libraries(SchedulerBench PRIVATE Scheduler)
-# C++20 even though the Scheduler it measures is C++17: the crossover sweep accumulates into a
-# std::atomic<double>, and atomic<floating-point>::fetch_add is C++20. Without this the target
-# inherits cxx_std_17 through Scheduler and fails to compile - which says nothing about the
-# library's own C++17 compatibility claim, only about the benchmark harness.
-target_compile_features(SchedulerBench PRIVATE cxx_std_20)
+endif()  # NOT JLIB_SCHEDULER_ONLY
+
+# SchedulerBench is defined by Scheduler/CMakeLists.txt, alongside the library it measures, so the
+# standalone repo gets it too. Only its IDE placement is set here.
+set_target_properties(Scheduler      PROPERTIES FOLDER "JLib")
 set_target_properties(SchedulerBench PROPERTIES FOLDER "Tools")
 
 if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
     set_property(DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}" PROPERTY VS_STARTUP_PROJECT SchedulerBench)
     set_property(GLOBAL PROPERTY USE_FOLDERS ON)
 endif()
+
+# =============================================================================================
+# INSTALL
+#
+#   cmake --install build --config Release --prefix C:/libs/JLib
+#
+# You do NOT need this to use JLib. Building in place and pointing at the tree (ProjectReference,
+# UseJLib.props, or add_subdirectory) is the normal path and involves no copying at all. Install
+# exists for the two cases where a copy is actually wanted: handing someone a prebuilt drop, and
+# `find_package(JLib)` from an unrelated CMake project.
+#
+# Libraries go to lib/<Config>/ rather than using a debug postfix, because Debug, Development and
+# Release all produce a file called Scheduler.lib and one of them would otherwise overwrite the
+# others. It also matches the layout the C:\libs convention already used.
+# =============================================================================================
+include(GNUInstallDirs)
+include(CMakePackageConfigHelpers)
+
+if(JLIB_SCHEDULER_ONLY)
+    set(JLIB_TARGETS Scheduler Assets Geometry)
+else()
+    set(JLIB_TARGETS Scheduler Renderer Time Scene Input Sound PlatformerPhysics2D Physics3D Jolt
+                     Assets Geometry)
+endif()
+
+install(TARGETS ${JLIB_TARGETS}
+        EXPORT JLibTargets
+        ARCHIVE DESTINATION "lib/$<CONFIG>"
+        INCLUDES DESTINATION include)
+
+# Public headers. Each library's include/ is flattened into one include/ directory, which is what
+# consumers already expect (#include <TaskScheduler.h>, not <Scheduler/TaskScheduler.h>).
+if(JLIB_SCHEDULER_ONLY)
+    set(_hdr_libs Scheduler Assets Geometry)
+else()
+    set(_hdr_libs Scheduler Renderer Time Scene Input Sound PlatformerPhysics2D Physics3D
+                  Assets Geometry)
+endif()
+foreach(_lib IN LISTS _hdr_libs)
+    install(DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/${_lib}/include/" DESTINATION include)
+endforeach()
+
+if(NOT JLIB_SCHEDULER_ONLY)
+    # Jolt keeps its directory structure: its headers are included as <Jolt/Jolt.h>.
+    install(DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/ThirdParty/Jolt/Jolt" DESTINATION include)
+    install(DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/ThirdParty/DirectX-Headers/include/" DESTINATION include)
+    install(DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/ThirdParty/DirectXTex/include/" DESTINATION include)
+    # The prebuilt DirectXTex, which must travel with a redistributed binary.
+    install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/ThirdParty/DirectXTex/lib/release/DirectXTex.lib"
+            DESTINATION lib)
+endif()
+
+# Licence files always ship, on every platform.
+install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/LICENSE"
+              "${CMAKE_CURRENT_SOURCE_DIR}/THIRD-PARTY-NOTICES.md"
+        DESTINATION .)
+
+# Compiled shaders. Without these the renderer links but has nothing to load at runtime.
+if(JLIB_DXC)
+    install(DIRECTORY "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/" DESTINATION bin
+            FILES_MATCHING PATTERN "*.cso")
+endif()
+
+install(EXPORT JLibTargets
+        FILE JLibTargets.cmake
+        NAMESPACE JLib::
+        DESTINATION lib/cmake/JLib)
+
+write_basic_package_version_file(
+    "${CMAKE_CURRENT_BINARY_DIR}/JLibConfigVersion.cmake"
+    VERSION 0.1.0
+    COMPATIBILITY SameMajorVersion)
+
+configure_package_config_file(
+    "${CMAKE_CURRENT_SOURCE_DIR}/cmake/JLibConfig.cmake.in"
+    "${CMAKE_CURRENT_BINARY_DIR}/JLibConfig.cmake"
+    INSTALL_DESTINATION lib/cmake/JLib)
+
+install(FILES "${CMAKE_CURRENT_BINARY_DIR}/JLibConfig.cmake"
+              "${CMAKE_CURRENT_BINARY_DIR}/JLibConfigVersion.cmake"
+        DESTINATION lib/cmake/JLib)

@@ -53,6 +53,49 @@ instead of honest link errors. A single solution makes that structurally impossi
 3. **No absolute paths.** Everything resolves through `$(SolutionDir)` or
    `$(MSBuildProjectDirectory)`.
 
+## Installing (optional — you usually should not)
+
+**There is no install step in the normal workflow.** Build in place and point at the tree; nothing is
+copied, staged, or registered anywhere. That is the whole reason the old `C:\libs` deploy convention
+went away, and re-introducing it by hand is how a project ends up building against a stale copy.
+
+Install exists for two specific cases: handing someone a prebuilt drop, and `find_package(JLib)`
+from an unrelated CMake project.
+
+```
+cmake --build build --config Release
+cmake --install build --config Release --prefix C:/libs/JLib
+```
+
+Produces:
+
+```
+C:/libs/JLib/
+  include/            every public header, flattened (plus Jolt/ and the DirectX headers)
+  lib/<Config>/       the nine .lib files
+  lib/DirectXTex.lib  the prebuilt third-party lib Renderer links
+  lib/cmake/JLib/     JLibConfig.cmake — makes find_package work
+  bin/                the 28 compiled .cso shaders
+  LICENSE, THIRD-PARTY-NOTICES.md
+```
+
+Run it once per configuration you want available (`--config Debug`, `--config Development`) —
+libraries land in `lib/<Config>/` rather than using a debug postfix, because all three configurations
+produce a file called `Scheduler.lib` and one would otherwise overwrite the others.
+
+Then from any CMake project:
+
+```cmake
+find_package(JLib REQUIRED)          # -DCMAKE_PREFIX_PATH=C:/libs/JLib
+target_link_libraries(MyGame PRIVATE JLib::Scheduler JLib::Renderer JLib::Physics3D)
+```
+
+Verified end to end: installed to a clean prefix, then a consumer project that knows nothing about
+the source tree configured, linked and ran against it.
+
+**Note the shaders.** They install to `bin/`, and the renderer loads them at runtime — an install
+that omits them links perfectly and then fails when it tries to create a pipeline state.
+
 ## Using JLib from your own project
 
 Inside this solution, a consumer adds a `ProjectReference` and is done. From a **separate** solution

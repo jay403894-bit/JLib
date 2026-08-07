@@ -1,0 +1,42 @@
+@PACKAGE_INIT@
+
+# Package config for an INSTALLED JLib:
+#
+#   find_package(JLib REQUIRED)
+#   target_link_libraries(MyGame PRIVATE JLib::Scheduler JLib::Renderer JLib::Physics3D)
+#
+# Point CMake at the install prefix with -DCMAKE_PREFIX_PATH=C:/libs/JLib.
+
+include(CMakeFindDependencyMacro)
+
+if(NOT WIN32 OR NOT MSVC)
+    message(FATAL_ERROR "JLib is Windows x64 + MSVC only, by construction. See its README.")
+endif()
+
+# Re-create the imported DirectXTex that Renderer links. It is a prebuilt library with no source
+# tree, so it cannot be part of the exported target set - the export would have had to record an
+# absolute path from the machine that built the package, which is exactly the thing that makes
+# relocated installs break. Recreating it here against the package's own prefix keeps the install
+# self-contained and movable.
+# Absent from a scheduler-only (non-Windows) install, which ships no renderer and therefore no
+# DirectXTex -- so its presence is checked rather than assumed.
+if(NOT TARGET JLib_DirectXTex AND EXISTS "${PACKAGE_PREFIX_DIR}/lib/DirectXTex.lib")
+    add_library(JLib_DirectXTex STATIC IMPORTED)
+    set_target_properties(JLib_DirectXTex PROPERTIES
+        IMPORTED_LOCATION "${PACKAGE_PREFIX_DIR}/lib/DirectXTex.lib")
+endif()
+
+include("${CMAKE_CURRENT_LIST_DIR}/JLibTargets.cmake")
+
+# Targets were installed per-configuration into lib/<Config>. A consumer building a configuration
+# JLib was not installed for (a custom config name, say) would otherwise fail to find anything;
+# map anything unknown onto Release, which is correct for any optimized /MD build.
+foreach(_t Scheduler Renderer Time Scene Input Sound PlatformerPhysics2D Physics3D Jolt)
+    if(TARGET JLib::${_t})
+        set_target_properties(JLib::${_t} PROPERTIES
+            MAP_IMPORTED_CONFIG_MINSIZEREL Release
+            MAP_IMPORTED_CONFIG_RELWITHDEBINFO Release)
+    endif()
+endforeach()
+
+check_required_components(JLib)

@@ -13,6 +13,16 @@
 #include <TaskDAG.h>
 #include <chrono>
 #include <cstdio>
+
+// Case-insensitive compare for the affinity-policy argument. The two platforms spell it
+// differently and neither name is standard C++: MSVC has _stricmp, POSIX has strcasecmp.
+#if defined(_WIN32)
+  #include <cstring>
+  #define JLIB_STRICMP _stricmp
+#else
+  #include <strings.h>
+  #define JLIB_STRICMP strcasecmp
+#endif
 #include <cstdint>
 #include <vector>
 #include <thread>
@@ -241,9 +251,9 @@ int main(int argc, char** argv) {
     const char* policyName = "hard";
     auto policy = JLib::TaskScheduler::AffinityPolicy::Hard;
     if (argc > 1) {
-        if (_stricmp(argv[1], "ideal") == 0) { policy = JLib::TaskScheduler::AffinityPolicy::Ideal; policyName = "ideal"; }
-        else if (_stricmp(argv[1], "none") == 0) { policy = JLib::TaskScheduler::AffinityPolicy::None; policyName = "none"; }
-        else if (_stricmp(argv[1], "physical") == 0) { policy = JLib::TaskScheduler::AffinityPolicy::PhysicalOnly; policyName = "physical"; }
+        if (JLIB_STRICMP(argv[1], "ideal") == 0) { policy = JLib::TaskScheduler::AffinityPolicy::Ideal; policyName = "ideal"; }
+        else if (JLIB_STRICMP(argv[1], "none") == 0) { policy = JLib::TaskScheduler::AffinityPolicy::None; policyName = "none"; }
+        else if (JLIB_STRICMP(argv[1], "physical") == 0) { policy = JLib::TaskScheduler::AffinityPolicy::PhysicalOnly; policyName = "physical"; }
     }
     JLib::TaskScheduler::SetAffinityPolicy(policy);
 
