@@ -94,6 +94,11 @@
 
   <ItemGroup>
     <ClCompile Include="src\SoundManager.cpp" />
+    <!-- miniaudio is a single-header library: this two-line .c file is the ONE translation unit
+         that defines MINIAUDIO_IMPLEMENTATION, and without it Sound.lib contains no ma_* symbols
+         and every consumer fails to link. It is a .c, so a glob or file list matching only *.cpp
+         silently drops it, which is exactly what happened. -->
+    <ClCompile Include="src\miniaudio.c" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="include\SoundManager.h" />

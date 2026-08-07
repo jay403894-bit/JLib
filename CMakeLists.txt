@@ -23,9 +23,9 @@ cmake_minimum_required(VERSION 3.21)
 
 # MASM only exists on Windows; the Linux context switch is GAS, which CMake handles as plain ASM.
 if(WIN32)
-    project(JLib LANGUAGES CXX ASM_MASM)
+    project(JLib LANGUAGES C CXX ASM_MASM)
 else()
-    project(JLib LANGUAGES CXX ASM)
+    project(JLib LANGUAGES C CXX ASM)
 endif()
 
 # The scheduler alone is portable (Windows x64 + Linux x86-64); everything above it -- the DX12
@@ -92,7 +92,11 @@ function(jlib_library NAME)
     if(NOT A_STD)
         set(A_STD 17)
     endif()
-    file(GLOB _srcs CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/${A_DIR}/src/*.cpp")
+    # *.c as well as *.cpp: Sound's miniaudio implementation TU is a .c file, and a cpp-only glob
+    # drops it silently, producing a library with no ma_* symbols that only fails at the consumer's
+    # link step. Any single-header C dependency lands the same way.
+    file(GLOB _srcs CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/${A_DIR}/src/*.cpp"
+                                      "${CMAKE_CURRENT_SOURCE_DIR}/${A_DIR}/src/*.c")
     # Platform sources live in src/win32 and src/posix. Exactly ONE directory is added, which is
     # the reason the split is by DIRECTORY and not by filename suffix: the glob above would happily
     # pick up both Topology_win32.cpp and Topology_posix.cpp and collide on duplicate symbols.

@@ -3,6 +3,17 @@
 
 namespace Physics2D {
 
+// Vec2 lives in namespace PlatformerPhysics2D (see PlatformerPhysics2D/include/Vec2.h), so it has
+// to be named. Without this the header only compiled when a consumer happened to have already
+// pulled Vec2 into scope -- it was NOT self-contained, and including it first produced "unknown
+// override specifier" rather than an honest missing-type error. Fallout from the
+// Physics2D -> PlatformerPhysics2D rename.
+//
+// Worth revisiting the layering rather than the symptom: Vec2 is geometry, so it arguably belongs
+// in THIS library with PlatformerPhysics2D depending on Geometry, instead of Geometry reaching
+// into the physics library for its own vector type.
+using PlatformerPhysics2D::Vec2;
+
 // Center + full size, matching PhysicsWorld's own convention (posX/posY is a cell's center,
 // size.x/size.y is full width/height, half-extents computed on the fly) -- not min-corner, so a
 // Rect built from a PhysicsWorld row is just { {world.posX[i], world.posY[i]}, world.size[i] }.

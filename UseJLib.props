@@ -56,6 +56,13 @@
     <JLibConfig Condition="'$(JLibConfig)'==''">Release</JLibConfig>
 
     <JLibBinDir>$(JLibRoot)build\$(Platform)\$(JLibConfig)\</JLibBinDir>
+
+    <!-- DirectXTex ships as a prebuilt lib in BOTH CRT flavours, and the wrong one is not a soft
+         failure: linking the /MD build into a /MDd consumer is an LNK2038 on _ITERATOR_DEBUG_LEVEL
+         and RuntimeLibrary. Keyed on the CRT rather than the configuration name, exactly like
+         JLibConfig above. Development uses /MD like Release, so it takes the release build. -->
+    <JLibDxTexCfg Condition="'$(JLibConfig)'=='Debug'">debug</JLibDxTexCfg>
+    <JLibDxTexCfg Condition="'$(JLibDxTexCfg)'==''">release</JLibDxTexCfg>
   </PropertyGroup>
 
   <ItemDefinitionGroup>
@@ -68,7 +75,7 @@
     </ClCompile>
 
     <Link>
-      <AdditionalLibraryDirectories>$(JLibBinDir);$(JLibRoot)ThirdParty\DirectXTex\lib\release;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
+      <AdditionalLibraryDirectories>$(JLibBinDir);$(JLibRoot)ThirdParty\DirectXTex\lib\$(JLibDxTexCfg);%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
       <!-- Every JLib library plus the system libraries they need. The linker discards objects from
            libraries you never reference, so naming all of them costs nothing in your binary - a
            project that only touches the scheduler does not pay for the renderer. -->

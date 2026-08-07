@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  ============================ COPY THIS INTO EACH DEMO / GAME REPO ============================
+  A template, not part of the JLib build. Applications live in their own repositories, so they need
+  a way to FIND JLib rather than assume it. This resolves that, then imports UseJLib.props.
+
+  USAGE -- one line in your .vcxproj, right after Microsoft.Cpp.props:
+
+      <Import Project="$(MSBuildProjectDirectory)\FindJLib.props" />
+
+  That is the entire integration. Every include directory, the library path and all nine .lib names
+  come from UseJLib.props behind it.
+
+  RESOLUTION ORDER, first hit wins. Deliberately the same chain Physics3D\Jolt.props uses for Jolt,
+  so the project has ONE convention for locating an external dependency rather than two:
+
+    1. /p:JLibRoot=C:\path\to\JLib     -- command line. This is what CI passes.
+    2. %JLIB_ROOT%                     -- environment variable. Set once per machine; the normal
+                                          developer case. (setx JLIB_ROOT C:\JLib)
+    3. ..\JLib relative to this repo   -- covers a side-by-side clone with no configuration at all.
+    4. C:\JLib                         -- last-resort fallback.
+
+  Note 4 is a FALLBACK, not a requirement. Hardcoding C:\JLib would mean the demo only builds for
+  someone who happened to clone to the same path; having it last means it works out of the box on
+  the author's machine while remaining configurable everywhere else.
+-->
+<Project xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <PropertyGroup>
+    <!-- 1. command line wins, so nothing below overrides an explicit /p:JLibRoot= -->
+    <JLibRoot Condition="'$(JLibRoot)'=='' and '$(JLIB_ROOT)'!=''">$(JLIB_ROOT)</JLibRoot>
+    <!-- 3. side-by-side clone: <parent>\MyDemo and <parent>\JLib -->
+    <JLibRoot Condition="'$(JLibRoot)'=='' and exists('$(MSBuildProjectDirectory)\..\JLib\UseJLib.props')">$(MSBuildProjectDirectory)\..\JLib</JLibRoot>
+    <JLibRoot Condition="'$(JLibRoot)'=='' and exists('$(MSBuildProjectDirectory)\..\..\JLib\UseJLib.props')">$(MSBuildProjectDirectory)\..\..\JLib</JLibRoot>
+    <!-- 4. fallback -->
+    <JLibRoot Condition="'$(JLibRoot)'==''">C:\JLib</JLibRoot>
+  </PropertyGroup>
+
+  <!-- Fail with a sentence that says what to do, rather than 200 missing-header errors. -->
+  <Target Name="JLibCheckFound" BeforeTargets="PrepareForBuild" Condition="!exists('$(JLibRoot)\UseJLib.props')">
+    <Error Text="JLib not found. Looked for '$(JLibRoot)\UseJLib.props'. Set the JLIB_ROOT environment variable to your JLib clone (setx JLIB_ROOT C:\path\to\JLib), pass /p:JLibRoot=..., or clone JLib beside this repository. See https://github.com/jay403894-bit/JLib" />
+  </Target>
+
+  <Import Project="$(JLibRoot)\UseJLib.props" Condition="exists('$(JLibRoot)\UseJLib.props')" />
+</Project>
