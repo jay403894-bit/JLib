@@ -1,6 +1,6 @@
-﻿// Scheduler microbenchmark -- standalone console app linked against the DEPLOYED release
-// Threads.lib (C:\libs\Threads), so it measures exactly the bits every game links, not a
-// special build. Build with build_bench.bat, run bench.exe.
+﻿// Scheduler microbenchmark -- console app built by the umbrella solution (Bench.vcxproj takes a
+// ProjectReference on Scheduler), so it measures exactly the library every game links, not a
+// special build. Build JLib.slnx, run build\x64\<Config>\SchedulerBench.exe.
 //
 // Four benches, chosen to mirror how the games actually use the scheduler:
 //   1. throughput   -- how many no-op tasks/sec the pool can drain (create+push+steal+run+free)
@@ -247,7 +247,7 @@ int main(int argc, char** argv) {
     }
     JLib::TaskScheduler::SetAffinityPolicy(policy);
 
-    printf("T_Threads scheduler bench  (sizeof(Task)=%zu, hw threads=%u, affinity=%s)\n",
+    printf("JLib::Scheduler bench  (sizeof(Task)=%zu, hw threads=%u, affinity=%s)\n",
         sizeof(JLib::Task), std::thread::hardware_concurrency(), policyName);
     printf("----------------------------------------------------------------\n");
 
