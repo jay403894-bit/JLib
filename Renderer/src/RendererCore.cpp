@@ -1,4 +1,7 @@
-﻿#include "../include/RendererCore.h"
+﻿// SPDX-License-Identifier: BSD-3-Clause
+// Copyright (c) 2026 Joshua Makler. Part of JLib -- see LICENSE at the repository root.
+
+#include "../include/RendererCore.h"
 #include "../include/Renderer2D.h"     // Renderer2D -- PresentFrame collects its draw lists
 #include "../include/Renderer3D.h"     // Renderer3D -- PresentFrame records + submits its 3D-world list
 #include "../include/Helpers.h"      // ThrowIfFailed

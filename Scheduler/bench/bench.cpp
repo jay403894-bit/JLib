@@ -1,4 +1,7 @@
-﻿// Scheduler microbenchmark -- console app built by the umbrella solution (Bench.vcxproj takes a
+﻿// SPDX-License-Identifier: BSD-3-Clause
+// Copyright (c) 2026 Joshua Makler. Part of JLib -- see LICENSE at the repository root.
+
+// Scheduler microbenchmark -- console app built by the umbrella solution (Bench.vcxproj takes a
 // ProjectReference on Scheduler), so it measures exactly the library every game links, not a
 // special build. Build JLib.slnx, run build\x64\<Config>\SchedulerBench.exe.
 //

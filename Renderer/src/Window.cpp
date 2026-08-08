@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: BSD-3-Clause
+// Copyright (c) 2026 Joshua Makler. Part of JLib -- see LICENSE at the repository root.
+
 #include "../include/Window.h"
 #include "../include/RendererCore.h"   // full definition needed here to call m_renderer->Resize()
 #include "../include/imgui/imgui.h"    // IMGUI_IMPL_API + ImGui::GetCurrentContext

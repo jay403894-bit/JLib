@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: BSD-3-Clause
+// Copyright (c) 2026 Joshua Makler. Part of JLib -- see LICENSE at the repository root.
+
 // ============================================================================================
 // Skybox_PS.hlsl -- procedural gradient sky from the view ray (no texture, no HDR asset). A horizon->
 // zenith blend for the upper hemisphere, a dim ground tone below, plus a soft sun disc + glow. Tone-

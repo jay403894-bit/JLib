@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: BSD-3-Clause
+// Copyright (c) 2026 Joshua Makler. Part of JLib -- see LICENSE at the repository root.
+
 // ShadowDepth_VS.hlsl -- the shadow map pass. Renders the scene from the LIGHT's point of view into
 // a depth-only target; the resulting depth buffer is "how far the light can see in each direction",
 // and the main pixel shader later asks "is this surface further from the light than that?" to decide

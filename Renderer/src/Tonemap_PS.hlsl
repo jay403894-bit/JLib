@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: BSD-3-Clause
+// Copyright (c) 2026 Joshua Makler. Part of JLib -- see LICENSE at the repository root.
+
 // Tonemapping: the pass that turns the FP16 scene into something a display can show.
 //
 // Everything before this writes LINEAR HDR into an R16G16B16A16_FLOAT intermediate -- values well

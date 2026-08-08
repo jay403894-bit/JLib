@@ -4,7 +4,7 @@
   A template, not part of the JLib build. Applications live in their own repositories, so they need
   a way to FIND JLib rather than assume it. This resolves that, then imports UseJLib.props.
 
-  USAGE -- one line in your .vcxproj, right after Microsoft.Cpp.props:
+  USAGE - one line in your .vcxproj, right after Microsoft.Cpp.props:
 
       <Import Project="$(MSBuildProjectDirectory)\FindJLib.props" />
 
@@ -14,11 +14,11 @@
   RESOLUTION ORDER, first hit wins. Deliberately the same chain Physics3D\Jolt.props uses for Jolt,
   so the project has ONE convention for locating an external dependency rather than two:
 
-    1. /p:JLibRoot=C:\path\to\JLib     -- command line. This is what CI passes.
-    2. %JLIB_ROOT%                     -- environment variable. Set once per machine; the normal
+    1. /p:JLibRoot=C:\path\to\JLib     - command line. This is what CI passes.
+    2. %JLIB_ROOT%                     - environment variable. Set once per machine; the normal
                                           developer case. (setx JLIB_ROOT C:\JLib)
-    3. ..\JLib relative to this repo   -- covers a side-by-side clone with no configuration at all.
-    4. C:\JLib                         -- last-resort fallback.
+    3. ..\JLib relative to this repo   - covers a side-by-side clone with no configuration at all.
+    4. C:\JLib                         - last-resort fallback.
 
   Note 4 is a FALLBACK, not a requirement. Hardcoding C:\JLib would mean the demo only builds for
   someone who happened to clone to the same path; having it last means it works out of the box on

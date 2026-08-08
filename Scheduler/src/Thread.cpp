@@ -1,4 +1,7 @@
-﻿#include "../include/Thread.h"
+﻿// SPDX-License-Identifier: BSD-3-Clause
+// Copyright (c) 2026 Joshua Makler. Part of JLib -- see LICENSE at the repository root.
+
+#include "../include/Thread.h"
 #include "../include/platform.h"
 #include "../include/TaskScheduler.h"
 #include <chrono>

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: BSD-3-Clause
+// Copyright (c) 2026 Joshua Makler. Part of JLib -- see LICENSE at the repository root.
+
 // Single-thread dispatch that turns "how many particles are in the compacted alive list right
 // now" into "how many thread groups does the update dispatch actually need" -- entirely on the
 // GPU, so ExecuteIndirect never needs a CPU readback. Must run AFTER CompactParticles.hlsl's

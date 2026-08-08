@@ -1,4 +1,7 @@
-﻿// MUST be first, before any include pulls in the CRT: cgltf (and tinyobj) use fopen/strncpy, which
+﻿// SPDX-License-Identifier: BSD-3-Clause
+// Copyright (c) 2026 Joshua Makler. Part of JLib -- see LICENSE at the repository root.
+
+// MUST be first, before any include pulls in the CRT: cgltf (and tinyobj) use fopen/strncpy, which
 // MSVC flags as C4996 "deprecated". This silences that for THIS TU only, so a pristine re-downloaded
 // cgltf.h compiles unmodified -- no need to hand-patch it to fopen_s/strncpy_s each update.
 #define _CRT_SECURE_NO_WARNINGS

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: BSD-3-Clause
+// Copyright (c) 2026 Joshua Makler. Part of JLib -- see LICENSE at the repository root.
+
 // "Linear" behavior: straight-line motion by velocity, fading out over lifetime. The FIRST
 // registered per-effect update shader -- see ParticleCommon.hlsli for the shared
 // struct/buffers/root-constants every update shader (and SpawnParticles.hlsl) agree on.

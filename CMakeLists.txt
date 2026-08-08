@@ -322,6 +322,21 @@ install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/LICENSE"
               "${CMAKE_CURRENT_SOURCE_DIR}/THIRD-PARTY-NOTICES.md"
         DESTINATION .)
 
+# ...and so do the VENDORED components' own licence texts. THIRD-PARTY-NOTICES.md is a summary; MIT
+# and BSD require the actual text to accompany a redistribution, and an installed package is a
+# redistribution. Without this the obligation is met for anyone who clones the repo (where the texts
+# sit beside the code) and quietly unmet for anyone who consumes a built install -- which is the
+# distribution path where it actually matters. Components whose licence lives in a header preamble
+# (tinyobjloader, miniaudio, DirectXTex, DirectX-Headers) need no entry: those headers are installed.
+install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/Scheduler/include/LICENSE.md"
+        DESTINATION share/licenses RENAME concurrentqueue-LICENSE.md)
+install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/Renderer/include/imgui/LICENSE.txt"
+        DESTINATION share/licenses RENAME imgui-LICENSE.txt)
+install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/Renderer/include/LICENSE"
+        DESTINATION share/licenses RENAME cgltf-LICENSE)
+install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/ThirdParty/Jolt/LICENSE"
+        DESTINATION share/licenses RENAME jolt-LICENSE)
+
 # Compiled shaders. Without these the renderer links but has nothing to load at runtime.
 if(JLIB_DXC)
     install(DIRECTORY "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/" DESTINATION bin

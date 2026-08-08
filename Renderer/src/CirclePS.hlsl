@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: BSD-3-Clause
+// Copyright (c) 2026 Joshua Makler. Part of JLib -- see LICENSE at the repository root.
+
 // Signed-distance circle for Renderer2D's 2D primitives. Same VS_OUTPUT/PS_INPUT layout as
 // PixelShader.hlsl -- it pairs with the SAME VertexShader.hlsl (registered together via
 // Renderer2D::RegisterEffect); only the pixel stage differs.

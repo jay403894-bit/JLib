@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: BSD-3-Clause
+// Copyright (c) 2026 Joshua Makler. Part of JLib -- see LICENSE at the repository root.
+
 // "Wave" behavior: drifts by velocity.x horizontally while oscillating vertically with a
 // sin() driven by age -- a genuinely different compute shader from UpdateParticles.hlsl's
 // straight-line motion, proving the per-effect-pool system actually swaps shaders, not branches.

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: BSD-3-Clause
+// Copyright (c) 2026 Joshua Makler. Part of JLib -- see LICENSE at the repository root.
+
 // ============================================================================================
 // Basic3D_PS.hlsl -- the PIXEL shader. PBR metallic-roughness (Cook-Torrance) with a multi-light
 // loop. Runs once per covered pixel; outputs the lit color (SV_TARGET). Shared by BOTH the static

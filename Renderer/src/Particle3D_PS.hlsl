@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: BSD-3-Clause
+// Copyright (c) 2026 Joshua Makler. Part of JLib -- see LICENSE at the repository root.
+
 // Particle3D_PS.hlsl -- phase 1 keeps it texture-free: a SOFT RADIAL falloff computed from the quad UVs
 // turns each hard billboard into a round, glowing dot (no texture bind, no descriptor heap). The PSO uses
 // alpha blending with depth TEST on but depth WRITE off, so particles are occluded by opaque geometry yet

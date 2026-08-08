@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: BSD-3-Clause
+// Copyright (c) 2026 Joshua Makler. Part of JLib -- see LICENSE at the repository root.
+
 // SHARED across every particle pool (see ParticleCommon.hlsli / Renderer::RegisterParticleEffect)
 // -- popping a dead slot and copying spawn data in is identical regardless of which pool's
 // buffers this dispatch is currently bound to, so there's only ever one compiled copy of this.

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: BSD-3-Clause
+// Copyright (c) 2026 Joshua Makler. Part of JLib -- see LICENSE at the repository root.
+
 // ============================================================================================
 // Skybox_VS.hlsl -- the VISUAL-ONLY procedural sky, vertex stage. No vertex buffer: 3 verts from
 // SV_VertexID make a FULLSCREEN TRIANGLE at the far plane (z=1). For each pixel it reconstructs a

@@ -16,7 +16,7 @@ which is why it is vendored alongside rather than only summarised here.
 | **cgltf** | MIT — © 2018-2021 Johannes Kuhlmann | `Renderer/include/cgltf.h`, `cgltf_write.h` | `Renderer/include/LICENSE` |
 | **tinyobjloader** | MIT | `Renderer/include/tiny_obj_loader.h` | header preamble |
 | **miniaudio** | Public domain **or** MIT-0 (dual, your choice) | `Sound/include/miniaudio.h` | header preamble |
-| **Jolt Physics** | MIT — © 2021 Jorrit Rouwe | `ThirdParty/Jolt/Jolt/` (source, built by `Jolt.vcxproj`) | `SPDX-License-Identifier: MIT` in every source file |
+| **Jolt Physics** | MIT — © 2021 Jorrit Rouwe | `ThirdParty/Jolt/Jolt/` (source, built by `Jolt.vcxproj`) | `ThirdParty/Jolt/LICENSE` |
 | **DirectXTex** | MIT — © Microsoft | `ThirdParty/DirectXTex/` | header preamble |
 | **DirectX-Headers** | MIT — © Microsoft | `ThirdParty/DirectX-Headers/include/` (33 files) | per-header preamble |
 
@@ -42,13 +42,21 @@ notice, which this file plus the header preamble satisfies. Replacing it with a 
 is a wanted cleanup — it would remove the only binary blob in the tree and let it participate in the
 `Development` configuration properly instead of borrowing the release CRT build.
 
-**Jolt carries no LICENSE file in this tree — ACTION NEEDED.** Every Jolt source file declares
-`SPDX-License-Identifier: MIT`, which is a valid and unambiguous licence declaration, so the position
-is defensible as it stands. But upstream ships a full `LICENSE` at its repo root and that file was
-not part of the source folder vendored here. **Copy it from
-`https://github.com/jrouwe/JoltPhysics` on the next Jolt update.** It is deliberately not
-reconstructed from memory here: MIT is boilerplate, but the copyright line and year are not, and an
-invented licence file is worse than a missing one.
+**Jolt's LICENSE is now vendored** at `ThirdParty/Jolt/LICENSE` (2026-08-08), copied from the
+upstream release rather than reconstructed — MIT is boilerplate but the copyright line and year are
+not, and an invented licence file is worse than a missing one. This closes the gap that previously
+rested on the per-file `SPDX-License-Identifier: MIT` declarations alone. Those are a valid licence
+declaration, so the old position was defensible; it was simply weaker than shipping the text, and
+"the SPDX tag is in a source file we did not ship you" is not an argument worth having.
+**Re-copy it on any Jolt update** — the copyright year moves.
+
+**BINARY INSTALLS SHIP THE LICENCE TEXTS TOO.** `CMakeLists.txt` installs the files named in the
+table above into `share/licenses/`, not just this summary. That matters because a `make install`
+consumer never sees the source tree, so "the text is vendored alongside the code" — the principle
+stated at the top of this file — would otherwise hold for a git clone and quietly fail for exactly
+the distribution path where attribution obligations actually bite. Components whose licence lives in
+a header preamble (tinyobjloader, miniaudio, DirectXTex, DirectX-Headers) are covered automatically,
+because those headers are themselves installed.
 
 **EnTT (MIT) is not vendored yet.** Add a row here at the same time as the code, not afterwards — a
 notices file that lags the tree is worse than none, because it reads as a complete list.

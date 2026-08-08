@@ -1,4 +1,7 @@
-﻿#include "../include/Renderer2D.h"
+﻿// SPDX-License-Identifier: BSD-3-Clause
+// Copyright (c) 2026 Joshua Makler. Part of JLib -- see LICENSE at the repository root.
+
+#include "../include/Renderer2D.h"
 #include "../include/Helpers.h"      // ThrowIfFailed
 #include <Thread.h>     // Thread::GetCurrent()->qIndex for worker-local storage
 #include <TaskScheduler.h> // JLib::TaskScheduler::Instance()/CreateTask -- previously pulled in transitively via Renderer2D.h

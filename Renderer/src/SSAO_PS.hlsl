@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: BSD-3-Clause
+// Copyright (c) 2026 Joshua Makler. Part of JLib -- see LICENSE at the repository root.
+
 // Screen-space ambient occlusion.
 //
 // Why this pass exists: hemisphere ambient varies fill light by which way a surface FACES, which is

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: BSD-3-Clause
+// Copyright (c) 2026 Joshua Makler. Part of JLib -- see LICENSE at the repository root.
+
 // UpdateParticles3D.hlsl -- the phase-1 3D particle simulation (compute). A SELF-RECYCLING fountain: every
 // particle integrates under gravity, and when its lifetime runs out it RESPAWNS at the emitter with a fresh
 // pseudo-random velocity. That means NO spawn pass, dead-list, or compaction is needed yet -- the fixed pool

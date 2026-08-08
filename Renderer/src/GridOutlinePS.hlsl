@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: BSD-3-Clause
+// Copyright (c) 2026 Joshua Makler. Part of JLib -- see LICENSE at the repository root.
+
 // Same VS_OUTPUT/PS_INPUT layout as PixelShader.hlsl -- pairs with the SAME VertexShader.hlsl
 // (registered together via Renderer2D::RegisterEffect), only the pixel stage differs. Draws a
 // thin BLACK border near the quad's UV edges and fully transparent everywhere else, so an item

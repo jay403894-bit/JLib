@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: BSD-3-Clause
+// Copyright (c) 2026 Joshua Makler. Part of JLib -- see LICENSE at the repository root.
+
 // ============================================================================================
 // Basic3D_PS.hlsl -- the PIXEL (fragment) shader. Runs ONCE PER PIXEL the triangle covers. Its
 // job: output the final color for that pixel (SV_TARGET).

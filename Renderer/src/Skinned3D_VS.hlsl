@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: BSD-3-Clause
+// Copyright (c) 2026 Joshua Makler. Part of JLib -- see LICENSE at the repository root.
+
 // ============================================================================================
 // Skinned3D_VS.hlsl -- the SKINNED vertex shader. Same job as Basic3D_VS (output clip pos + the
 // normal/uv the pixel shader needs), but first DEFORMS the vertex by its bones. Pairs with the

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: BSD-3-Clause
+// Copyright (c) 2026 Joshua Makler. Part of JLib -- see LICENSE at the repository root.
+
 // Particle3D_VS.hlsl -- world-space, CAMERA-FACING billboards for the 3D GPU particles. No vertex buffer:
 // each particle is one instance (SV_InstanceID), expanded to a quad (6 verts, SV_VertexID). The corners are
 // offset from the particle center along the camera's WORLD-space right/up axes, so the quad always faces the

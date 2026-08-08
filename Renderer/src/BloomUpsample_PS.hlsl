@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: BSD-3-Clause
+// Copyright (c) 2026 Joshua Makler. Part of JLib -- see LICENSE at the repository root.
+
 // Bloom, stage 2 of 2: UPSAMPLE + ACCUMULATE.
 //
 // Walks back UP the chain built by BloomDownsample_PS, adding each smaller level into the next

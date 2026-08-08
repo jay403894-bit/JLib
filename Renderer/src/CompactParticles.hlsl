@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: BSD-3-Clause
+// Copyright (c) 2026 Joshua Makler. Part of JLib -- see LICENSE at the repository root.
+
 // SHARED across every pool -- scanning maxParticles slots and appending the alive ones is
 // identical regardless of pool behavior. This is the cheap O(maxParticles) pass that makes the
 // expensive per-particle UPDATE dispatch (UpdateParticles.hlsl/WaveParticles.hlsl) only need to

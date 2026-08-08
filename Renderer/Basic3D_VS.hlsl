@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: BSD-3-Clause
+// Copyright (c) 2026 Joshua Makler. Part of JLib -- see LICENSE at the repository root.
+
 // ============================================================================================
 // Basic3D_VS.hlsl -- the VERTEX shader. Runs ONCE PER VERTEX. Its job: output where this vertex
 // lands on the screen (SV_POSITION), plus anything the pixel shader will need (here, the normal).

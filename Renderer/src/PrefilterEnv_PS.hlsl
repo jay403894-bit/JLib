@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: BSD-3-Clause
+// Copyright (c) 2026 Joshua Makler. Part of JLib -- see LICENSE at the repository root.
+
 // Step 3 of the IBL bake: environment cubemap -> PREFILTERED SPECULAR cubemap (one mip per roughness).
 //
 // The specular half of the split-sum approximation. A rough surface reflects a wide cone of the

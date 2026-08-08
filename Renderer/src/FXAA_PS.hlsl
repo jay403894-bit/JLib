@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: BSD-3-Clause
+// Copyright (c) 2026 Joshua Makler. Part of JLib -- see LICENSE at the repository root.
+
 // FXAA -- Fast Approximate Anti-Aliasing (Lottes, NVIDIA).
 //
 // The LAST pass in the chain. It runs on the tonemapped, gamma-encoded LDR image, which is not an

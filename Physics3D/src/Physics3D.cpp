@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: BSD-3-Clause
+// Copyright (c) 2026 Joshua Makler. Part of JLib -- see LICENSE at the repository root.
+
 // JLib::Physics3D implementation -- the Jolt-backed physics library (see Physics3D.h for the interface
 // contract). Boilerplate (layer interfaces, allocator/factory/type registration, the step call) adapted
 // from Jolt's public-domain HelloWorld.cpp. All Jolt/JPH types stay inside THIS file (PIMPL). Jolt's jobs

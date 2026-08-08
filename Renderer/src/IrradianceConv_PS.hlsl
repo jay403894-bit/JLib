@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: BSD-3-Clause
+// Copyright (c) 2026 Joshua Makler. Part of JLib -- see LICENSE at the repository root.
+
 // Step 2 of the IBL bake: environment cubemap -> DIFFUSE IRRADIANCE cubemap.
 //
 // This is the term that replaces flat/hemisphere ambient. For a given surface normal, it answers

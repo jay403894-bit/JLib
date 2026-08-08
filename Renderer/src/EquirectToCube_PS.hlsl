@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: BSD-3-Clause
+// Copyright (c) 2026 Joshua Makler. Part of JLib -- see LICENSE at the repository root.
+
 // Step 1 of the IBL bake: equirectangular HDR -> cubemap face.
 //
 // HDRIs ship as equirectangular (latitude/longitude) images because that is a convenient way to store

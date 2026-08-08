@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: BSD-3-Clause
+// Copyright (c) 2026 Joshua Makler. Part of JLib -- see LICENSE at the repository root.
+
 // Standalone usage example for JLib::Input. Kept COMMENTED OUT on purpose: this project builds a
 // static library that apps link, and a stray main() here can collide with the consumer's entry
 // point. Copy it into your own project to try the library.

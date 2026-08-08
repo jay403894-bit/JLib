@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: BSD-3-Clause
+// Copyright (c) 2026 Joshua Makler. Part of JLib -- see LICENSE at the repository root.
+
 // SpawnBurst3D.hlsl -- writes ONE burst of particles into a ring-buffer burst pool (phase 2A).
 // The CPU owns the ring head (single writer), so this shader gets an explicit slot range: thread i
 // writes slot (gStartSlot + i) % gPoolSize. No dead-list/counters -- transient burst particles are

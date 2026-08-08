@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: BSD-3-Clause
+// Copyright (c) 2026 Joshua Makler. Part of JLib -- see LICENSE at the repository root.
+
 // Shared by every per-effect update shader (UpdateParticles.hlsl, WaveParticles.hlsl, future
 // ones) AND SpawnParticles.hlsl -- all of them bind through the SAME root signature (see
 // Renderer::CreateComputeRootSignature), so they must all agree on this exact layout.

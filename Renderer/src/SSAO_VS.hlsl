@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: BSD-3-Clause
+// Copyright (c) 2026 Joshua Makler. Part of JLib -- see LICENSE at the repository root.
+
 // Fullscreen triangle, generated from the vertex ID alone -- no vertex or index buffer is bound for
 // this pass (draw it with DrawInstanced(3, 1, 0, 0)). One oversized triangle rather than two quad
 // triangles: the quad's shared diagonal gets rasterized twice and breaks up the 2x2 quads that ddx/ddy

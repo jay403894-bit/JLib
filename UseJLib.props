@@ -49,13 +49,28 @@
     <!-- Where JLib lives. Derived from this file's own location, so it is correct wherever the tree
          is cloned and no absolute path is baked in. -->
     <JLibRoot Condition="'$(JLibRoot)'==''">$(MSBuildThisFileDirectory)</JLibRoot>
+    <!-- JLibDir is JLibRoot WITH A GUARANTEED TRAILING SEPARATOR, and every path below uses it.
+         Two reasons it is a separate property rather than a reassignment of JLibRoot:
+
+         1. Paths below are built as $(JLibDir)Scheduler\include with no separator of their own. That
+            is correct for the default above ($(MSBuildThisFileDirectory) always ends in a backslash)
+            and wrong for any caller that supplies JLibRoot itself - a command line, an environment
+            variable or a relative clone all lack one. Unnormalised, every include directory silently
+            concatenates into "...\JLibScheduler\include" and you get a wall of missing headers
+            pointing nowhere near the cause.
+
+         2. A property set on the MSBuild COMMAND LINE (/p:JLibRoot=...) is GLOBAL and cannot be
+            reassigned by a project - the assignment is silently ignored. So normalising JLibRoot
+            in place worked for the environment-variable path and did nothing for the CI path, which
+            is the worst possible split. Writing to a different property always takes effect. -->
+    <JLibDir>$([MSBuild]::EnsureTrailingSlash('$(JLibRoot)'))</JLibDir>
 
     <!-- Map the consumer's configuration onto a JLib one. Only set if the consumer did not. -->
     <JLibConfig Condition="'$(JLibConfig)'=='' and '$(Configuration)'=='Debug'">Debug</JLibConfig>
     <JLibConfig Condition="'$(JLibConfig)'=='' and '$(Configuration)'=='Development'">Development</JLibConfig>
     <JLibConfig Condition="'$(JLibConfig)'==''">Release</JLibConfig>
 
-    <JLibBinDir>$(JLibRoot)build\$(Platform)\$(JLibConfig)\</JLibBinDir>
+    <JLibBinDir>$(JLibDir)build\$(Platform)\$(JLibConfig)\</JLibBinDir>
 
     <!-- DirectXTex ships as a prebuilt lib in BOTH CRT flavours, and the wrong one is not a soft
          failure: linking the /MD build into a /MDd consumer is an LNK2038 on _ITERATOR_DEBUG_LEVEL
@@ -70,12 +85,12 @@
       <!-- Same list as JLib.Common.props. Duplicated deliberately: that file is INTERNAL to the
            suite and carries build settings a consumer must not inherit, so the two are kept apart
            even though the include list overlaps. -->
-      <AdditionalIncludeDirectories>$(JLibRoot)Scheduler\include;$(JLibRoot)Renderer\include;$(JLibRoot)Time\include;$(JLibRoot)Assets\include;$(JLibRoot)Geometry\include;$(JLibRoot)Scene\include;$(JLibRoot)Input\include;$(JLibRoot)Sound\include;$(JLibRoot)PlatformerPhysics2D\include;$(JLibRoot)Physics3D\include;$(JLibRoot)ThirdParty;$(JLibRoot)ThirdParty\Jolt;$(JLibRoot)ThirdParty\DirectX-Headers\include;$(JLibRoot)ThirdParty\DirectXTex\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(JLibDir)Scheduler\include;$(JLibDir)Renderer\include;$(JLibDir)Time\include;$(JLibDir)Assets\include;$(JLibDir)Geometry\include;$(JLibDir)Scene\include;$(JLibDir)Input\include;$(JLibDir)Sound\include;$(JLibDir)PlatformerPhysics2D\include;$(JLibDir)Physics3D\include;$(JLibDir)ThirdParty;$(JLibDir)ThirdParty\Jolt;$(JLibDir)ThirdParty\DirectX-Headers\include;$(JLibDir)ThirdParty\DirectXTex\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <PreprocessorDefinitions>NOMINMAX;WIN32_LEAN_AND_MEAN;%(PreprocessorDefinitions)</PreprocessorDefinitions>
     </ClCompile>
 
     <Link>
-      <AdditionalLibraryDirectories>$(JLibBinDir);$(JLibRoot)ThirdParty\DirectXTex\lib\$(JLibDxTexCfg);%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
+      <AdditionalLibraryDirectories>$(JLibBinDir);$(JLibDir)ThirdParty\DirectXTex\lib\$(JLibDxTexCfg);%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
       <!-- Every JLib library plus the system libraries they need. The linker discards objects from
            libraries you never reference, so naming all of them costs nothing in your binary - a
            project that only touches the scheduler does not pay for the renderer. -->
@@ -124,7 +139,7 @@
 
   <!-- Fail with a sentence that says what to do, rather than 40 unresolved externals. -->
   <Target Name="JLibCheckBuilt" BeforeTargets="Link" Condition="!Exists('$(JLibBinDir)Scheduler.lib')">
-    <Error Text="JLib has not been built for this configuration. Expected '$(JLibBinDir)Scheduler.lib'. Open $(JLibRoot)JLib.slnx and build $(JLibConfig)|$(Platform) first. (Your configuration '$(Configuration)' maps to JLib's '$(JLibConfig)'; override with the JLibConfig property if that is wrong.)" />
+    <Error Text="JLib has not been built for this configuration. Expected '$(JLibBinDir)Scheduler.lib'. Open $(JLibDir)JLib.slnx and build $(JLibConfig)|$(Platform) first. (Your configuration '$(Configuration)' maps to JLib's '$(JLibConfig)'; override with the JLibConfig property if that is wrong.)" />
   </Target>
 
 </Project>

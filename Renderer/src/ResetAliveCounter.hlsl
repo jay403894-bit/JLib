@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: BSD-3-Clause
+// Copyright (c) 2026 Joshua Makler. Part of JLib -- see LICENSE at the repository root.
+
 // Single-thread: zeroes u2/u3's (AliveList's) hidden UAV counter before CompactParticles.hlsl
 // re-appends this frame's alive indices. Separate dispatch (not folded into CompactParticles)
 // because the reset must happen-before every append, and there's no ordering guarantee between

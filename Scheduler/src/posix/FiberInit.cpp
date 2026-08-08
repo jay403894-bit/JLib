@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: BSD-3-Clause
+// Copyright (c) 2026 Joshua Makler. Part of JLib -- see LICENSE at the repository root.
+
 // Fiber::Init -- System V AMD64 (Linux) frame layout.
 //
 // Beside ContextSwitch.s for the same reason the Windows pair sit together: this function writes

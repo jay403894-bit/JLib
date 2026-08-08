@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: BSD-3-Clause
+// Copyright (c) 2026 Joshua Makler. Part of JLib -- see LICENSE at the repository root.
+
 #include "../include/SoundManager.h"
 #include <Windows.h>
 // See SoundManager.h's comment -- Windows.h (included above, AFTER that header in this file)

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: BSD-3-Clause
+// Copyright (c) 2026 Joshua Makler. Part of JLib -- see LICENSE at the repository root.
+
 // Same GlobalUniforms layout as VertexShader.hlsl, kept identical so both shaders can share the
 // SAME constant buffer (m_ConstantBuffers[frame]) without a second upload. cameraPos/cameraZoom
 // are what this shader actually needs them for (see VSMain): particles are simulated entirely in

@@ -1,4 +1,7 @@
-﻿#include "../include/Renderer3D.h"
+﻿// SPDX-License-Identifier: BSD-3-Clause
+// Copyright (c) 2026 Joshua Makler. Part of JLib -- see LICENSE at the repository root.
+
+#include "../include/Renderer3D.h"
 #include "../include/Helpers.h"   // ThrowIfFailed
 #include "../include/Vertex.h"    // Vertex3D
 #include "../include/Particle3D.h" // Particle3D (GPU particle buffer stride)
