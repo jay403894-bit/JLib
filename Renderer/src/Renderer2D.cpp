@@ -626,10 +626,12 @@ void Renderer2D::EnsurePrimitives()
 		m_Prim.circleEffect = RegisterEffect(L"shaders\\VertexShader.cso",
 			L"shaders\\CirclePS.cso", DefaultAlphaBlend());
 	}
-	catch (...) {
+	catch (const std::exception& e) {
 		m_Prim.circleEffect = 0;   // 0 = the default sprite effect => "unavailable", use meshes
-		OutputDebugStringA("[Renderer2D] CirclePS.cso not found -- circles fall back to N-gon "
-			"meshes (visible faceting when zoomed). Redeploy the renderer's shaders.\n");
+		char buf[512];
+		sprintf_s(buf, "[Renderer2D] CirclePS effect NOT REGISTERED -- circles fall back to N-gon "
+			"meshes (visible faceting when zoomed). Cause: %s\n", e.what());
+		OutputDebugStringA(buf);
 	}
 
 	// SDF rounded rectangle: the UI shape. Same guard -- missing .cso degrades to sharp corners
@@ -638,10 +640,15 @@ void Renderer2D::EnsurePrimitives()
 		m_Prim.roundRectEffect = RegisterEffect(L"shaders\\VertexShader.cso",
 			L"shaders\\RoundRectPS.cso", DefaultAlphaBlend());
 	}
-	catch (...) {
+	catch (const std::exception& e) {
 		m_Prim.roundRectEffect = 0;
-		OutputDebugStringA("[Renderer2D] RoundRectPS.cso not found -- rounded rectangles fall back "
-			"to square corners. Redeploy the renderer's shaders.\n");
+		// Print the ACTUAL failure. `catch (...)` reporting "not found" was a lie whenever the cause
+		// was anything else -- a PSO/root-signature mismatch or a shader-model problem degrades to
+		// square corners with a message pointing at the wrong thing, which is worse than no message.
+		char buf[512];
+		sprintf_s(buf, "[Renderer2D] RoundRectPS effect NOT REGISTERED -- rounded rectangles fall "
+			"back to square corners. Cause: %s\n", e.what());
+		OutputDebugStringA(buf);
 	}
 
 	m_Prim.ready = true;

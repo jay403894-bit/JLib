@@ -116,6 +116,100 @@ namespace JLib {
         void SetSSAOParams(float radius, float intensity, float bias = 0.025f) {
             m_SsaoRadius = radius; m_SsaoIntensity = intensity; m_SsaoBias = bias;
         }
+        // ---- HDR + tonemapping -------------------------------------------------------------------
+        // Every 3D pass renders into an FP16 (RendererCore::HdrFormat) intermediate, and this pass
+        // maps that unbounded linear range onto the back buffer. It is NOT optional -- the 3D PSOs
+        // are built for the FP16 target -- so there is nothing to enable; only the curve and the
+        // exposure are choices.
+        //
+        // The 2D renderer, the 2D particle pools and ImGui all still draw straight onto the back
+        // buffer AFTER this pass, so nothing 2D is tonemapped and every existing 2D demo is
+        // pixel-identical to before. That is deliberate: 2D colours in this engine are DISPLAY
+        // space, and running them through a filmic curve would change every one of them.
+        // MEASURED, because the choice is not neutral: after the sRGB encode, ACES sits ~30% brighter
+        // than Reinhard across the whole mid-range (middle grey 0.18 linear -> 0.427 under Reinhard
+        // vs 0.553 under ACES; 1.0 linear -> 0.735 vs 0.908). Swapping the curve at a fixed exposure
+        // therefore brightens EVERY scene at once, which reads as "the gamma is wrong" even though
+        // the encode is untouched. That is why the default below is Reinhard.
+        enum class Tonemapper : uint32_t {
+            None       = 0,   // straight clip -- for A/B only; anything over 1.0 blows out
+            Reinhard   = 1,   // c/(c+1). Exactly what the pixel shader used to do inline: THE DEFAULT,
+                              // so the FP16 change is visually a no-op for existing content.
+            ACES       = 2,   // Narkowicz's cheap fit. Filmic, but applied PER CHANNEL, so saturated
+                              // colours converge toward white up the shoulder -- this is what makes
+                              // strong greens and reds look washed. Needs ~0.4x exposure vs Reinhard.
+            Uchimura   = 3,   // Gran Turismo: toe + LINEAR midtones + shoulder. Leaves the middle of
+                              // the range alone, so a scene tuned by eye survives it better than ACES.
+            ACESFitted = 4,   // Stephen Hill's fit: the same RRT+ODT wrapped in sRGB<->ACEScg matrices.
+                              // Two extra 3x3 multiplies, and it does NOT desaturate saturated colours
+                              // the way ACES above does. Use this if ACES looks right but the greens
+                              // and reds go milky.
+        };
+        void       SetTonemapper(Tonemapper t) { m_Tonemapper = t; }
+        Tonemapper GetTonemapper() const       { return m_Tonemapper; }
+        // Linear multiplier applied BEFORE the curve -- this is the scene's "shutter speed".
+        //
+        // ANY SCENE CALLING LoadEnvironment PROBABLY WANTS ~0.35, AND THAT IS NOT A TONEMAPPING BUG.
+        // A real outdoor sky HDRI carries an irradiance around 3.0, while the hand-picked hemisphere
+        // ambient it replaces is around 0.45. Turning IBL on therefore multiplies total scene light
+        // by roughly 2.6x, and the hand-authored light intensities (a 4.0 sun) were never rescaled to
+        // match. That has been true since IBL landed, and the old inline Reinhard merely kept it
+        // BOUNDED rather than correct -- there was no exposure control to reveal it. Adding one is
+        // what made a long-standing over-brightness visible, so do not read it as a regression.
+        // The alternative fix is to scale the environment's contribution instead of the whole camera;
+        // exposure is the blunter of the two because it dims the sun along with the sky.
+        void  SetExposure(float e) { m_Exposure = e > 0.0f ? e : 0.0f; }
+        float GetExposure() const  { return m_Exposure; }
+
+        // ---- Bloom -------------------------------------------------------------------------------
+        // Light spilling around bright things. Off by default (opt-in, like shadows and SSAO).
+        //
+        // This is the pass the FP16 intermediate was actually built for: bloom needs radiance ABOVE
+        // 1.0 to find, and before the HDR target existed the pixel shader crushed everything to 0..1
+        // the moment it was computed, so there was nothing left to bloom FROM. Running it here, on
+        // linear HDR before the tonemap curve, is also what makes it read as light rather than as a
+        // screen-space smear -- see Tonemap_PS.
+        //
+        // Implemented as a progressive downsample/upsample chain (Jimenez / Call of Duty), not one
+        // wide gaussian: repeated halving gives a very wide, very smooth response cheaply, where a
+        // single big kernel is both expensive and visibly boxy.
+        void EnableBloom(bool on) { m_BloomEnabled = on; }
+        bool IsBloomEnabled() const { return m_BloomEnabled; }
+        // threshold -- radiance at which bloom starts. 1.0 means "only things brighter than white",
+        //              which is the physically sensible starting point now that such values exist.
+        // intensity -- how much of the accumulated chain is added back. Small numbers: the chain sums
+        //              several levels, so 0.05-0.15 is the usual range and 1.0 is a white-out.
+        // knee      -- width of the SOFT shoulder under the threshold. A hard cutoff makes bloom pop
+        //              on and off as a surface crosses it, which is very visible when the camera moves.
+        // scatter   -- upsample tent radius in texels; wider = broader, softer, more diffuse halo.
+        void SetBloomParams(float threshold, float intensity, float knee = 0.5f, float scatter = 1.0f) {
+            m_BloomThreshold = threshold > 0.0f ? threshold : 0.0f;
+            m_BloomIntensity = intensity > 0.0f ? intensity : 0.0f;
+            m_BloomKnee      = knee > 1e-4f ? knee : 1e-4f;
+            m_BloomScatter   = scatter > 0.0f ? scatter : 0.0f;
+        }
+
+        // ---- FXAA --------------------------------------------------------------------------------
+        // Post-process anti-aliasing, run LAST, on the tonemapped LDR image. Off by default.
+        //
+        // Enabling it CHANGES THE PIPELINE SHAPE: the tonemap pass stops writing the back buffer and
+        // writes an LDR intermediate instead, which this pass then resolves to the back buffer. That
+        // is forced by the ordering -- FXAA needs a finished, gamma-encoded image to detect edges in,
+        // and a pass cannot read and write the same target.
+        //
+        // Being a post-process it catches what MSAA cannot: specular aliasing, alpha-cutout edges,
+        // the rim of a bloom-lit emitter. The cost is that it cannot tell a geometric edge from a
+        // textured one, so fine texture detail softens slightly. That trade is the whole point.
+        void EnableFXAA(bool on) { m_FxaaEnabled = on; }
+        bool IsFXAAEnabled() const { return m_FxaaEnabled; }
+        // threshold    -- relative luma delta before a pixel counts as an edge. Lower = more pixels
+        //                 filtered (softer, slower). 0.125 is the usual default.
+        // thresholdMin -- absolute floor, so flat gradients and noise are left alone. 0.0312 typical.
+        void SetFXAAParams(float threshold, float thresholdMin = 0.0312f) {
+            m_FxaaThreshold    = threshold;
+            m_FxaaThresholdMin = thresholdMin;
+        }
+
         bool ShadowsEnabled() const { return m_ShadowsEnabled; }
         void SetShadowBounds(DirectX::XMFLOAT3 center, float extent) {
             m_ShadowCenter = center; m_ShadowExtent = extent > 1.0f ? extent : 1.0f;
@@ -540,6 +634,132 @@ namespace JLib {
         UINT m_SsaoWidth = 0, m_SsaoHeight = 0;   // rebuilt on resize
         void CreateSsaoResources(UINT width, UINT height);
         void RecordSsaoPass(int frame);           // depth prepass + the occlusion pass, one list
+
+        // ---- HDR intermediate + tonemap pass (see SetTonemapper) ----
+        // The scene target every 3D pass renders into, and the pass that resolves it to the back
+        // buffer. Created lazily on the first RecordCommandList (it needs the client size, and it
+        // reaches the SHARED SRV heap through Renderer2D, which is not guaranteed to be attached at
+        // Initialize time -- the same reason SSAO defers) and rebuilt when the window resizes.
+        //
+        // TWO command lists, not one, because the clear has to happen BEFORE the sky/geometry lists
+        // and the resolve AFTER them, and a command list cannot be submitted twice:
+        //   m_HdrBeginList -- clears the FP16 target. Pushed FIRST into m_RecordedLists. Without it,
+        //                     a frame with the sky disabled and nothing drawn shows the PREVIOUS
+        //                     frame's HDR contents (RendererCore's BeginFrame clears the back
+        //                     buffer, which is no longer what the 3D passes write into).
+        //   m_TonemapList  -- RT->SRV barrier, fullscreen triangle onto the back buffer, barrier
+        //                     back. Pushed LAST, so the 2D layers RendererCore submits after the 3D
+        //                     lists land on top of the resolved image.
+        // The target RESTS in RENDER_TARGET state, so only the tonemap list needs barriers.
+        Microsoft::WRL::ComPtr<ID3D12Resource>       m_HdrTarget;
+        Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> m_HdrRtvHeap;      // 1 RTV
+        D3D12_CPU_DESCRIPTOR_HANDLE                  m_HdrSrvCpu = {};  // kept so a resize can rewrite
+        D3D12_GPU_DESCRIPTOR_HANDLE                  m_HdrSrvGpu = {};  // the view IN PLACE instead of
+                                                                        // leaking a new heap slot
+        Microsoft::WRL::ComPtr<ID3D12RootSignature>  m_TonemapRootSig;  // b0 root constants + t0
+        Microsoft::WRL::ComPtr<ID3D12PipelineState>  m_TonemapPso;
+        Microsoft::WRL::ComPtr<ID3D12CommandAllocator>    m_HdrBeginAlloc[RendererCore::NumFrames];
+        Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList> m_HdrBeginList[RendererCore::NumFrames];
+        Microsoft::WRL::ComPtr<ID3D12CommandAllocator>    m_TonemapAlloc[RendererCore::NumFrames];
+        Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList> m_TonemapList[RendererCore::NumFrames];
+        UINT       m_HdrWidth = 0, m_HdrHeight = 0;   // rebuilt on resize
+        // ACESFitted, chosen BY EYE at MATCHED exposure. Matched exposure is 0.35.
+        //
+        // This REPLACED Uchimura, and the flip is informative rather than arbitrary: Uchimura won
+        // while the test scene was all midtones (diffuse stone lit by ambient), which is exactly the
+        // range its linear section is designed to leave alone. Once the scene gained real emitters
+        // (emissive 14 radiance) and bloom, the frame had genuine HIGHLIGHTS, and the curve with the
+        // stronger shoulder won. **Judge a tonemapper on a scene that has the range you actually
+        // ship** -- a comparison run on midtones alone selects for the wrong property.
+        //
+        // Ruled out, each for a concrete reason:
+        // Ruled out along the way, each for a concrete reason:
+        //   Reinhard  -- has NO TOE, so it cannot produce a black point: linear 0.02 lands at 0.150
+        //               on screen where a filmic curve puts 0.042, and 0.005 lands at 0.061 vs 0.003.
+        //               Shadows come out grey and the image reads hazy no matter what exposure does.
+        //               This is what the old inline curve was, which is why "washed out" predates
+        //               this pass entirely.
+        //   ACES      -- per-channel, so saturated colour converges on white up the shoulder.
+        //   ACESFitted-- correct and close second; slightly heavier toe than Uchimura wants here.
+        //   None      -- only flatters a view with no bright highlights; the first specular or
+        //               visible sky clips it flat.
+        //   Uchimura  -- close second, and the winner before the scene had highlights (see above).
+        Tonemapper m_Tonemapper = Tonemapper::ACESFitted;
+        float      m_Exposure   = 1.0f;
+        // The colour the FP16 target is cleared to. Kept separate from RendererCore's back-buffer
+        // clear colour on purpose: this one is LINEAR HDR and passes through the tonemap curve,
+        // whereas the core's is display-space and only shows where 2D draws over untouched pixels.
+        DirectX::XMFLOAT4 m_HdrClearColor = { 0.0f, 0.0f, 0.0f, 1.0f };
+        // SPLIT DELIBERATELY. The root signature, PSO and command lists are size-independent, so they
+        // are built in Initialize -- which means a missing or stale Tonemap_PS.cso throws at STARTUP,
+        // naming the file. Building them lazily instead put a file read on the first frame, inside
+        // RecordCommandList, which RendererCore drives from a scheduler task whose Execute() is
+        // noexcept: the throw became a bare std::terminate with the message only visible to an
+        // attached debugger. Only the TEXTURE has to be lazy (it needs the client size).
+        void CreateTonemapPipeline();                     // Initialize-time; throws if the .cso is absent
+        bool CreateHdrTarget(UINT width, UINT height);    // lazy + on resize; false => 3D pass skipped
+        void RecordHdrBegin(int frame);
+
+        // ---- Bloom chain (see EnableBloom) ----
+        // Separate textures per level rather than one mipped texture. A mip chain would be tidier in
+        // memory, but sampling mip N while rendering into mip N+1 of the SAME resource needs per-
+        // subresource barriers on every step -- legal, fiddly, and easy to get subtly wrong. Distinct
+        // resources make each step a plain RENDER_TARGET <-> PIXEL_SHADER_RESOURCE flip, and cost
+        // essentially the same memory. They REST in PIXEL_SHADER_RESOURCE.
+        // Level i is (width >> (i+1), height >> (i+1)); the chain stops early on small windows.
+        static constexpr UINT kBloomMips = 5;
+        bool  m_BloomEnabled   = false;
+        float m_BloomThreshold = 1.0f;
+        float m_BloomKnee      = 0.5f;
+        float m_BloomIntensity = 0.08f;
+        float m_BloomScatter   = 1.0f;
+        UINT  m_BloomLevels    = 0;      // how many of kBloomMips actually exist at this resolution
+        Microsoft::WRL::ComPtr<ID3D12Resource>       m_BloomTex[kBloomMips];
+        Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> m_BloomRtvHeap;              // kBloomMips RTVs
+        D3D12_CPU_DESCRIPTOR_HANDLE                  m_BloomSrvCpu[kBloomMips] = {};  // reused on resize
+        D3D12_GPU_DESCRIPTOR_HANDLE                  m_BloomSrvGpu[kBloomMips] = {};
+        UINT m_BloomW[kBloomMips] = {}, m_BloomH[kBloomMips] = {};
+        Microsoft::WRL::ComPtr<ID3D12RootSignature>  m_BloomRootSig;   // b0 constants + t0 source
+        Microsoft::WRL::ComPtr<ID3D12PipelineState>  m_BloomDownPso;   // opaque
+        Microsoft::WRL::ComPtr<ID3D12PipelineState>  m_BloomUpPso;     // ADDITIVE -- the accumulate
+        Microsoft::WRL::ComPtr<ID3D12CommandAllocator>    m_BloomAlloc[RendererCore::NumFrames];
+        Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList> m_BloomList[RendererCore::NumFrames];
+        // MUST match the BloomParams cbuffer in BloomDownsample_PS.hlsl / BloomUpsample_PS.hlsl.
+        struct BloomConsts {
+            float texelX, texelY;   // 1 / SOURCE dimensions (taps are in source texels)
+            float threshold, knee;
+            float mode;             // 1 = prefilter (threshold + Karis), 0 = plain downsample
+            float radius;           // upsample tent radius
+            float pad0, pad1;
+        };
+        void CreateBloomPipeline();                        // Initialize-time
+        bool CreateBloomTargets(UINT width, UINT height);  // lazy + on resize
+        void RecordBloomPass(int frame);
+
+        // ---- FXAA (see EnableFXAA) ----
+        // The LDR intermediate the tonemap pass writes when FXAA is on. R8G8B8A8_UNORM resource with
+        // TWO different views on purpose, and the pairing is the whole trick:
+        //   RTV = ..._UNORM_SRGB -> the tonemap pass's hardware encode still happens, so the 8 bits
+        //                           are spent perceptually and darks do not band.
+        //   SRV = ..._UNORM      -> FXAA reads the ENCODED values WITHOUT decoding, because edge
+        //                           detection by luma is only meaningful in a perceptual space.
+        // FXAA_PS then converts back to linear on output, since the back buffer's own RTV encodes.
+        bool  m_FxaaEnabled      = false;
+        float m_FxaaThreshold    = 0.125f;
+        float m_FxaaThresholdMin = 0.0312f;
+        Microsoft::WRL::ComPtr<ID3D12Resource>       m_LdrTarget;
+        Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> m_LdrRtvHeap;      // 1 RTV, _UNORM_SRGB
+        D3D12_CPU_DESCRIPTOR_HANDLE                  m_LdrSrvCpu = {};  // reused across resizes
+        D3D12_GPU_DESCRIPTOR_HANDLE                  m_LdrSrvGpu = {};  // plain _UNORM view
+        Microsoft::WRL::ComPtr<ID3D12RootSignature>  m_FxaaRootSig;
+        Microsoft::WRL::ComPtr<ID3D12PipelineState>  m_FxaaPso;
+        Microsoft::WRL::ComPtr<ID3D12CommandAllocator>    m_FxaaAlloc[RendererCore::NumFrames];
+        Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList> m_FxaaList[RendererCore::NumFrames];
+        UINT m_LdrWidth = 0, m_LdrHeight = 0;
+        void CreateFxaaPipeline();                       // Initialize-time
+        bool CreateLdrTarget(UINT width, UINT height);   // lazy + on resize
+        void RecordFxaaPass(int frame, D3D12_CPU_DESCRIPTOR_HANDLE backRtv, UINT width, UINT height);
+        void RecordTonemapPass(int frame, D3D12_CPU_DESCRIPTOR_HANDLE backRtv, UINT width, UINT height);
 
         // ---- IBL (see LoadEnvironment) ----
         // Baked ONCE at load, never per frame: equirectangular HDR -> environment cube -> a cosine-

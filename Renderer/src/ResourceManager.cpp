@@ -10,6 +10,7 @@
 
 #include <Windows.h>      // WideCharToMultiByte -- narrow keys for AssetManager<T>'s std::string cache
 #include <fstream>        // atlas sidecar parsing (LoadAtlas)
+#include <cassert>        // SRV heap exhaustion guards below
 #include <vector>
 #include <cmath>          // std::sqrt (mesh bounding-sphere radius)
 using namespace JLib;
@@ -157,6 +158,18 @@ TextureHandle ResourceManager::LoadTexture(const std::wstring& filename, ID3D12G
 
     // Keep the upload buffer alive until the caller has executed+waited on cmdList.
     m_UploadBuffers.push_back(uploadBuffer);
+
+    // BOUNDS CHECK. m_CurrentDescriptorIndex is a bump allocator into a 256-slot heap and slots are
+    // NEVER FREED (see AllocateSrvSlot's comment: "engine-lifetime resources, not streamed assets").
+    // Three texture paths used to increment it with no check at all, so once a session loaded more
+    // than kSrvHeapCapacity textures - which repeated scene loads do, since nothing evicts - they
+    // wrote descriptors PAST THE END OF THE HEAP. The debug layer catches that as an error, so it
+    // presented as a Debug-only crash on "new game" while Release silently tolerated it.
+    if (m_CurrentDescriptorIndex >= kSrvHeapCapacity) {
+        assert(false && "ResourceManager SRV heap exhausted (256 slots, never freed). Textures are "
+                        "not evicted between scenes - see AllocateSrvSlot.");
+        return false;
+    }
 
     // 2. Setup the SRV
     UINT descriptorSize = m_Device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
@@ -501,6 +514,15 @@ TextureResource ResourceManager::UploadDecodedImage(const DecodedImage& img, ID3
 
     m_UploadBuffers.push_back(uploadBuffer);
 
+    // Same bump-allocator bounds check as the synchronous path: the heap is 256 slots and nothing
+    // is ever freed, so an unchecked increment writes descriptors outside it. Returns a
+    // default-constructed (null resource) TextureResource on exhaustion.
+    if (m_CurrentDescriptorIndex >= kSrvHeapCapacity) {
+        assert(false && "ResourceManager SRV heap exhausted (256 slots, never freed). Textures are "
+                        "not evicted between scenes - see AllocateSrvSlot.");
+        return TextureResource{};
+    }
+
     UINT descriptorSize = m_Device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
     CD3DX12_CPU_DESCRIPTOR_HANDLE cpuHandle(
         m_SrvHeap->GetCPUDescriptorHandleForHeapStart(), m_CurrentDescriptorIndex, descriptorSize);
@@ -579,6 +601,13 @@ TextureHandle ResourceManager::CreateSolidColorTexture(ID3D12GraphicsCommandList
 
     m_UploadBuffers.push_back(uploadBuffer);
 
+    // Third of the three bump-allocated paths; same 256-slot, never-freed heap.
+    if (m_CurrentDescriptorIndex >= kSrvHeapCapacity) {
+        assert(false && "ResourceManager SRV heap exhausted (256 slots, never freed). Textures are "
+                        "not evicted between scenes - see AllocateSrvSlot.");
+        return false;
+    }
+
     UINT descriptorSize = m_Device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
     CD3DX12_CPU_DESCRIPTOR_HANDLE cpuHandle(
         m_SrvHeap->GetCPUDescriptorHandleForHeapStart(), m_CurrentDescriptorIndex, descriptorSize);
@@ -589,6 +618,7 @@ TextureHandle ResourceManager::CreateSolidColorTexture(ID3D12GraphicsCommandList
     srvDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
     srvDesc.Texture2D.MipLevels = 1;
     m_Device->CreateShaderResourceView(newResource.Get(), &srvDesc, cpuHandle);
+    // NOTE: the bounds check for this path is above, before cpuHandle is computed.
 
     tex.resource = newResource;
     tex.gpuHandle = CD3DX12_GPU_DESCRIPTOR_HANDLE(

@@ -99,6 +99,16 @@
       <EntryPointName>VSMain</EntryPointName>
       <ShaderModel>6.1</ShaderModel>
     </FxCompile>
+    <FxCompile Include="src\BloomDownsample_PS.hlsl">
+      <ShaderType>Pixel</ShaderType>
+      <EntryPointName>PSMain</EntryPointName>
+      <ShaderModel>6.1</ShaderModel>
+    </FxCompile>
+    <FxCompile Include="src\BloomUpsample_PS.hlsl">
+      <ShaderType>Pixel</ShaderType>
+      <EntryPointName>PSMain</EntryPointName>
+      <ShaderModel>6.1</ShaderModel>
+    </FxCompile>
     <FxCompile Include="src\BuildDispatchArgs.hlsl">
       <ShaderType>Compute</ShaderType>
       <EntryPointName>main</EntryPointName>
@@ -115,6 +125,11 @@
       <ShaderModel>6.1</ShaderModel>
     </FxCompile>
     <FxCompile Include="src\EquirectToCube_PS.hlsl">
+      <ShaderType>Pixel</ShaderType>
+      <EntryPointName>PSMain</EntryPointName>
+      <ShaderModel>6.1</ShaderModel>
+    </FxCompile>
+    <FxCompile Include="src\FXAA_PS.hlsl">
       <ShaderType>Pixel</ShaderType>
       <EntryPointName>PSMain</EntryPointName>
       <ShaderModel>6.1</ShaderModel>
@@ -207,6 +222,11 @@
     <FxCompile Include="src\SSAO_VS.hlsl">
       <ShaderType>Vertex</ShaderType>
       <EntryPointName>VSMain</EntryPointName>
+      <ShaderModel>6.1</ShaderModel>
+    </FxCompile>
+    <FxCompile Include="src\Tonemap_PS.hlsl">
+      <ShaderType>Pixel</ShaderType>
+      <EntryPointName>PSMain</EntryPointName>
       <ShaderModel>6.1</ShaderModel>
     </FxCompile>
     <FxCompile Include="src\UpdateParticles.hlsl">

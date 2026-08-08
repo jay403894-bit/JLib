@@ -341,8 +341,10 @@ float4 PSMain(PSInput input) : SV_TARGET {
 
     float3 color = ambient + Lo + emissive;
 
-    // Reinhard tone map so multiple/bright lights roll off to white instead of hard-clipping. (Proper
-    // HDR + gamma is the Environment milestone; this keeps the output bounded and reasonable for now.)
-    color = color / (color + 1.0f);
+    // OUTPUT IS LINEAR HDR AND DELIBERATELY UNBOUNDED. There used to be an inline Reinhard here
+    // (color/(color+1)) because the target was an 8-bit UNORM back buffer that could not hold
+    // anything above white -- so every highlight was crushed the instant it was computed. The pass
+    // now renders into an FP16 target (RendererCore::HdrFormat) and Tonemap_PS does the mapping once,
+    // at the end, with a real filmic curve. Re-adding a curve here would apply two of them.
     return float4(color, 1.0f);
 }

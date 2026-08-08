@@ -83,6 +83,45 @@
     </Link>
   </ItemDefinitionGroup>
 
+  <!-- ======================= THE DEVELOPMENT CONFIGURATION, FOR CONSUMERS =======================
+       Supplied here so an app only has to DECLARE a Development configuration; it inherits the
+       settings rather than reinventing them. That is not convenience, it is safety: these libraries
+       are built /MD with assertions live and NDEBUG undefined, and a consumer that declared
+       Development itself and reached for /MDd would link them anyway and get an
+       _ITERATOR_DEBUG_LEVEL mismatch - heap corruption or 0xC0000409, not a clean error.
+
+       Why the configuration exists at all: full Debug is unusable at content scale. Game01's larger
+       levels run at ~2 FPS in Debug while Release holds hundreds. That is not a bug to hunt, it is
+       what an unoptimized build plus _ITERATOR_DEBUG_LEVEL=2 costs when per-frame work means
+       iterating thousands of tiles and bodies. Development keeps symbols, breakpoints, call stacks
+       and asserts; it gives up some locals to inlining. Every engine ships this third configuration.
+
+       NDEBUG is deliberately NOT defined - that is what keeps assertions live, and it is why this
+       cannot simply be aliased onto a stock Release. Code that branches on NDEBUG to mean
+       "optimized" must also check JLIB_DEVELOPMENT, as the scheduler's ParallelFor threshold does.
+
+       TO USE IT: add a Development configuration to your .vcxproj (ProjectConfiguration entry plus
+       a Configuration PropertyGroup) and list it in your solution. The compiler settings arrive
+       from here. -->
+  <PropertyGroup Condition="'$(Configuration)'=='Development'">
+    <UseDebugLibraries>false</UseDebugLibraries>
+    <WholeProgramOptimization>false</WholeProgramOptimization>
+  </PropertyGroup>
+  <ItemDefinitionGroup Condition="'$(Configuration)'=='Development'">
+    <ClCompile>
+      <Optimization>MaxSpeed</Optimization>
+      <FunctionLevelLinking>true</FunctionLevelLinking>
+      <IntrinsicFunctions>true</IntrinsicFunctions>
+      <RuntimeLibrary>MultiThreadedDLL</RuntimeLibrary>
+      <PreprocessorDefinitions>JLIB_DEVELOPMENT;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <DebugInformationFormat>ProgramDatabase</DebugInformationFormat>
+      <BasicRuntimeChecks>Default</BasicRuntimeChecks>
+    </ClCompile>
+    <Link>
+      <GenerateDebugInformation>true</GenerateDebugInformation>
+    </Link>
+  </ItemDefinitionGroup>
+
   <!-- Fail with a sentence that says what to do, rather than 40 unresolved externals. -->
   <Target Name="JLibCheckBuilt" BeforeTargets="Link" Condition="!Exists('$(JLibBinDir)Scheduler.lib')">
     <Error Text="JLib has not been built for this configuration. Expected '$(JLibBinDir)Scheduler.lib'. Open $(JLibRoot)JLib.slnx and build $(JLibConfig)|$(Platform) first. (Your configuration '$(Configuration)' maps to JLib's '$(JLibConfig)'; override with the JLibConfig property if that is wrong.)" />

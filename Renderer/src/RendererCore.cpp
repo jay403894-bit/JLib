@@ -470,7 +470,16 @@ ComPtr<ID3D12Device2> RendererCore::CreateDevice(ComPtr<IDXGIAdapter4> adapter)
 	{
 		pInfoQueue->SetBreakOnSeverity(D3D12_MESSAGE_SEVERITY_CORRUPTION, TRUE);
 		pInfoQueue->SetBreakOnSeverity(D3D12_MESSAGE_SEVERITY_ERROR, TRUE);
-		pInfoQueue->SetBreakOnSeverity(D3D12_MESSAGE_SEVERITY_WARNING, TRUE);
+		// WARNING is deliberately NOT a break. D3D12 emits a warning during normal process
+		// TEARDOWN ("Process is terminating. Using simple reporting.") which carries no message ID,
+		// so it cannot be filtered by ID and it breaks into the debugger on every clean exit --
+		// looking exactly like a crash despite the process returning 0. Warnings are also routinely
+		// benign (driver hints, redundant state). CORRUPTION and ERROR still break, which is what
+		// actually catches API misuse.
+		//
+		// Turn this back on temporarily when bringing up a new pass and you want every warning to
+		// stop the world; just expect the exit-time break to come with it.
+		// pInfoQueue->SetBreakOnSeverity(D3D12_MESSAGE_SEVERITY_WARNING, TRUE);
 
 		D3D12_MESSAGE_SEVERITY Severities[] = { D3D12_MESSAGE_SEVERITY_INFO };
 		D3D12_MESSAGE_ID DenyIds[] = {
@@ -1587,6 +1596,30 @@ void RendererCore::InitImGui(HWND hwnd)
 	io.Fonts->AddFontDefault();
 
 	ImGui::StyleColorsDark();
+
+	// LINEARISE THE IMGUI STYLE. ImGui authors its colours in sRGB/display space, but the back
+	// buffer RTV is ..._UNORM_SRGB so the hardware ENCODES on write -- meaning ImGui's colours get
+	// transfer-encoded a SECOND time and every mid-tone washes out (0.5 -> ~0.73; endpoints are
+	// unaffected, which is why it reads as "faded" rather than obviously broken).
+	//
+	// Exactly the same bug as app-specified 2D colours, which Renderer2D::Submit handles with
+	// SrgbToLinear. ImGui does not go through Submit -- imgui_impl_dx12 has its own pipeline and
+	// knows nothing about our colour convention -- so its style has to be converted here instead.
+	// Done ONCE at init rather than per-frame: the style is a fixed table.
+	//
+	// Alpha is NOT converted; it is not a colour channel and is never transfer-encoded.
+	{
+		auto srgbToLinear = [](float v) {
+			return (v <= 0.04045f) ? (v / 12.92f) : std::pow((v + 0.055f) / 1.055f, 2.4f);
+		};
+		ImGuiStyle& style = ImGui::GetStyle();
+		for (int i = 0; i < ImGuiCol_COUNT; ++i) {
+			ImVec4& c = style.Colors[i];
+			c.x = srgbToLinear(c.x);
+			c.y = srgbToLinear(c.y);
+			c.z = srgbToLinear(c.z);
+		}
+	}
 
 	ImGui_ImplWin32_Init(hwnd);
 

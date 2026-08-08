@@ -234,6 +234,13 @@ void Renderer3D::Initialize(RendererCore& core) {
     }
     m_ParticleDrawRootSig = CreateParticleDrawRootSignature();
     CreateParticleDrawPipeline();
+    // Tonemap pipeline (the FP16 resolve). Built HERE, with every other pipeline, so a missing
+    // shaders\Tonemap_PS.cso throws at startup naming the file -- rather than on the first frame
+    // from inside a noexcept scheduler task, where it surfaces as a bare terminate. The FP16 TEXTURE
+    // itself is still lazy (it needs the client size); see CreateHdrTarget.
+    CreateTonemapPipeline();
+    CreateBloomPipeline();   // same reasoning: shaders read at Initialize, targets built lazily
+    CreateFxaaPipeline();
 
     // Per-frame camera constant buffer: UPLOAD heap (CPU-writable), 256 bytes (CB alignment rule),
     // mapped once and never unmapped -- SetCamera() then just memcpy's the matrix into the slot.
@@ -325,7 +332,9 @@ void Renderer3D::CreatePipelineState() {
     pso.PS = { ps.data(), ps.size() };
     pso.InputLayout = { kVertex3DLayout, _countof(kVertex3DLayout) }; // how to unpack a Vertex3D
     pso.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
-    pso.RTVFormats[0] = RendererCore::BackBufferRTVFormat;             // MUST match the back buffer format
+    // The FP16 scene target, NOT the back buffer -- this pass writes linear HDR and the tonemap pass
+    // resolves it later (see RendererCore::HdrFormat). Must match or PSO creation fails outright.
+    pso.RTVFormats[0] = RendererCore::HdrFormat;
     pso.NumRenderTargets = 1;
     pso.SampleDesc.Count = 1;
     pso.SampleMask = 0xFFFFFFFF;
@@ -439,7 +448,7 @@ void Renderer3D::CreateSkinnedPipelineState() {
     pso.PS                    = { ps.data(), ps.size() };
     pso.InputLayout           = { kSkinnedVertex3DLayout, _countof(kSkinnedVertex3DLayout) };
     pso.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
-    pso.RTVFormats[0]         = RendererCore::BackBufferRTVFormat;
+    pso.RTVFormats[0]         = RendererCore::HdrFormat;   // FP16 scene target, not the back buffer
     pso.NumRenderTargets      = 1;
     pso.SampleDesc.Count      = 1;
     pso.SampleMask            = 0xFFFFFFFF;
@@ -499,7 +508,9 @@ void Renderer3D::CreateSkyPipeline() {
     pso.PS                    = { ps.data(), ps.size() };
     pso.InputLayout           = { nullptr, 0 };   // no vertex buffer
     pso.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
-    pso.RTVFormats[0]         = RendererCore::BackBufferRTVFormat;
+    // FP16 scene target. This is also what finally makes the HDRI sky honest: sampled at intensity
+    // it routinely exceeds 1.0, and writing it to an 8-bit target clipped the sun to flat white.
+    pso.RTVFormats[0]         = RendererCore::HdrFormat;
     pso.NumRenderTargets      = 1;
     pso.SampleDesc.Count      = 1;
     pso.SampleMask            = 0xFFFFFFFF;
@@ -596,7 +607,7 @@ void Renderer3D::CreateParticleDrawPipeline() {
     pso.PS                    = { ps.data(), ps.size() };
     pso.InputLayout           = { nullptr, 0 };   // no vertex buffer -- SV_VertexID quad, SV_InstanceID particle
     pso.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
-    pso.RTVFormats[0]         = RendererCore::BackBufferRTVFormat;
+    pso.RTVFormats[0]         = RendererCore::HdrFormat;   // FP16 scene target, not the back buffer
     pso.NumRenderTargets      = 1;
     pso.SampleDesc.Count      = 1;
     pso.SampleMask            = 0xFFFFFFFF;
@@ -995,6 +1006,34 @@ void Renderer3D::RecordCommandList(int frame,
     LARGE_INTEGER t0; QueryPerformanceCounter(&t0);
     m_RecordedLists.clear();
 
+    // ---- HDR: swap the render target out from under every pass below -------------------------
+    // RendererCore hands us the BACK BUFFER's RTV. Nothing in the 3D renderer draws there any more;
+    // every pass writes linear HDR into an FP16 intermediate, and the tonemap pass at the bottom of
+    // this function resolves that onto the back buffer. Reassigning the by-value `rtv` parameter is
+    // how that redirect reaches the sky, geometry, skinned and particle passes without threading a
+    // second handle through all of them -- `backRtv` keeps the real one for the resolve.
+    //
+    // Created lazily on first use (needs the client size, and reaches the shared SRV heap through
+    // Renderer2D, which is not guaranteed attached at Initialize) and rebuilt on resize. Safe to
+    // drop the old texture without flushing, for the same reason SSAO is: the only way the size
+    // changes is RendererCore::Resize, which has already waited on every in-flight frame.
+    const D3D12_CPU_DESCRIPTOR_HANDLE backRtv = rtv;
+    if (!m_HdrTarget || m_HdrWidth != width || m_HdrHeight != height) {
+        m_HdrTarget.Reset();
+        if (!CreateHdrTarget(width, height)) {
+            // Logged inside; no 3D this frame. Still drain the queues -- Submit() runs every frame
+            // whether or not we render, so leaving them would grow without bound.
+            m_Items.clear();
+            m_SkinnedItems.clear();
+            m_CulledThisFrame = 0;
+            return;
+        }
+    }
+    rtv = m_HdrRtvHeap->GetCPUDescriptorHandleForHeapStart();
+    // Pushed FIRST so the clear lands ahead of the sky/geometry lists.
+    RecordHdrBegin(frame);
+    m_RecordedLists.push_back(m_HdrBeginList[frame].Get());
+
     // Auto-benchmark: alternate serial/parallel every frame so BOTH modes get timed at the same scene
     // complexity (see SetAutoBenchmark). Overrides the manual P toggle while active.
     if (m_AutoBench) {
@@ -1138,7 +1177,7 @@ void Renderer3D::RecordCommandList(int frame,
     }
 
 
-    // ---- sky pass: recorded FIRST so it lands at m_RecordedLists[0] and draws behind the geometry ----
+    // ---- sky pass: recorded before the geometry lists (right after the HDR clear) so it draws behind them ----
     // Upload InvViewProj (to unproject view rays in the sky VS) + camPos, then record the fullscreen pass.
     if (m_SkyEnabled) {
         DirectX::XMFLOAT4X4 invVP;
@@ -1293,6 +1332,43 @@ void Renderer3D::RecordCommandList(int frame,
         memcpy(m_ParticleCamCBMapped[frame], &pc, sizeof(pc));
         RecordParticles(frame, rtv, dsv, width, height);
         m_RecordedLists.push_back(m_ParticleList[frame].Get());
+    }
+
+    // ---- bloom: after everything that writes the scene, before the tonemap that consumes it. It
+    // reads the finished FP16 target and leaves bloom[0] holding the accumulated chain, which the
+    // tonemap pass adds in BEFORE its curve. Targets are lazy + rebuilt on resize, like the HDR
+    // target itself; if they can't be created the pass is skipped and intensity 0 disables it. ----
+    if (m_BloomEnabled) {
+        if (m_BloomLevels == 0 || m_BloomW[0] != (width >> 1) || m_BloomH[0] != (height >> 1))
+            CreateBloomTargets(width, height);
+        if (m_BloomLevels > 0) {
+            RecordBloomPass(frame);
+            m_RecordedLists.push_back(m_BloomList[frame].Get());
+        }
+    }
+
+    // ---- tonemap: LAST of the 3D lists. Reads the finished FP16 scene, maps it to display range and
+    // writes the back buffer through its _SRGB view (the one and only gamma encode in the pipeline).
+    // RendererCore submits the 2D layers, 2D particles and ImGui after these lists, so all of that
+    // composites on top of the resolved image and is NOT tonemapped -- which is what keeps every
+    // existing 2D demo pixel-identical. ----
+    // With FXAA on, the tonemap pass writes the LDR INTERMEDIATE instead of the back buffer, and the
+    // FXAA pass resolves that to the back buffer. FXAA needs a finished gamma-encoded image to find
+    // edges in, and a pass cannot read and write the same target -- so the intermediate is forced by
+    // the ordering, not a preference. Both PSOs use BackBufferRTVFormat, so the tonemap PSO is valid
+    // against either destination and no second pipeline is needed.
+    bool fxaaLive = m_FxaaEnabled;
+    if (fxaaLive && (!m_LdrTarget || m_LdrWidth != width || m_LdrHeight != height))
+        fxaaLive = CreateLdrTarget(width, height);
+
+    RecordTonemapPass(frame,
+                      fxaaLive ? m_LdrRtvHeap->GetCPUDescriptorHandleForHeapStart() : backRtv,
+                      width, height);
+    m_RecordedLists.push_back(m_TonemapList[frame].Get());
+
+    if (fxaaLive) {
+        RecordFxaaPass(frame, backRtv, width, height);
+        m_RecordedLists.push_back(m_FxaaList[frame].Get());
     }
 
     LARGE_INTEGER t1; QueryPerformanceCounter(&t1);
@@ -1600,14 +1676,41 @@ bool Renderer3D::BakeEnvironment(const std::wstring& hdrPath) {
 
     // ---- 1. decode the HDR. DirectXTex handles .hdr natively (it is already linked here for WIC),
     //         which is why this needs no third-party HDR parser. ----
-    DirectX::ScratchImage src;
-    if (FAILED(DirectX::LoadFromHDRFile(hdrPath.c_str(), nullptr, src))) {
+    // Resolve the path EXE-RELATIVE when the caller gave a relative one. Every other asset path in
+    // this renderer already goes through ExeRelative (shaders, textures, models) for one reason: the
+    // CURRENT WORKING DIRECTORY IS NOT THE EXE DIRECTORY when launched from Visual Studio -- it is
+    // the project dir. This one call took its string raw, so it worked when run from Explorer and
+    // failed under the debugger, which is about the most confusing way for an asset load to break.
+    // Try as-given first so an ABSOLUTE path (or a genuinely cwd-relative one) still works.
+    auto tryLoad = [](const std::wstring& p, DirectX::ScratchImage& out) {
+        if (SUCCEEDED(DirectX::LoadFromHDRFile(p.c_str(), nullptr, out))) return true;
         // .exr and LDR fallbacks: try WIC before giving up, so a .png/.jpg panorama still works
-        // (it just has no values above 1 to give the highlights any punch).
-        if (FAILED(DirectX::LoadFromWICFile(hdrPath.c_str(), DirectX::WIC_FLAGS_NONE, nullptr, src))) {
-            OutputDebugStringA("[Renderer3D] LoadEnvironment: could not decode the file -- IBL stays off.\n");
-            return false;
-        }
+        // (it just has no values above 1 to give the highlights any punch). NOTE: WIC cannot decode
+        // .exr -- that needs DirectXTexEXR + OpenEXR, so a .exr beside the .hdr will NOT load.
+        return SUCCEEDED(DirectX::LoadFromWICFile(p.c_str(), DirectX::WIC_FLAGS_NONE, nullptr, out));
+    };
+
+    DirectX::ScratchImage src;
+    const std::wstring exeRel = ExeRelative(hdrPath);
+    if (!tryLoad(hdrPath, src) && !tryLoad(exeRel, src)) {
+        // Name BOTH paths tried, and say whether the file was even found. "could not decode" on a
+        // file that was never there sends you looking at the decoder instead of the path.
+        const bool existsCwd = (GetFileAttributesW(hdrPath.c_str()) != INVALID_FILE_ATTRIBUTES);
+        const bool existsExe = (GetFileAttributesW(exeRel.c_str())  != INVALID_FILE_ATTRIBUTES);
+        std::string narrow(hdrPath.begin(), hdrPath.end());
+        std::string narrowExe(exeRel.begin(), exeRel.end());
+        char buf[900];
+        sprintf_s(buf, "[Renderer3D] LoadEnvironment FAILED -- IBL stays off.\n"
+                       "  as given : %s  (%s)\n"
+                       "  exe-rel  : %s  (%s)\n"
+                       "  %s\n",
+                  narrow.c_str(),    existsCwd ? "exists, DECODE FAILED" : "NOT FOUND",
+                  narrowExe.c_str(), existsExe ? "exists, DECODE FAILED" : "NOT FOUND",
+                  (existsCwd || existsExe)
+                      ? "File found but undecodable. .exr is NOT supported (needs OpenEXR) -- use .hdr."
+                      : "File not found on either path. Copy the .hdr next to the exe.");
+        OutputDebugStringA(buf);
+        return false;
     }
     const auto& srcMeta = src.GetMetadata();
 
@@ -2071,6 +2174,628 @@ void Renderer3D::RecordSsaoPass(int frame) {
     CD3DX12_RESOURCE_BARRIER aoToRead = CD3DX12_RESOURCE_BARRIER::Transition(
         m_SsaoTarget.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
     cmd->ResourceBarrier(1, &aoToRead);
+
+    ThrowIfFailed(cmd->Close());
+}
+
+
+// ============================ HDR intermediate + tonemapping ============================
+// Everything the 3D renderer draws goes into an FP16 texture instead of the back buffer, and one
+// fullscreen pass maps that linear HDR range down to what a display can show.
+//
+// Why this is worth a whole extra target: an 8-bit UNORM back buffer cannot hold a value above 1.0,
+// so before this the pixel shader had to squash its lighting result inline (a Reinhard divide) the
+// instant it was computed. Every highlight above white was destroyed at that point -- which is both
+// why bright scenes read flat and why bloom could not be built (bloom needs something to bloom
+// FROM, and there was nothing left over 1.0 to find). Keeping the range and deciding how to map it
+// ONCE, at the end, is the entire structural change; the curve itself is a handful of ALU ops.
+//
+// The pass reuses SSAO_VS -- one oversized triangle from SV_VertexID, no vertex buffer -- and gets
+// its ordering from resource barriers, which is the established idiom in this renderer.
+
+// Root signature + PSO + command lists: everything that does NOT depend on the window size, built
+// once from Initialize. Keeping the shader read here is the point -- see the header comment.
+void Renderer3D::CreateTonemapPipeline() {
+    auto* device = m_Core->GetDevice();
+
+    // ---- root signature: b0 = 4 root constants (exposure + operator), t0 = the HDR texture ----
+    // Root constants rather than a per-frame CB: two live floats, changed at most once per frame,
+    // so a CB resource per frame slot would be pure bookkeeping.
+    CD3DX12_DESCRIPTOR_RANGE rHdr, rBloom;
+    rHdr.Init  (D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0);   // t0: the FP16 scene
+    rBloom.Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 1);   // t1: the finished bloom chain
+    // t0 and t1 need SEPARATE ranges rather than one range of 2, because the HDR target and
+    // bloom[0] are allocated independently in the shared SRV heap and are not adjacent -- a
+    // 2-descriptor range would require them to be.
+    CD3DX12_ROOT_PARAMETER tp[3] = {};
+    tp[0].InitAsConstants(4, 0, 0, D3D12_SHADER_VISIBILITY_PIXEL);            // b0
+    tp[1].InitAsDescriptorTable(1, &rHdr,   D3D12_SHADER_VISIBILITY_PIXEL);   // t0
+    tp[2].InitAsDescriptorTable(1, &rBloom, D3D12_SHADER_VISIBILITY_PIXEL);   // t1
+    // POINT: the pass is 1:1 with the back buffer, so there is nothing to interpolate. A linear
+    // sampler here would only soften the image for no reason.
+    D3D12_STATIC_SAMPLER_DESC ss = {};
+    ss.Filter           = D3D12_FILTER_MIN_MAG_MIP_POINT;
+    ss.AddressU = ss.AddressV = ss.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+    ss.MaxLOD           = D3D12_FLOAT32_MAX;
+    ss.ShaderRegister   = 0;
+    ss.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+    CD3DX12_ROOT_SIGNATURE_DESC sd;
+    sd.Init(3, tp, 1, &ss, D3D12_ROOT_SIGNATURE_FLAG_NONE);   // no input layout: vertex ID only
+    ComPtr<ID3DBlob> blob, err;
+    HRESULT hr = D3D12SerializeRootSignature(&sd, D3D_ROOT_SIGNATURE_VERSION_1, &blob, &err);
+    if (FAILED(hr)) { if (err) OutputDebugStringA((const char*)err->GetBufferPointer()); ThrowIfFailed(hr); }
+    ThrowIfFailed(device->CreateRootSignature(0, blob->GetBufferPointer(), blob->GetBufferSize(),
+                                              IID_PPV_ARGS(&m_TonemapRootSig)));
+
+    auto vs = ReadFile(ExeRelative(L"shaders\\SSAO_VS.cso"));       // shared fullscreen triangle
+    auto ps = ReadFile(ExeRelative(L"shaders\\Tonemap_PS.cso"));
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC pso = {};
+    pso.pRootSignature        = m_TonemapRootSig.Get();
+    pso.VS                    = { vs.data(), vs.size() };
+    pso.PS                    = { ps.data(), ps.size() };
+    pso.InputLayout           = { nullptr, 0 };
+    pso.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+    pso.RasterizerState       = CD3DX12_RASTERIZER_DESC(D3D12_DEFAULT);
+    pso.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+    pso.BlendState            = CD3DX12_BLEND_DESC(D3D12_DEFAULT);   // opaque: it REPLACES the frame
+    pso.DepthStencilState     = CD3DX12_DEPTH_STENCIL_DESC(D3D12_DEFAULT);
+    pso.DepthStencilState.DepthEnable = FALSE;
+    pso.SampleMask            = UINT_MAX;
+    pso.NumRenderTargets      = 1;
+    // THE encode point. This one PSO writes through the _SRGB view, which is what gamma-encodes the
+    // frame; every other 3D PSO writes linear into HdrFormat and must NOT encode.
+    pso.RTVFormats[0]         = RendererCore::BackBufferRTVFormat;
+    pso.DSVFormat             = DXGI_FORMAT_UNKNOWN;
+    pso.SampleDesc.Count      = 1;
+    ThrowIfFailed(device->CreateGraphicsPipelineState(&pso, IID_PPV_ARGS(&m_TonemapPso)));
+    m_TonemapPso->SetName(L"Tonemap PSO");
+
+    for (int i = 0; i < RendererCore::NumFrames; ++i) {
+        ThrowIfFailed(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
+                                                     IID_PPV_ARGS(&m_HdrBeginAlloc[i])));
+        ThrowIfFailed(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT,
+            m_HdrBeginAlloc[i].Get(), nullptr, IID_PPV_ARGS(&m_HdrBeginList[i])));
+        ThrowIfFailed(m_HdrBeginList[i]->Close());
+        m_HdrBeginList[i]->SetName(L"HDR target clear");
+
+        ThrowIfFailed(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
+                                                     IID_PPV_ARGS(&m_TonemapAlloc[i])));
+        ThrowIfFailed(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT,
+            m_TonemapAlloc[i].Get(), nullptr, IID_PPV_ARGS(&m_TonemapList[i])));
+        ThrowIfFailed(m_TonemapList[i]->Close());
+        m_TonemapList[i]->SetName(L"Tonemap pass");
+    }
+}
+
+// The size-dependent half: the FP16 texture plus its RTV and SRV. Called on first record and again
+// whenever the window size changes.
+bool Renderer3D::CreateHdrTarget(UINT width, UINT height) {
+    auto* device = m_Core->GetDevice();
+    if (!device || width == 0 || height == 0) return false;
+
+    D3D12_RESOURCE_DESC td = {};
+    td.Dimension        = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    td.Width            = width;
+    td.Height           = height;
+    td.DepthOrArraySize = 1;
+    td.MipLevels        = 1;
+    td.Format           = RendererCore::HdrFormat;
+    td.SampleDesc.Count = 1;
+    td.Flags            = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+
+    // The optimized clear value MUST match what RecordHdrBegin actually clears to, or the driver
+    // takes a slow path (and the debug layer complains).
+    D3D12_CLEAR_VALUE clear = {};
+    clear.Format = RendererCore::HdrFormat;
+    memcpy(clear.Color, &m_HdrClearColor, sizeof(clear.Color));
+
+    CD3DX12_HEAP_PROPERTIES defaultHeap(D3D12_HEAP_TYPE_DEFAULT);
+    // Created in RENDER_TARGET and it RESTS there: the tonemap list is the only thing that moves it
+    // (to PIXEL_SHADER_RESOURCE and straight back), so no other pass needs a barrier.
+    ThrowIfFailed(device->CreateCommittedResource(&defaultHeap, D3D12_HEAP_FLAG_NONE, &td,
+        D3D12_RESOURCE_STATE_RENDER_TARGET, &clear, IID_PPV_ARGS(&m_HdrTarget)));
+    m_HdrTarget->SetName(L"HDR scene target (FP16)");
+
+    if (!m_HdrRtvHeap) {
+        D3D12_DESCRIPTOR_HEAP_DESC rh = {};
+        rh.Type           = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
+        rh.NumDescriptors = 1;
+        ThrowIfFailed(device->CreateDescriptorHeap(&rh, IID_PPV_ARGS(&m_HdrRtvHeap)));
+    }
+    device->CreateRenderTargetView(m_HdrTarget.Get(), nullptr,
+                                   m_HdrRtvHeap->GetCPUDescriptorHandleForHeapStart());
+
+    // SRV in the SHARED heap (only one shader-visible heap can be bound at a time). On a RESIZE the
+    // slot is REUSED -- the view is rewritten at the CPU handle we kept -- rather than allocating a
+    // fresh one. AllocateSrvSlot has no free list, so re-allocating here would leak a descriptor on
+    // every window resize; the SSAO path does exactly that and should be given the same treatment.
+    auto* rm = m_Core->GetRenderer2D()->GetResourceManager();
+    if (!m_HdrSrvGpu.ptr) {
+        if (!rm->AllocateSrvSlot(m_HdrSrvCpu, m_HdrSrvGpu)) {
+            OutputDebugStringA("[Renderer3D] SRV heap full -- cannot create the HDR target; "
+                               "the 3D pass will be skipped.\n");
+            m_HdrTarget.Reset();
+            return false;
+        }
+    }
+    D3D12_SHADER_RESOURCE_VIEW_DESC srv = {};
+    srv.Format                  = RendererCore::HdrFormat;
+    srv.ViewDimension           = D3D12_SRV_DIMENSION_TEXTURE2D;
+    srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    srv.Texture2D.MipLevels     = 1;
+    device->CreateShaderResourceView(m_HdrTarget.Get(), &srv, m_HdrSrvCpu);
+
+    m_HdrWidth = width; m_HdrHeight = height;
+    return true;
+}
+
+// Clears the FP16 target. Pushed FIRST each frame. RendererCore's BeginFrame clears the BACK BUFFER,
+// which the 3D passes no longer touch -- without this list the scene target keeps whatever the
+// previous frame left in it wherever nothing draws over it this frame.
+void Renderer3D::RecordHdrBegin(int frame) {
+    auto* cmd = m_HdrBeginList[frame].Get();
+    ThrowIfFailed(m_HdrBeginAlloc[frame]->Reset());
+    ThrowIfFailed(cmd->Reset(m_HdrBeginAlloc[frame].Get(), nullptr));
+    // No barrier: the target rests in RENDER_TARGET (the tonemap list restores it before it ends).
+    cmd->ClearRenderTargetView(m_HdrRtvHeap->GetCPUDescriptorHandleForHeapStart(),
+                               reinterpret_cast<const FLOAT*>(&m_HdrClearColor), 0, nullptr);
+    ThrowIfFailed(cmd->Close());
+}
+
+// Resolves the FP16 scene onto the back buffer. Pushed LAST of the 3D lists, so RendererCore's 2D
+// layers -- submitted after them -- composite on top of the finished image.
+void Renderer3D::RecordTonemapPass(int frame, D3D12_CPU_DESCRIPTOR_HANDLE backRtv,
+                                   UINT width, UINT height) {
+    auto* cmd = m_TonemapList[frame].Get();
+    ThrowIfFailed(m_TonemapAlloc[frame]->Reset());
+    ThrowIfFailed(cmd->Reset(m_TonemapAlloc[frame].Get(), m_TonemapPso.Get()));
+
+    CD3DX12_RESOURCE_BARRIER toRead = CD3DX12_RESOURCE_BARRIER::Transition(
+        m_HdrTarget.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET,
+        D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    cmd->ResourceBarrier(1, &toRead);
+
+    D3D12_VIEWPORT vp = { 0.0f, 0.0f, (float)width, (float)height, 0.0f, 1.0f };
+    D3D12_RECT     sc = { 0, 0, (LONG)width, (LONG)height };
+    cmd->RSSetViewports(1, &vp);
+    cmd->RSSetScissorRects(1, &sc);
+    // The back buffer is already in RENDER_TARGET (RendererCore's PRE list transitioned it) and no
+    // depth is bound -- a fullscreen resolve has nothing to test against.
+    cmd->OMSetRenderTargets(1, &backRtv, FALSE, nullptr);
+
+    ID3D12DescriptorHeap* heaps[] = { m_Core->GetRenderer2D()->GetSrvHeap() };
+    cmd->SetDescriptorHeaps(1, heaps);
+    cmd->SetGraphicsRootSignature(m_TonemapRootSig.Get());
+    // Bloom is live only if it was asked for AND the chain actually exists this frame. When it
+    // doesn't, t1 is still bound (D3D12 requires every declared table populated even where the
+    // shader branches past it) -- the HDR target itself is the placeholder, and intensity 0 is what
+    // switches it off.
+    const bool  bloomLive = m_BloomEnabled && m_BloomLevels > 0 && m_BloomTex[0];
+    const float consts[4] = { m_Exposure, (float)(uint32_t)m_Tonemapper,
+                              bloomLive ? m_BloomIntensity : 0.0f, 0.0f };
+    cmd->SetGraphicsRoot32BitConstants(0, 4, consts, 0);
+    cmd->SetGraphicsRootDescriptorTable(1, m_HdrSrvGpu);
+    cmd->SetGraphicsRootDescriptorTable(2, bloomLive ? m_BloomSrvGpu[0] : m_HdrSrvGpu);
+    cmd->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    cmd->IASetVertexBuffers(0, 0, nullptr);
+    cmd->IASetIndexBuffer(nullptr);
+    cmd->DrawInstanced(3, 1, 0, 0);   // the fullscreen triangle SSAO_VS builds from SV_VertexID
+
+    CD3DX12_RESOURCE_BARRIER backToRt = CD3DX12_RESOURCE_BARRIER::Transition(
+        m_HdrTarget.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+        D3D12_RESOURCE_STATE_RENDER_TARGET);
+    cmd->ResourceBarrier(1, &backToRt);
+
+    ThrowIfFailed(cmd->Close());
+}
+
+
+// ============================ FXAA ============================
+// The final pass. Reads the tonemapped LDR intermediate and resolves it to the back buffer.
+// See FXAA_PS.hlsl for why this must run on gamma-encoded data, and the m_LdrTarget declaration for
+// why one resource carries an _SRGB render-target view and a plain _UNORM shader view.
+
+void Renderer3D::CreateFxaaPipeline() {
+    auto* device = m_Core->GetDevice();
+
+    CD3DX12_DESCRIPTOR_RANGE rScene;
+    rScene.Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0);
+    CD3DX12_ROOT_PARAMETER fp[2] = {};
+    fp[0].InitAsConstants(4, 0, 0, D3D12_SHADER_VISIBILITY_PIXEL);            // b0: texel size + thresholds
+    fp[1].InitAsDescriptorTable(1, &rScene, D3D12_SHADER_VISIBILITY_PIXEL);   // t0
+    // LINEAR, not point: the edge-blend taps land BETWEEN texels by design -- that sub-texel
+    // interpolation is where the smoothing actually comes from. A point sampler here reduces FXAA
+    // to picking whole neighbours and it stops working.
+    D3D12_STATIC_SAMPLER_DESC ss = {};
+    ss.Filter           = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+    ss.AddressU = ss.AddressV = ss.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+    ss.MaxLOD           = D3D12_FLOAT32_MAX;
+    ss.ShaderRegister   = 0;
+    ss.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+    CD3DX12_ROOT_SIGNATURE_DESC sd;
+    sd.Init(2, fp, 1, &ss, D3D12_ROOT_SIGNATURE_FLAG_NONE);
+    ComPtr<ID3DBlob> blob, err;
+    HRESULT hr = D3D12SerializeRootSignature(&sd, D3D_ROOT_SIGNATURE_VERSION_1, &blob, &err);
+    if (FAILED(hr)) { if (err) OutputDebugStringA((const char*)err->GetBufferPointer()); ThrowIfFailed(hr); }
+    ThrowIfFailed(device->CreateRootSignature(0, blob->GetBufferPointer(), blob->GetBufferSize(),
+                                              IID_PPV_ARGS(&m_FxaaRootSig)));
+
+    auto vs = ReadFile(ExeRelative(L"shaders\\SSAO_VS.cso"));   // shared fullscreen triangle
+    auto ps = ReadFile(ExeRelative(L"shaders\\FXAA_PS.cso"));
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC pso = {};
+    pso.pRootSignature        = m_FxaaRootSig.Get();
+    pso.VS                    = { vs.data(), vs.size() };
+    pso.PS                    = { ps.data(), ps.size() };
+    pso.InputLayout           = { nullptr, 0 };
+    pso.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+    pso.RasterizerState       = CD3DX12_RASTERIZER_DESC(D3D12_DEFAULT);
+    pso.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+    pso.BlendState            = CD3DX12_BLEND_DESC(D3D12_DEFAULT);
+    pso.DepthStencilState     = CD3DX12_DEPTH_STENCIL_DESC(D3D12_DEFAULT);
+    pso.DepthStencilState.DepthEnable = FALSE;
+    pso.SampleMask            = UINT_MAX;
+    pso.NumRenderTargets      = 1;
+    pso.RTVFormats[0]         = RendererCore::BackBufferRTVFormat;
+    pso.DSVFormat             = DXGI_FORMAT_UNKNOWN;
+    pso.SampleDesc.Count      = 1;
+    ThrowIfFailed(device->CreateGraphicsPipelineState(&pso, IID_PPV_ARGS(&m_FxaaPso)));
+    m_FxaaPso->SetName(L"FXAA PSO");
+
+    for (int i = 0; i < RendererCore::NumFrames; ++i) {
+        ThrowIfFailed(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
+                                                     IID_PPV_ARGS(&m_FxaaAlloc[i])));
+        ThrowIfFailed(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT,
+            m_FxaaAlloc[i].Get(), nullptr, IID_PPV_ARGS(&m_FxaaList[i])));
+        ThrowIfFailed(m_FxaaList[i]->Close());
+        m_FxaaList[i]->SetName(L"FXAA pass");
+    }
+}
+
+bool Renderer3D::CreateLdrTarget(UINT width, UINT height) {
+    auto* device = m_Core->GetDevice();
+    if (!device || width == 0 || height == 0) return false;
+
+    D3D12_RESOURCE_DESC td = {};
+    td.Dimension        = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    td.Width            = width;
+    td.Height           = height;
+    td.DepthOrArraySize = 1;
+    td.MipLevels        = 1;
+    // The RESOURCE is plain UNORM; the two VIEWS below differ. Same trick as the back buffer -- a
+    // resource created _SRGB could not also be read raw.
+    td.Format           = RendererCore::BackBufferFormat;
+    td.SampleDesc.Count = 1;
+    td.Flags            = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+
+    D3D12_CLEAR_VALUE clear = {};
+    clear.Format = RendererCore::BackBufferRTVFormat;
+
+    CD3DX12_HEAP_PROPERTIES defaultHeap(D3D12_HEAP_TYPE_DEFAULT);
+    m_LdrTarget.Reset();
+    ThrowIfFailed(device->CreateCommittedResource(&defaultHeap, D3D12_HEAP_FLAG_NONE, &td,
+        D3D12_RESOURCE_STATE_RENDER_TARGET, &clear, IID_PPV_ARGS(&m_LdrTarget)));
+    m_LdrTarget->SetName(L"LDR target (tonemap output, FXAA input)");
+
+    if (!m_LdrRtvHeap) {
+        D3D12_DESCRIPTOR_HEAP_DESC rh = {};
+        rh.Type           = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
+        rh.NumDescriptors = 1;
+        ThrowIfFailed(device->CreateDescriptorHeap(&rh, IID_PPV_ARGS(&m_LdrRtvHeap)));
+    }
+    // EXPLICIT desc: passing nullptr would inherit the resource's plain UNORM format and silently
+    // skip the sRGB encode -- the same trap documented on RendererCore::BackBufferRTVFormat.
+    D3D12_RENDER_TARGET_VIEW_DESC rtvDesc = {};
+    rtvDesc.Format        = RendererCore::BackBufferRTVFormat;   // _UNORM_SRGB: encode on write
+    rtvDesc.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
+    device->CreateRenderTargetView(m_LdrTarget.Get(), &rtvDesc,
+                                   m_LdrRtvHeap->GetCPUDescriptorHandleForHeapStart());
+
+    auto* rm = m_Core->GetRenderer2D()->GetResourceManager();
+    if (!m_LdrSrvGpu.ptr) {
+        if (!rm->AllocateSrvSlot(m_LdrSrvCpu, m_LdrSrvGpu)) {
+            OutputDebugStringA("[Renderer3D] SRV heap full -- FXAA disabled.\n");
+            m_LdrTarget.Reset();
+            return false;
+        }
+    }
+    D3D12_SHADER_RESOURCE_VIEW_DESC srv = {};
+    srv.Format                  = RendererCore::BackBufferFormat;   // plain UNORM: NO decode on read
+    srv.ViewDimension           = D3D12_SRV_DIMENSION_TEXTURE2D;
+    srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    srv.Texture2D.MipLevels     = 1;
+    device->CreateShaderResourceView(m_LdrTarget.Get(), &srv, m_LdrSrvCpu);
+
+    m_LdrWidth = width; m_LdrHeight = height;
+    return true;
+}
+
+void Renderer3D::RecordFxaaPass(int frame, D3D12_CPU_DESCRIPTOR_HANDLE backRtv,
+                                UINT width, UINT height) {
+    auto* cmd = m_FxaaList[frame].Get();
+    ThrowIfFailed(m_FxaaAlloc[frame]->Reset());
+    ThrowIfFailed(cmd->Reset(m_FxaaAlloc[frame].Get(), m_FxaaPso.Get()));
+
+    // The LDR target rests in RENDER_TARGET (the tonemap pass just wrote it) and is restored before
+    // this list ends, so the tonemap pass needs no knowledge of this one.
+    auto toRead = CD3DX12_RESOURCE_BARRIER::Transition(m_LdrTarget.Get(),
+        D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    cmd->ResourceBarrier(1, &toRead);
+
+    D3D12_VIEWPORT vp = { 0.0f, 0.0f, (float)width, (float)height, 0.0f, 1.0f };
+    D3D12_RECT     sc = { 0, 0, (LONG)width, (LONG)height };
+    cmd->RSSetViewports(1, &vp);
+    cmd->RSSetScissorRects(1, &sc);
+    cmd->OMSetRenderTargets(1, &backRtv, FALSE, nullptr);
+
+    ID3D12DescriptorHeap* heaps[] = { m_Core->GetRenderer2D()->GetSrvHeap() };
+    cmd->SetDescriptorHeaps(1, heaps);
+    cmd->SetGraphicsRootSignature(m_FxaaRootSig.Get());
+    const float consts[4] = { 1.0f / (float)width, 1.0f / (float)height,
+                              m_FxaaThreshold, m_FxaaThresholdMin };
+    cmd->SetGraphicsRoot32BitConstants(0, 4, consts, 0);
+    cmd->SetGraphicsRootDescriptorTable(1, m_LdrSrvGpu);
+    cmd->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    cmd->IASetVertexBuffers(0, 0, nullptr);
+    cmd->IASetIndexBuffer(nullptr);
+    cmd->DrawInstanced(3, 1, 0, 0);
+
+    auto backToRt = CD3DX12_RESOURCE_BARRIER::Transition(m_LdrTarget.Get(),
+        D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+    cmd->ResourceBarrier(1, &backToRt);
+
+    ThrowIfFailed(cmd->Close());
+}
+
+
+// ============================ Bloom ============================
+// Progressive downsample/upsample over the FP16 scene target (Jimenez, "Next Generation Post
+// Processing in Call of Duty"), composited back in Tonemap_PS BEFORE the curve.
+//
+// The chain runs HDR -> bloom[0] (prefilter + threshold) -> bloom[1] .. bloom[N-1] (downsample),
+// then back up bloom[N-1] -> ... -> bloom[0] with ADDITIVE blending. Summing every level is what
+// gives a response that looks like light: the small levels are a tight core, the large ones a wide
+// faint halo, and real glare is that whole stack rather than any one blur radius.
+//
+// Every target rests in PIXEL_SHADER_RESOURCE and is flipped to RENDER_TARGET only for the step
+// that writes it, so each step is self-contained -- the same idiom as the shadow and SSAO passes.
+
+void Renderer3D::CreateBloomPipeline() {
+    auto* device = m_Core->GetDevice();
+
+    // b0 = 8 root constants (BloomConsts), t0 = the source level. LINEAR CLAMP sampler: the whole
+    // filter design assumes bilinear taps between texels, and clamp keeps the edge of the screen
+    // from wrapping a bright pixel around to the opposite side as the chain shrinks.
+    CD3DX12_DESCRIPTOR_RANGE rSrc;
+    rSrc.Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0);
+    CD3DX12_ROOT_PARAMETER bp[2] = {};
+    bp[0].InitAsConstants(8, 0, 0, D3D12_SHADER_VISIBILITY_PIXEL);
+    bp[1].InitAsDescriptorTable(1, &rSrc, D3D12_SHADER_VISIBILITY_PIXEL);
+    D3D12_STATIC_SAMPLER_DESC ss = {};
+    ss.Filter           = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+    ss.AddressU = ss.AddressV = ss.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+    ss.MaxLOD           = D3D12_FLOAT32_MAX;
+    ss.ShaderRegister   = 0;
+    ss.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+    CD3DX12_ROOT_SIGNATURE_DESC sd;
+    sd.Init(2, bp, 1, &ss, D3D12_ROOT_SIGNATURE_FLAG_NONE);   // no input layout: vertex ID only
+    ComPtr<ID3DBlob> blob, err;
+    HRESULT hr = D3D12SerializeRootSignature(&sd, D3D_ROOT_SIGNATURE_VERSION_1, &blob, &err);
+    if (FAILED(hr)) { if (err) OutputDebugStringA((const char*)err->GetBufferPointer()); ThrowIfFailed(hr); }
+    ThrowIfFailed(device->CreateRootSignature(0, blob->GetBufferPointer(), blob->GetBufferSize(),
+                                              IID_PPV_ARGS(&m_BloomRootSig)));
+
+    auto vs   = ReadFile(ExeRelative(L"shaders\\SSAO_VS.cso"));   // shared fullscreen triangle
+    auto down = ReadFile(ExeRelative(L"shaders\\BloomDownsample_PS.cso"));
+    auto up   = ReadFile(ExeRelative(L"shaders\\BloomUpsample_PS.cso"));
+
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC pso = {};
+    pso.pRootSignature        = m_BloomRootSig.Get();
+    pso.VS                    = { vs.data(), vs.size() };
+    pso.PS                    = { down.data(), down.size() };
+    pso.InputLayout           = { nullptr, 0 };
+    pso.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+    pso.RasterizerState       = CD3DX12_RASTERIZER_DESC(D3D12_DEFAULT);
+    pso.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+    pso.BlendState            = CD3DX12_BLEND_DESC(D3D12_DEFAULT);   // downsample REPLACES
+    pso.DepthStencilState     = CD3DX12_DEPTH_STENCIL_DESC(D3D12_DEFAULT);
+    pso.DepthStencilState.DepthEnable = FALSE;
+    pso.SampleMask            = UINT_MAX;
+    pso.NumRenderTargets      = 1;
+    pso.RTVFormats[0]         = RendererCore::HdrFormat;   // the chain stays FP16 end to end
+    pso.DSVFormat             = DXGI_FORMAT_UNKNOWN;
+    pso.SampleDesc.Count      = 1;
+    ThrowIfFailed(device->CreateGraphicsPipelineState(&pso, IID_PPV_ARGS(&m_BloomDownPso)));
+    m_BloomDownPso->SetName(L"Bloom downsample PSO");
+
+    // The upsample PSO differs from the downsample one ONLY in the shader and the blend state.
+    // ONE/ONE additive IS the accumulation step -- that is why the upsample shader never reads its
+    // destination and the chain needs no ping-pong target.
+    pso.PS = { up.data(), up.size() };
+    CD3DX12_BLEND_DESC addBlend(D3D12_DEFAULT);
+    addBlend.RenderTarget[0].BlendEnable    = TRUE;
+    addBlend.RenderTarget[0].SrcBlend       = D3D12_BLEND_ONE;
+    addBlend.RenderTarget[0].DestBlend      = D3D12_BLEND_ONE;
+    addBlend.RenderTarget[0].BlendOp        = D3D12_BLEND_OP_ADD;
+    addBlend.RenderTarget[0].SrcBlendAlpha  = D3D12_BLEND_ONE;
+    addBlend.RenderTarget[0].DestBlendAlpha = D3D12_BLEND_ONE;
+    addBlend.RenderTarget[0].BlendOpAlpha   = D3D12_BLEND_OP_ADD;
+    pso.BlendState = addBlend;
+    ThrowIfFailed(device->CreateGraphicsPipelineState(&pso, IID_PPV_ARGS(&m_BloomUpPso)));
+    m_BloomUpPso->SetName(L"Bloom upsample PSO");
+
+    for (int i = 0; i < RendererCore::NumFrames; ++i) {
+        ThrowIfFailed(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
+                                                     IID_PPV_ARGS(&m_BloomAlloc[i])));
+        ThrowIfFailed(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT,
+            m_BloomAlloc[i].Get(), nullptr, IID_PPV_ARGS(&m_BloomList[i])));
+        ThrowIfFailed(m_BloomList[i]->Close());
+        m_BloomList[i]->SetName(L"Bloom chain");
+    }
+}
+
+bool Renderer3D::CreateBloomTargets(UINT width, UINT height) {
+    auto* device = m_Core->GetDevice();
+    if (!device || width < 4 || height < 4) return false;
+
+    if (!m_BloomRtvHeap) {
+        D3D12_DESCRIPTOR_HEAP_DESC rh = {};
+        rh.Type           = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
+        rh.NumDescriptors = kBloomMips;
+        ThrowIfFailed(device->CreateDescriptorHeap(&rh, IID_PPV_ARGS(&m_BloomRtvHeap)));
+    }
+    const UINT rtvStride = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+    auto* rm = m_Core->GetRenderer2D()->GetResourceManager();
+
+    D3D12_CLEAR_VALUE clear = {};
+    clear.Format = RendererCore::HdrFormat;   // black; must match what the passes clear to
+    CD3DX12_HEAP_PROPERTIES defaultHeap(D3D12_HEAP_TYPE_DEFAULT);
+
+    m_BloomLevels = 0;
+    for (UINT i = 0; i < kBloomMips; ++i) {
+        const UINT w = width  >> (i + 1);
+        const UINT h = height >> (i + 1);
+        // Stop before the level gets degenerate. A 4x4 target has no meaningful filter footprint
+        // left, and on a small window that can happen well before kBloomMips levels exist.
+        if (w < 4 || h < 4) break;
+
+        D3D12_RESOURCE_DESC td = {};
+        td.Dimension        = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        td.Width            = w;
+        td.Height           = h;
+        td.DepthOrArraySize = 1;
+        td.MipLevels        = 1;
+        td.Format           = RendererCore::HdrFormat;
+        td.SampleDesc.Count = 1;
+        td.Flags            = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+
+        m_BloomTex[i].Reset();
+        ThrowIfFailed(device->CreateCommittedResource(&defaultHeap, D3D12_HEAP_FLAG_NONE, &td,
+            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, &clear, IID_PPV_ARGS(&m_BloomTex[i])));
+        m_BloomTex[i]->SetName(L"Bloom level");
+
+        CD3DX12_CPU_DESCRIPTOR_HANDLE rtv(m_BloomRtvHeap->GetCPUDescriptorHandleForHeapStart(),
+                                          (INT)i, rtvStride);
+        device->CreateRenderTargetView(m_BloomTex[i].Get(), nullptr, rtv);
+
+        // Slot REUSED across resizes (AllocateSrvSlot has no free list) -- allocate only the first time.
+        if (!m_BloomSrvGpu[i].ptr) {
+            if (!rm->AllocateSrvSlot(m_BloomSrvCpu[i], m_BloomSrvGpu[i])) {
+                OutputDebugStringA("[Renderer3D] SRV heap full -- bloom disabled.\n");
+                for (UINT k = 0; k <= i; ++k) m_BloomTex[k].Reset();
+                m_BloomLevels = 0;
+                return false;
+            }
+        }
+        D3D12_SHADER_RESOURCE_VIEW_DESC srv = {};
+        srv.Format                  = RendererCore::HdrFormat;
+        srv.ViewDimension           = D3D12_SRV_DIMENSION_TEXTURE2D;
+        srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        srv.Texture2D.MipLevels     = 1;
+        device->CreateShaderResourceView(m_BloomTex[i].Get(), &srv, m_BloomSrvCpu[i]);
+
+        m_BloomW[i] = w; m_BloomH[i] = h;
+        ++m_BloomLevels;
+    }
+    return m_BloomLevels > 0;
+}
+
+void Renderer3D::RecordBloomPass(int frame) {
+    auto* cmd = m_BloomList[frame].Get();
+    ThrowIfFailed(m_BloomAlloc[frame]->Reset());
+    ThrowIfFailed(cmd->Reset(m_BloomAlloc[frame].Get(), m_BloomDownPso.Get()));
+
+    ID3D12DescriptorHeap* heaps[] = { m_Core->GetRenderer2D()->GetSrvHeap() };
+    cmd->SetDescriptorHeaps(1, heaps);
+    cmd->SetGraphicsRootSignature(m_BloomRootSig.Get());
+    cmd->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    cmd->IASetVertexBuffers(0, 0, nullptr);
+    cmd->IASetIndexBuffer(nullptr);
+
+    const UINT rtvStride =
+        m_Core->GetDevice()->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+    auto levelRtv = [&](UINT i) {
+        return CD3DX12_CPU_DESCRIPTOR_HANDLE(
+            m_BloomRtvHeap->GetCPUDescriptorHandleForHeapStart(), (INT)i, rtvStride);
+    };
+    auto setViewport = [&](UINT w, UINT h) {
+        D3D12_VIEWPORT vp = { 0.0f, 0.0f, (float)w, (float)h, 0.0f, 1.0f };
+        D3D12_RECT     sc = { 0, 0, (LONG)w, (LONG)h };
+        cmd->RSSetViewports(1, &vp);
+        cmd->RSSetScissorRects(1, &sc);
+    };
+    auto toTarget = [&](ID3D12Resource* r) {
+        auto b = CD3DX12_RESOURCE_BARRIER::Transition(r,
+            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+        cmd->ResourceBarrier(1, &b);
+    };
+    auto toRead = [&](ID3D12Resource* r) {
+        auto b = CD3DX12_RESOURCE_BARRIER::Transition(r,
+            D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+        cmd->ResourceBarrier(1, &b);
+    };
+
+    // The HDR target rests in RENDER_TARGET and is put BACK before this list ends, so the tonemap
+    // pass's own barriers stay valid without either pass knowing about the other.
+    {
+        auto b = CD3DX12_RESOURCE_BARRIER::Transition(m_HdrTarget.Get(),
+            D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+        cmd->ResourceBarrier(1, &b);
+    }
+
+    // ---- prefilter: full-res HDR -> bloom[0], applying the threshold ----
+    {
+        toTarget(m_BloomTex[0].Get());
+        auto rtv = levelRtv(0);
+        cmd->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+        setViewport(m_BloomW[0], m_BloomH[0]);
+        cmd->SetPipelineState(m_BloomDownPso.Get());
+        // Texel size is the SOURCE's (the full-res HDR target), not the destination's.
+        BloomConsts c{ 1.0f / (float)m_HdrWidth, 1.0f / (float)m_HdrHeight,
+                       m_BloomThreshold, m_BloomKnee, 1.0f, m_BloomScatter, 0.0f, 0.0f };
+        cmd->SetGraphicsRoot32BitConstants(0, 8, &c, 0);
+        cmd->SetGraphicsRootDescriptorTable(1, m_HdrSrvGpu);
+        cmd->DrawInstanced(3, 1, 0, 0);
+        toRead(m_BloomTex[0].Get());
+    }
+
+    // ---- downsample: bloom[i] -> bloom[i+1] ----
+    for (UINT i = 0; i + 1 < m_BloomLevels; ++i) {
+        toTarget(m_BloomTex[i + 1].Get());
+        auto rtv = levelRtv(i + 1);
+        cmd->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+        setViewport(m_BloomW[i + 1], m_BloomH[i + 1]);
+        cmd->SetPipelineState(m_BloomDownPso.Get());
+        BloomConsts c{ 1.0f / (float)m_BloomW[i], 1.0f / (float)m_BloomH[i],
+                       m_BloomThreshold, m_BloomKnee, 0.0f, m_BloomScatter, 0.0f, 0.0f };
+        cmd->SetGraphicsRoot32BitConstants(0, 8, &c, 0);
+        cmd->SetGraphicsRootDescriptorTable(1, m_BloomSrvGpu[i]);
+        cmd->DrawInstanced(3, 1, 0, 0);
+        toRead(m_BloomTex[i + 1].Get());
+    }
+
+    // ---- upsample + ACCUMULATE: bloom[i+1] added into bloom[i], smallest first ----
+    // Additive blend, so each level is summed into the one above rather than replacing it. Walking
+    // downward (i from the second-smallest to 0) means bloom[0] ends up holding the whole stack.
+    for (int i = (int)m_BloomLevels - 2; i >= 0; --i) {
+        toTarget(m_BloomTex[i].Get());
+        auto rtv = levelRtv((UINT)i);
+        cmd->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+        setViewport(m_BloomW[i], m_BloomH[i]);
+        cmd->SetPipelineState(m_BloomUpPso.Get());
+        BloomConsts c{ 1.0f / (float)m_BloomW[i + 1], 1.0f / (float)m_BloomH[i + 1],
+                       m_BloomThreshold, m_BloomKnee, 0.0f, m_BloomScatter, 0.0f, 0.0f };
+        cmd->SetGraphicsRoot32BitConstants(0, 8, &c, 0);
+        cmd->SetGraphicsRootDescriptorTable(1, m_BloomSrvGpu[i + 1]);
+        cmd->DrawInstanced(3, 1, 0, 0);
+        toRead(m_BloomTex[i].Get());
+    }
+
+    // Hand the HDR target back in the state the tonemap pass expects to find it.
+    {
+        auto b = CD3DX12_RESOURCE_BARRIER::Transition(m_HdrTarget.Get(),
+            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+        cmd->ResourceBarrier(1, &b);
+    }
 
     ThrowIfFailed(cmd->Close());
 }

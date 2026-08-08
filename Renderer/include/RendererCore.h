@@ -215,6 +215,28 @@ namespace JLib {
         static constexpr DXGI_FORMAT BackBufferFormat    = DXGI_FORMAT_R8G8B8A8_UNORM;
         static constexpr DXGI_FORMAT BackBufferRTVFormat = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
 
+        // The 3D scene's HDR intermediate. Renderer3D renders EVERY 3D pass (sky, geometry, skinned,
+        // particles) into a texture of this format and then tonemaps it onto the back buffer; the 2D
+        // pass, particles and ImGui still draw straight onto the back buffer AFTER that, so 2D output
+        // is byte-identical to before (see the "2D API colours are DISPLAY space" convention).
+        //
+        // WHY FLOAT: an 8-bit UNORM target cannot represent anything brighter than white, so the old
+        // pipeline had to squash the lighting result into 0..1 inside the pixel shader (an inline
+        // Reinhard) before it was ever written. Every value above 1 -- which is most of what a sun,
+        // an emissive surface or a specular highlight produces -- was destroyed at that point, which
+        // is why bloom and real tonemapping could not be built on it. FP16 keeps the range so a
+        // single dedicated pass can decide how to map it.
+        //
+        // NOTE THE ENCODE POINT MOVED. This format is LINEAR (a float target has no sRGB variant and
+        // needs none), so nothing gamma-encodes when the 3D passes write. The sRGB encode now happens
+        // exactly once, when the TONEMAP pass writes the back buffer through BackBufferRTVFormat.
+        // Doing it in both places is the double-encode failure -- same class of bug as the
+        // three-places sRGB problem documented above.
+        //
+        // Every 3D PSO's RTVFormats[0] must equal this, and the tonemap PSO's must equal
+        // BackBufferRTVFormat. As above, a mismatch is a loud CreateGraphicsPipelineState failure.
+        static constexpr DXGI_FORMAT HdrFormat = DXGI_FORMAT_R16G16B16A16_FLOAT;
+
         // Seconds elapsed since the LAST call to GetFrameTime() (not since last frame Present --
         // call this once per game-loop iteration, same spot every time, e.g. right after
         // ProcessMessages()/before Submit() calls, so "once per call" lines up with "once per
