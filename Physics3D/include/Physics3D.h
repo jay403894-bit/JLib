@@ -94,6 +94,16 @@ namespace JLib {
 
         void Update(float dt);     // steps the simulation this frame
 
+        // How many bodies Jolt is actually SOLVING this step, as opposed to how many exist.
+        // Jolt deactivates a body once it has been at rest long enough, and a sleeping body costs
+        // essentially nothing -- so this, not BodyCount(), is the number that explains solver time.
+        //
+        // It is the direct diagnostic for "physics time climbs and never comes back down": if the
+        // pile has visibly settled and this stays high, bodies are NOT sleeping (usually because
+        // something keeps waking them or they are jittering at rest), and the cost is a bug rather
+        // than the honest price of more contacts.
+        std::size_t ActiveBodyCount() const;
+
         // Set a dynamic body's linear velocity (and wake it) -- the slingshot launch: spawn a sphere, then
         // SetLinearVelocity(handle, aimDir * power). Plain types; safe on the main thread outside Update.
         void SetLinearVelocity(BodyHandle h, DirectX::XMFLOAT3 v);

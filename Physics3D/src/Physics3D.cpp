@@ -563,6 +563,12 @@ void Physics3D::Update(float dt) {
 
 std::size_t Physics3D::BodyCount() const { return m_impl ? m_impl->bodies.size() : 0; }
 
+std::size_t Physics3D::ActiveBodyCount() const {
+    // RigidBody only -- soft bodies are counted separately by Jolt and this wrapper has none.
+    return m_impl ? (std::size_t)m_impl->physics_system.GetNumActiveBodies(JPH::EBodyType::RigidBody)
+                  : 0;
+}
+
 void Physics3D::GetBody(BodyHandle h, DirectX::XMFLOAT3& outPos,
                         DirectX::XMFLOAT4& outRotQuat, DirectX::XMFLOAT3& outHalfExtent) const {
     const Impl& p = *m_impl;
