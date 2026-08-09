@@ -42,7 +42,11 @@ struct Light {
     float3 position;      float range;         // point/spot world position; range = falloff distance
     float3 direction;     float intensity;     // normalized light direction (directional/spot)
     float3 color;         float type;          // 0=dir, 1=point, 2=spot
-    float  spotCosInner;  float spotCosOuter;  float2 _lpad;   // spot cone edges (cosines)
+    // For a SPOT these are the cone-edge cosines. For a RECT AREA light (type 3) they are reused as
+    // half-width and half-height, with pad0 = roll angle and pad1 = two-sided flag -- see the type-3
+    // branch below. GpuLight is exactly 64 bytes and static_asserted, so reusing spare fields is what
+    // keeps a new light type from forcing an ABI change on every consumer.
+    float  spotCosInner;  float spotCosOuter;  float pad0;  float pad1;
 };
 cbuffer Lights : register(b3) {
     float3 gAmbient;   uint gLightCount;   // ambient term (applied to albedo) + how many lights are live
@@ -67,6 +71,9 @@ cbuffer Lights : register(b3) {
     // IBL: gIblOn = 0 falls back to the hemisphere/flat ambient above. gIblMipCount is the prefiltered
     // chain length, which maps roughness onto a mip level.
     float  gIblOn;           float gIblMipCount;  float2 _spad3;
+    // SSGI: gGiOn = 0 skips the bounce lookup entirely (the texture stays bound either way, since
+    // D3D12 requires every declared descriptor table populated).
+    float  gGiOn;            float gEnvIntensity;   float2 _spad4;
 }
 
 Texture2D    gSsao        : register(t7);   // screen-space occlusion factor (R8), full screen res
@@ -74,6 +81,7 @@ Texture2D    gSsao        : register(t7);   // screen-space occlusion factor (R8
 // SRV heap so one descriptor range covers both.
 TextureCube  gIrradiance  : register(t8);   // diffuse: cosine-convolved, 32x32/face
 TextureCube  gPrefiltered : register(t9);   // specular: one mip per roughness
+Texture2D    gSsgi        : register(t10);  // one-bounce indirect colour (see SSGI_PS)
 Texture2D    gAlbedo     : register(t0);   // base color
 Texture2D    gMetalRough : register(t1);   // G = roughness, B = metalness  (glTF packing)
 Texture2D    gEmissive   : register(t2);   // emissive color
@@ -245,6 +253,82 @@ float4 PSMain(PSInput input) : SV_TARGET {
     for (uint i = 0; i < count; ++i) {
         Light lt = gLights[i];
 
+        // TYPE 3 -- RECTANGULAR AREA LIGHT, handled entirely separately and then `continue`.
+        // A punctual light contributes  (BRDF) * radiance * NdotL: one direction, one cosine. An area
+        // light's diffuse term is instead an INTEGRAL over the whole polygon, and that integral already
+        // contains the cosine -- so it cannot be folded into the shared expression below without
+        // double-counting NdotL. Hence the early out.
+        //
+        // The integral has a closed form (Lambert's formula for the irradiance from a polygon): project
+        // each edge onto the unit sphere at the shading point, and sum the subtended angle of each edge
+        // weighted by how much that edge's plane aligns with the surface normal. Exact for diffuse, no
+        // sampling, no lookup tables.
+        if (lt.type > 2.5f) {
+            // Rebuild the rectangle from the packed fields. GpuLight is exactly 64 bytes and full, so
+            // rather than grow it (which rebuilds every consumer) the tangent basis is DERIVED: an
+            // arbitrary perpendicular to the normal, rotated by a stored roll angle. Same trick the
+            // hinge constraint uses for its reference axis. halfW/halfH reuse the spot cosine slots.
+            float3 An = normalize(lt.direction);
+            float3 a0 = abs(An.y) > 0.99f ? float3(1, 0, 0) : float3(0, 1, 0);
+            float3 At = normalize(cross(a0, An));
+            float3 Ab = cross(An, At);
+            float  roll = lt.pad0;
+            float  cs = cos(roll), sn = sin(roll);
+            float3 Tw = At * cs + Ab * sn;          // rolled tangent
+            float3 Bw = -At * sn + Ab * cs;         // rolled bitangent
+            float  hw = lt.spotCosInner, hh = lt.spotCosOuter;
+
+            float3 P = input.worldPos;
+            float3 c0 = lt.position - Tw * hw - Bw * hh;
+            float3 c1 = lt.position + Tw * hw - Bw * hh;
+            float3 c2 = lt.position + Tw * hw + Bw * hh;
+            float3 c3 = lt.position - Tw * hw + Bw * hh;
+
+            // ONE-SIDED unless pad1 says otherwise: a real panel light emits from its front face only,
+            // and without this a ceiling light also lights the room above it.
+            float3 toP = P - lt.position;
+            if (lt.pad1 < 0.5f && dot(toP, An) <= 0.0f) continue;
+
+            float3 v0 = normalize(c0 - P), v1 = normalize(c1 - P);
+            float3 v2 = normalize(c2 - P), v3 = normalize(c3 - P);
+
+            // Sum of edge contributions. Each term is (angle subtended by the edge) x (alignment of
+            // that edge's great-circle normal with N). The result times the light's radiance IS the
+            // irradiance -- there is no 1/PI here, that belongs to the Lambert BRDF below.
+            float sum = 0.0f;
+            sum += acos(clamp(dot(v0, v1), -1.0f, 1.0f)) * dot(normalize(cross(v0, v1)), N);
+            sum += acos(clamp(dot(v1, v2), -1.0f, 1.0f)) * dot(normalize(cross(v1, v2)), N);
+            sum += acos(clamp(dot(v2, v3), -1.0f, 1.0f)) * dot(normalize(cross(v2, v3)), N);
+            sum += acos(clamp(dot(v3, v0), -1.0f, 1.0f)) * dot(normalize(cross(v3, v0)), N);
+            // APPROXIMATION: the polygon is not clipped to the horizon, so a light straddling the
+            // surface plane is slightly wrong. Clamping is the cheap stand-in; proper clipping is what
+            // a full LTC implementation does.
+            float E = max(sum * 0.5f, 0.0f);
+
+            // Range cutoff so an area light stays local like the punctual ones.
+            float  adist = length(lt.position - P);
+            float  ar    = max(lt.range, 1e-3f);
+            float  afall = saturate(1.0f - pow(adist / ar, 4.0f));
+            E *= afall * afall;
+
+            float3 aRad = lt.color * lt.intensity;
+            // Diffuse is exact. SPECULAR IS APPROXIMATE: the rect's centre is treated as a punctual
+            // light scaled by the same form factor. That is visibly wrong on a mirror (a real area
+            // light shows a stretched rectangular highlight) and fine on anything rough. Correct
+            // specular for area sources is what LTC exists for.
+            float3 aL = normalize(lt.position - P);
+            float3 aH = normalize(V + aL);
+            float  aNdotL = saturate(dot(N, aL));
+            float  aD = D_GGX(saturate(dot(N, aH)), rough);
+            float  aG = G_Smith(NdotV, aNdotL, rough);
+            float3 aF = F_Schlick(saturate(dot(V, aH)), F0);
+            float3 aSpec = (aD * aG * aF) / max(4.0f * NdotV * aNdotL, 1e-4f);
+            float3 akD = (1.0f - aF) * (1.0f - metallic);
+
+            Lo += akD * albedo / PI * aRad * E + aSpec * aRad * E;
+            continue;
+        }
+
         // Light direction (surface->light) + radiance, per type.
         float3 L;
         float  atten = 1.0f;
@@ -325,10 +409,13 @@ float4 PSMain(PSInput input) : SV_TARGET {
         // the cosine-convolved irradiance along N; specular reads the prefiltered chain along the
         // reflection vector, with roughness selecting the mip -- which is why a rough metal blurs its
         // reflection and a smooth one mirrors, from one sample each.
-        float3 irradiance = gIrradiance.Sample(gSampler, N).rgb;
+        // gEnvIntensity scales the environment's LIGHTING contribution. Indoors this wants to be well
+        // below 1: one env map assumes every surface sees the sky, which an enclosed room contradicts,
+        // and that over-bright ambient is what drowns the geometrically correct SSGI bounce.
+        float3 irradiance = gIrradiance.Sample(gSampler, N).rgb * gEnvIntensity;
         float3 R          = reflect(-V, N);
         float3 prefiltered = gPrefiltered.SampleLevel(gSampler, R,
-                                                      rough * max(gIblMipCount - 1.0f, 0.0f)).rgb;
+                                                      rough * max(gIblMipCount - 1.0f, 0.0f)).rgb * gEnvIntensity;
         float2 ab   = EnvBRDFApprox(rough, NdotV);
         float3 spec = prefiltered * (F0 * ab.x + ab.y);
         ambient = (kDamb * albedo * irradiance + spec) * ao;
@@ -336,6 +423,35 @@ float4 PSMain(PSInput input) : SV_TARGET {
         float3 hemiAmbient  = lerp(gAmbientGround, gAmbient, saturate(N.y * 0.5f + 0.5f));
         float3 ambientColor = lerp(gAmbient, hemiAmbient, gHemiMix);
         ambient = ambientColor * (kDamb * albedo + Famb) * ao;
+    }
+
+    // SSGI: one bounce of indirect light gathered from the scene itself. This is the term IBL cannot
+    // supply -- the environment map only knows about the SKY, so a red curtain never tints the wall
+    // beside it. Multiplied by the receiver's albedo because bounce light is irradiance ARRIVING;
+    // what leaves the surface is that times what the surface reflects.
+    //
+    // Deliberately NOT multiplied by `ao`. SSAO exists to attenuate ambient that assumes an
+    // unoccluded sky, and this term makes no such assumption -- it gathered from the actual nearby
+    // geometry, so it already accounts for the crease. Applying AO on top would darken it twice.
+    float3 giTerm = 0.0f;
+    if (gGiOn > 0.5f) {
+        float2 guv = input.clip.xy * gSsaoTexel;   // same screen-UV derivation as the SSAO tap above
+        // BLURRED, exactly as the SSAO tap above is, and for a stronger reason. A 16-sample kernel
+        // rotated per pixel trades banding for noise, and that noise has to be smoothed -- but COLOUR
+        // noise is far more objectionable than the luminance noise SSAO produces, and on a large
+        // surface at a glancing angle the hemisphere samples project into long thin screen-space
+        // footprints, so the noise arrives as STREAKS that read as a change in the material rather
+        // than as grain. Sampling this raw made the floor look like a different, rougher wood.
+        //
+        // Taps are spaced TWO texels apart rather than one: the streaks are wider than a pixel, so a
+        // 3x3 at single-texel spacing barely touches them. Still 9 taps, same cost as the SSAO blur.
+        // (A depth-aware bilateral pass of its own would be better and is the standard answer; this
+        // stays inline for the same reason SSAO's blur does -- no extra render target or pass.)
+        // SINGLE TAP. The denoise is a dedicated edge-aware pass now (SSGIBlur_PS) -- filtering once
+        // per screen pixel instead of 25 taps per LIT pixel, and depth-aware so it stops at
+        // silhouettes instead of bleeding indirect light across them.
+        giTerm = gSsgi.Sample(gSampler, guv).rgb * kDamb * albedo;
+        ambient += giTerm;
     }
 
     // Emissive = factor x texture, added after lighting (self-illuminated surfaces -- the glowing bits).

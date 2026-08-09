@@ -65,6 +65,20 @@ namespace JLib {
         // orthographic pass); a point light would need six.
         void AddSpotLight(DirectX::XMFLOAT3 pos, DirectX::XMFLOAT3 dir, DirectX::XMFLOAT3 color,
                           float intensity, float range, float innerDeg = 20.0f, float outerDeg = 30.0f);
+        // RECTANGULAR AREA LIGHT (type 3). A real panel with width and height rather than a point,
+        // so its diffuse contribution is an exact analytic integral over the rectangle -- soft falloff
+        // and a wide, gradual terminator instead of the hard cosine a punctual light gives.
+        //
+        // `normal` is the direction the panel FACES; it emits from that side only unless twoSided.
+        // rollDeg spins the rectangle about that normal (the tangent basis is derived, not stored).
+        //
+        // TWO HONEST LIMITS: it casts NO SHADOW (the shadow rig handles directional/spot/point only),
+        // and its SPECULAR is approximated by treating the centre as a punctual source -- correct on
+        // rough surfaces, visibly wrong on a mirror, which is the case LTC exists to solve. Pair it
+        // with an emissive quad at the same position or the light appears to come from nowhere.
+        void AddRectAreaLight(DirectX::XMFLOAT3 pos, DirectX::XMFLOAT3 normal, DirectX::XMFLOAT3 color,
+                              float intensity, float halfWidth, float halfHeight, float range,
+                              float rollDeg = 0.0f, bool twoSided = false);
 
         // ---- Shadows (one caster: directional or spot) --------------------------------------------
         // Renders the scene once from the light's point of view into a depth map, then the pixel
@@ -109,6 +123,19 @@ namespace JLib {
         // baked lightmaps. Expect interiors to read too bright until those exist.
         bool LoadEnvironment(const std::wstring& hdrPath) { return BakeEnvironment(hdrPath); }
         bool HasEnvironment() const { return m_EnvReady; }
+
+        // How much the baked environment contributes to LIGHTING. Separate from the visible skybox
+        // on purpose: one is the backdrop you see, the other is the light it casts, and indoors they
+        // genuinely want different values.
+        //
+        // WHY THIS KNOB EXISTS. A single environment map assumes every surface can see the sky. That
+        // is right outdoors and plainly false inside a colonnade with a roof and columns -- IBL then
+        // supplies a large, geometrically WRONG indirect term that drowns the small, roughly correct
+        // one SSGI computes from the actual geometry. In an enclosed scene the honest move is to turn
+        // this DOWN and let the screen-space bounce carry more of the indirect, rather than cranking
+        // SSGI on top of an ambient that was already too bright.
+        void  SetEnvironmentIntensity(float i) { m_EnvIntensity = i > 0.0f ? i : 0.0f; }
+        float GetEnvironmentIntensity() const  { return m_EnvIntensity; }
 
         void EnableSSAO(bool on) { m_SsaoEnabled = on; }
         // radius    -- world units; the SCALE of detail it finds. Roughly the size of the gap you want
@@ -163,6 +190,66 @@ namespace JLib {
         // exposure is the blunter of the two because it dims the sun along with the sky.
         void  SetExposure(float e) { m_Exposure = e > 0.0f ? e : 0.0f; }
         float GetExposure() const  { return m_Exposure; }
+
+        // ---- SSGI: screen-space global illumination ------------------------------------------------
+        // ONE BOUNCE of indirect light, gathered from the depth buffer and the previous frame's lit
+        // colour. This is what makes a red curtain tint the wall beside it -- the thing IBL cannot do,
+        // because IBL only knows about the sky and assumes every surface can see it.
+        //
+        // It reuses the SSAO machinery almost entirely: the same camera depth prepass, the same
+        // hemisphere kernel, the same world-space reconstruction. Enabling SSGI turns the depth
+        // prepass on even if SSAO is off, since both need it.
+        //
+        // THE LIMITATION IS INHERENT, not a tuning problem: only geometry that is ON SCREEN can
+        // bounce. Turn the camera and indirect lighting changes, because the surface that was
+        // lighting the wall left the frustum. Probes or DDGI are the answer to that; this buys most
+        // of the visible benefit of colour bleeding for a fraction of the cost.
+        //
+        // Costs one extra fullscreen pass plus a full-res FP16 copy of the HDR target each frame
+        // (the history buffer the gather reads).
+        void EnableSSGI(bool on) { m_SsgiEnabled = on; }
+        bool IsSSGIEnabled() const { return m_SsgiEnabled; }
+        // radius    -- WORLD units; how far light is allowed to travel to bounce. Bigger looks
+        //              softer and costs more screen-space search; too big and the 16 samples spread
+        //              so thin the result turns noisy.
+        // intensity -- scales the gathered bounce. 1.0 is a reasonable start.
+        // maxLuma   -- per-sample clamp. The history buffer is unbounded HDR, so one emissive lamp
+        //              or specular highlight can dominate a 16-sample average and flicker as it
+        //              moves sub-pixel. Lower this if you see sparkle; raise it for stronger bleed
+        //              from bright sources.
+        // DEBUG VIEW: render the bounce term ALONE, with nothing else in the frame. A term that
+        // contributes a few percent of a lit surface cannot be judged in a composited image -- isolate
+        // it and "is the floor picking up red from the red wall" answers itself in one glance.
+        void SetSSGIDebug(bool on) { m_SsgiDebug = on; }
+        bool IsSSGIDebug() const   { return m_SsgiDebug; }
+        // maxDistance -- WORLD units a ray may travel before giving up. This is the scale over which
+        //                light is allowed to bounce; bigger costs more march steps to cover.
+        // intensity   -- 1.0 is ONE physically-normalised bounce. The gather is cosine-weighted, so
+        //                unlike the old point-sampling version this is a real multiplier, not a fudge.
+        //                Values above 1 are defensible as standing in for the bounces a single-bounce
+        //                technique cannot do: the converged series totals bounce1 / (1 - albedo).
+        // maxLuma     -- per-sample clamp. The history buffer is unbounded HDR, so one emissive texel
+        //                can dominate the average and flicker as it moves sub-pixel.
+        void SetSSGIParams(float maxDistance, float intensity, float maxLuma = 40.0f) {
+            m_SsgiMaxDist   = maxDistance > 0.0f ? maxDistance : 0.0f;
+            m_SsgiIntensity = intensity > 0.0f ? intensity : 0.0f;
+            m_SsgiMaxLuma   = maxLuma > 0.0f ? maxLuma : 0.0f;
+        }
+        // THE RAY-MARCH SETTINGS. Cost is rays x steps depth taps per pixel, so these are the dial
+        // between quality and frame time.
+        // steps     -- march steps per ray. Too few and rays step straight past thin geometry.
+        // rays      -- directions per pixel. This is the noise dial; doubling it halves the variance
+        //              at double the cost, and is the honest fix when the result looks grainy.
+        // thickness -- WORLD units behind the recorded surface that still counts as an intersection.
+        //              The depth buffer stores a surface, not a solid, so without this bound every ray
+        //              passing behind any object reports a hit and the screen fills with false bounce.
+        //              Too small and rays tunnel through everything; too large and thin geometry casts
+        //              light it should not.
+        void SetSSGIMarch(int steps, int rays, float thickness) {
+            m_SsgiSteps     = steps > 1 ? steps : 1;
+            m_SsgiRays      = rays  > 1 ? rays  : 1;
+            m_SsgiThickness = thickness > 0.0f ? thickness : 0.01f;
+        }
 
         // ---- Bloom -------------------------------------------------------------------------------
         // Light spilling around bright things. Off by default (opt-in, like shadows and SSAO).
@@ -578,6 +665,8 @@ namespace JLib {
             DirectX::XMFLOAT2 ssaoTexel;       float ssaoOn;   float _pad2;
             // IBL: iblOn = 0 -> the shader falls back to hemisphere/flat ambient.
             float iblOn;  float iblMipCount;   float _pad3[2];
+            // SSGI: giOn = 0 skips the bounce lookup in the shader.
+            float giOn;   float envIntensity;   float _pad4[2];
         };
         Microsoft::WRL::ComPtr<ID3D12Resource> m_LightsCB[RendererCore::NumFrames];
         void* m_LightsCBMapped[RendererCore::NumFrames] = {};
@@ -636,7 +725,82 @@ namespace JLib {
         Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList> m_SsaoList[RendererCore::NumFrames];
         UINT m_SsaoWidth = 0, m_SsaoHeight = 0;   // rebuilt on resize
         void CreateSsaoResources(UINT width, UINT height);
-        void RecordSsaoPass(int frame);           // depth prepass + the occlusion pass, one list
+        // Depth prepass + the occlusion pass + (when enabled) the SSGI gather -- all one list.
+        // They share the prepass, so the list runs whenever EITHER SSAO or SSGI is on.
+        void RecordSsaoPass(int frame);
+
+        // ---- SSGI (see EnableSSGI) ----
+        // Rides the SSAO list because it needs the same camera depth prepass. Two resources of its
+        // own: the gathered-bounce target, and a copy of the PREVIOUS frame's HDR to gather from.
+        //
+        // The history copy is why this pass can run before the geometry pass at all: Basic3D_PS
+        // consumes the result as an indirect term, so it must exist before shading, which means this
+        // frame's lit colour is not available yet. One frame of latency on low-frequency indirect
+        // light is invisible, and is what every screen-space bounce implementation accepts.
+        bool  m_SsgiEnabled   = false;
+        float m_SsgiMaxDist   = 3.0f;    // how far a ray may travel, world units
+        float m_SsgiThickness = 0.35f;   // world units behind the depth buffer that still counts as a hit
+        int   m_SsgiSteps     = 12;      // march steps per ray
+        int   m_SsgiRays      = 4;       // rays per pixel
+        uint32_t m_SsgiFrame  = 0;       // decorrelates the sampling noise between frames
+        float m_SsgiIntensity = 1.0f;
+        float m_SsgiMaxLuma   = 8.0f;
+        bool  m_SsgiDebug     = false;
+        // R11G11B10_FLOAT: HDR colour with no alpha needed, half the bandwidth of FP16. The gathered
+        // bounce is low-frequency and low-magnitude, so the reduced mantissa is not visible.
+        Microsoft::WRL::ComPtr<ID3D12Resource>       m_SsgiTarget;
+        Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> m_SsgiRtvHeap;
+        D3D12_CPU_DESCRIPTOR_HANDLE                  m_SsgiSrvCpu = {};   // reused across resizes
+        D3D12_GPU_DESCRIPTOR_HANDLE                  m_SsgiSrvGpu = {};   // t10 in the geometry pass
+        Microsoft::WRL::ComPtr<ID3D12Resource>       m_HdrHistory;        // last frame's HDR, FP16
+        D3D12_CPU_DESCRIPTOR_HANDLE                  m_HistSrvCpu = {};
+        D3D12_GPU_DESCRIPTOR_HANDLE                  m_HistSrvGpu = {};
+        Microsoft::WRL::ComPtr<ID3D12RootSignature>  m_SsgiRootSig;
+        Microsoft::WRL::ComPtr<ID3D12PipelineState>  m_SsgiPso;
+        // Denoise target + PSO. The blur writes HERE and the geometry pass samples this, not the raw
+        // gather -- one extra full-screen RT to avoid a read-modify-write of a target being sampled.
+        // TWO targets, ping-ponged. The denoise pass reads last frame's result and writes this
+        // frame's, and a pass cannot sample the surface it is writing -- so the alternative would be
+        // a full-screen copy every frame purely to make a readable history. Alternating costs one
+        // extra texture and nothing per frame.
+        Microsoft::WRL::ComPtr<ID3D12Resource>       m_SsgiBlurTarget[2];
+        Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> m_SsgiBlurRtvHeap;      // 2 RTVs
+        D3D12_CPU_DESCRIPTOR_HANDLE                  m_SsgiBlurSrvCpu[2] = {};
+        D3D12_GPU_DESCRIPTOR_HANDLE                  m_SsgiBlurSrvGpu[2] = {};
+        int  m_SsgiBlurIndex   = 0;       // which of the pair holds THIS frame's result
+        bool m_SsgiHistoryValid = false;  // false on the first frame and after any resize
+        Microsoft::WRL::ComPtr<ID3D12RootSignature>  m_SsgiBlurRootSig;
+        Microsoft::WRL::ComPtr<ID3D12PipelineState>  m_SsgiBlurPso;
+        Microsoft::WRL::ComPtr<ID3D12Resource>       m_SsgiBlurCB[RendererCore::NumFrames];
+        void*                                        m_SsgiBlurCBMapped[RendererCore::NumFrames] = {};
+        // MUST match BlurCB in SSGIBlur_PS.hlsl field for field.
+        struct SsgiBlurCBData {
+            DirectX::XMFLOAT4X4 invViewProj;
+            DirectX::XMFLOAT4X4 prevViewProj;
+            float texelX, texelY, stride, depthSigma;
+            float alpha, historyValid, pad0, pad1;
+        };
+        DirectX::XMFLOAT4X4 m_PrevViewProj = {};   // last frame's camera, for reprojection
+        float m_SsgiBlurStride = 2.0f;    // tap spacing in texels
+        float m_SsgiBlurSigma  = 0.02f;   // relative depth tolerance before a tap is rejected
+        float m_SsgiAlpha      = 0.9f;    // history weight; ~a 10-frame running average
+        Microsoft::WRL::ComPtr<ID3D12Resource>       m_SsgiCB[RendererCore::NumFrames];
+        void*                                        m_SsgiCBMapped[RendererCore::NumFrames] = {};
+        // SSGI tracks its OWN dimensions. Gating on the SSAO ones was a bug: CreateSsaoResources
+        // updates those to the new size BEFORE the SSGI check runs, so the comparison was always
+        // false and the history texture kept its old size -- CopyResource then failed a dimension
+        // match on the first resize and took the process down.
+        UINT m_SsgiWidth = 0, m_SsgiHeight = 0;
+        // MUST match the SsgiCB cbuffer in SSGI_PS.hlsl field for field.
+        struct SsgiCBData {
+            DirectX::XMFLOAT4X4 viewProj;
+            DirectX::XMFLOAT4X4 invViewProj;
+            DirectX::XMFLOAT3   eyePos;    float maxDist;
+            float intensity; float maxLuma; float thickness; float steps;
+            float rays; float frame; float pad0; float pad1;
+        };
+        void CreateSsgiPipeline();                       // Initialize-time
+        bool CreateSsgiTargets(UINT width, UINT height); // lazy + on resize
 
         // ---- HDR intermediate + tonemap pass (see SetTonemapper) ----
         // The scene target every 3D pass renders into, and the pass that resolves it to the back
@@ -772,6 +936,7 @@ namespace JLib {
         static constexpr UINT kIrradianceSize = 32;    // cosine irradiance is very low-frequency
         static constexpr UINT kPrefilterSize  = 128;   // mip 0; the chain runs down from here
         bool m_EnvReady      = false;
+        float m_EnvIntensity = 1.0f;   // scales the IBL lighting contribution (not the visible sky)
         UINT m_PrefilterMips = 1;
         Microsoft::WRL::ComPtr<ID3D12Resource> m_EnvCube;        // full-res environment (intermediate)
         Microsoft::WRL::ComPtr<ID3D12Resource> m_IrradianceCube;
@@ -815,6 +980,16 @@ namespace JLib {
         // object), bound as vertex slot 1 and read per-instance by Basic3D_VS (INSTMAT0..3). Persistently
         // mapped like m_CameraCB, so writing this frame's matrices is a plain memcpy. kMaxInstances caps
         // how many objects a single frame can draw; anything past the cap is dropped that frame.
+        // 1x1 opaque white, created lazily on the first untextured Submit. An INVALID albedo used to
+        // mean "skip this draw entirely", which is silently fatal for a mesh that is meant to be flat-
+        // coloured -- baseColorFactor exists precisely so a mesh can have no texture, and the whole
+        // object simply never appeared with no error anywhere. White is the identity for the
+        // `baseColorFactor * albedo` product, so substituting it makes the factor behave exactly as a
+        // caller would expect.
+        TextureHandle m_WhiteTex{};
+        bool          m_WhiteTexTried = false;
+        TextureHandle WhiteTexture();   // lazy; needs the ResourceManager, so not available at Initialize
+
         static constexpr UINT kMaxInstances = 65536;
         Microsoft::WRL::ComPtr<ID3D12Resource> m_InstanceBuffer[RendererCore::NumFrames];
         void* m_InstanceMapped[RendererCore::NumFrames] = {};

@@ -11,6 +11,14 @@
 //
 // Drawn as ONE fullscreen triangle from SV_VertexID (SSAO_VS, shared), no vertex buffer.
 
+// SSGI DEBUG VIEW lives HERE, not in the geometry pass, and the reason is a real bug that was worth
+// keeping: returning the bounce term from Basic3D_PS put it into the HDR TARGET -- which is exactly
+// what gets copied to the history buffer that SSGI gathers from next frame. So the debug view fed
+// itself a black scene, found no bounce in it, and went black permanently after one frame. Showing
+// the SSGI texture from the tonemap pass instead leaves the HDR target holding the real render, so
+// the history stays valid and the debug view is a pure display change with no feedback path.
+Texture2D<float4> gSsgiDbg : register(t2);
+
 Texture2D<float4> gHdr     : register(t0);
 // The finished bloom chain (bloom[0], half-res). Bound to a valid texture even when bloom is off --
 // D3D12 requires every declared descriptor table populated -- so gBloomIntensity, not the binding,
@@ -23,7 +31,7 @@ cbuffer TonemapParams : register(b0) {
     float  gExposure;       // linear multiplier applied BEFORE the curve (see SetExposure)
     float  gOperator;       // 0 = none (clamp), 1 = Reinhard, 2 = ACES, 3 = Uchimura, 4 = ACESFitted
     float  gBloomIntensity; // 0 = bloom off
-    float  _pad;
+    float  gSsgiDebug;      // >0 = show the SSGI bounce alone, scaled by this (display only)
 };
 
 struct PSInput {
@@ -102,6 +110,13 @@ float3 TonemapUchimura(float3 x) {
 float4 PSMain(PSInput input) : SV_TARGET {
     // SampleLevel, not Sample: 1:1 with the back buffer, so there is no mip chain and no derivative
     // to compute -- and an implicit-LOD sample on a non-mipped target is just wasted work.
+    // Debug display: show the gathered bounce on its own, bypassing everything else. Still goes
+    // through the curve and the sRGB encode so what you see is comparable to the composited image.
+    if (gSsgiDebug > 0.0f) {
+        float3 g = max(gSsgiDbg.SampleLevel(gSampler, input.uv, 0.0f).rgb, 0.0f) * gSsgiDebug;
+        return float4(TonemapACESFitted(g), 1.0f);
+    }
+
     float3 hdr = gHdr.SampleLevel(gSampler, input.uv, 0.0f).rgb;
 
     // A NaN or a negative survives every curve below and shows up as a black or white firefly that

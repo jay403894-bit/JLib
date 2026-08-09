@@ -224,6 +224,16 @@
       <EntryPointName>VSMain</EntryPointName>
       <ShaderModel>6.1</ShaderModel>
     </FxCompile>
+    <FxCompile Include="src\SSGI_PS.hlsl">
+      <ShaderType>Pixel</ShaderType>
+      <EntryPointName>PSMain</EntryPointName>
+      <ShaderModel>6.1</ShaderModel>
+    </FxCompile>
+    <FxCompile Include="src\SSGIBlur_PS.hlsl">
+      <ShaderType>Pixel</ShaderType>
+      <EntryPointName>PSMain</EntryPointName>
+      <ShaderModel>6.1</ShaderModel>
+    </FxCompile>
     <FxCompile Include="src\Tonemap_PS.hlsl">
       <ShaderType>Pixel</ShaderType>
       <EntryPointName>PSMain</EntryPointName>

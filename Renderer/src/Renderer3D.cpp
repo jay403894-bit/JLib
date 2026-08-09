@@ -75,10 +75,11 @@ ComPtr<ID3D12RootSignature> Renderer3D::CreateRootSignature() {
     rSsao.Init      (D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 7);  // t7: screen-space occlusion (per frame)
     // t8+t9 as ONE range of two: the irradiance and prefiltered cubes are allocated back-to-back in
     // the shared heap, so a single descriptor table and a single root parameter covers both.
-    CD3DX12_DESCRIPTOR_RANGE rIbl;
+    CD3DX12_DESCRIPTOR_RANGE rIbl, rSsgi;
     rIbl.Init       (D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 2, 8);  // t8: irradiance, t9: prefiltered
+    rSsgi.Init      (D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 10); // t10: SSGI bounce
 
-    CD3DX12_ROOT_PARAMETER params[13] = {};
+    CD3DX12_ROOT_PARAMETER params[14] = {};
     params[0].InitAsConstantBufferView(0, 0, D3D12_SHADER_VISIBILITY_ALL);    // b0: camera (ViewProj+camPos)
     params[1].InitAsConstants(16, 1, 0, D3D12_SHADER_VISIBILITY_VERTEX);      // b1: Model (unused w/ instancing)
     params[2].InitAsDescriptorTable(1, &rAlbedo, D3D12_SHADER_VISIBILITY_PIXEL);    // t0: base color (per batch)
@@ -92,6 +93,7 @@ ComPtr<ID3D12RootSignature> Renderer3D::CreateRootSignature() {
     params[10].InitAsDescriptorTable(1, &rShadowCube, D3D12_SHADER_VISIBILITY_PIXEL); // t6: shadow cube
     params[11].InitAsDescriptorTable(1, &rSsao,       D3D12_SHADER_VISIBILITY_PIXEL); // t7: SSAO
     params[12].InitAsDescriptorTable(1, &rIbl,        D3D12_SHADER_VISIBILITY_PIXEL); // t8+t9: IBL cubes
+    params[13].InitAsDescriptorTable(1, &rSsgi,       D3D12_SHADER_VISIBILITY_PIXEL); // t10: SSGI
 
     // s0 = a single static linear/wrap sampler baked into the root signature (no descriptor needed).
     D3D12_STATIC_SAMPLER_DESC samplers[2] = {};
@@ -244,6 +246,7 @@ void Renderer3D::Initialize(RendererCore& core) {
     CreateTonemapPipeline();
     CreateBloomPipeline();   // same reasoning: shaders read at Initialize, targets built lazily
     CreateFxaaPipeline();
+    CreateSsgiPipeline();
 
     // Per-frame camera constant buffer: UPLOAD heap (CPU-writable), 256 bytes (CB alignment rule),
     // mapped once and never unmapped -- SetCamera() then just memcpy's the matrix into the slot.
@@ -375,10 +378,11 @@ ComPtr<ID3D12RootSignature> Renderer3D::CreateSkinnedRootSignature() {
     rShadow.Init    (D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 5);   // t5: shadow map
     rShadowCube.Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 6);  // t6: point-light depth cube
     rSsao.Init      (D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 7);  // t7: screen-space occlusion
-    CD3DX12_DESCRIPTOR_RANGE rIbl;
+    CD3DX12_DESCRIPTOR_RANGE rIbl, rSsgi;
     rIbl.Init       (D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 2, 8);  // t8: irradiance, t9: prefiltered
+    rSsgi.Init      (D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 10); // t10: SSGI bounce
 
-    CD3DX12_ROOT_PARAMETER params[14] = {};
+    CD3DX12_ROOT_PARAMETER params[15] = {};
     params[0].InitAsConstantBufferView(0, 0, D3D12_SHADER_VISIBILITY_ALL);         // b0: camera (ViewProj+camPos)
     params[1].InitAsConstants(16, 1, 0, D3D12_SHADER_VISIBILITY_VERTEX);           // b1: Model (16 floats)
     params[2].InitAsConstantBufferView(2, 0, D3D12_SHADER_VISIBILITY_VERTEX);      // b2: bone palette
@@ -396,6 +400,7 @@ ComPtr<ID3D12RootSignature> Renderer3D::CreateSkinnedRootSignature() {
     params[11].InitAsDescriptorTable(1, &rShadowCube, D3D12_SHADER_VISIBILITY_PIXEL); // t6: shadow cube
     params[12].InitAsDescriptorTable(1, &rSsao,       D3D12_SHADER_VISIBILITY_PIXEL); // t7: SSAO
     params[13].InitAsDescriptorTable(1, &rIbl,        D3D12_SHADER_VISIBILITY_PIXEL); // t8+t9: IBL cubes
+    params[14].InitAsDescriptorTable(1, &rSsgi,       D3D12_SHADER_VISIBILITY_PIXEL); // t10: SSGI
 
     D3D12_STATIC_SAMPLER_DESC samplers[2] = {};
     // ANISOTROPIC, not plain trilinear: at grazing angles the pixel footprint in texture space is a
@@ -873,21 +878,70 @@ void Renderer3D::AddSpotLight(DirectX::XMFLOAT3 pos, DirectX::XMFLOAT3 dir, Dire
     AddLight(l);
 }
 
+void Renderer3D::AddRectAreaLight(DirectX::XMFLOAT3 pos, DirectX::XMFLOAT3 normal,
+                                  DirectX::XMFLOAT3 color, float intensity,
+                                  float halfWidth, float halfHeight, float range,
+                                  float rollDeg, bool twoSided) {
+    GpuLight l{};
+    DirectX::XMVECTOR n = DirectX::XMVector3Normalize(DirectX::XMLoadFloat3(&normal));
+    DirectX::XMStoreFloat3(&l.direction, n);   // the face normal, NOT a travel direction
+    l.position = pos; l.range = range; l.color = color; l.intensity = intensity;
+    l.type = 3.0f;
+    // The spot cosine slots carry the half-extents, and the two spare floats carry the roll and the
+    // two-sided flag. Packing into the existing 64 bytes rather than growing GpuLight is deliberate:
+    // the struct is static_asserted against the shader's Light, so widening it would force a rebuild
+    // of every consumer in every configuration for one new light type.
+    l.spotCosInner = halfWidth  > 0.0f ? halfWidth  : 0.0f;
+    l.spotCosOuter = halfHeight > 0.0f ? halfHeight : 0.0f;
+    l.pad0 = DirectX::XMConvertToRadians(rollDeg);
+    l.pad1 = twoSided ? 1.0f : 0.0f;
+    AddLight(l);
+}
+
+// 1x1 opaque white, built on first use. Created here rather than in Initialize because it needs the
+// ResourceManager, which lives on Renderer2D and is not guaranteed to be attached that early --
+// exactly the reason SSAO and the HDR target are also lazy.
+TextureHandle Renderer3D::WhiteTexture() {
+    if (m_WhiteTex.IsValid() || m_WhiteTexTried) return m_WhiteTex;
+    m_WhiteTexTried = true;   // one attempt only; a failure must not retry every Submit of every frame
+    auto* rm = m_Core->GetRenderer2D()->GetResourceManager();
+    m_Core->ExecuteUploadCommand([&](ID3D12GraphicsCommandList* cmd) {
+        m_WhiteTex = rm->CreateSolidColorTexture(cmd, 255, 255, 255, 255);
+    });
+    return m_WhiteTex;
+}
+
 void Renderer3D::Submit(const Mesh& mesh, DirectX::FXMMATRIX model) {
     // Frustum cull FIRST -- an off-screen object skips the albedo lock + Resolve below, not just the draw.
     if (!CullSphere(model, mesh)) { ++m_CulledThisFrame; return; }
     auto* rm = m_Core->GetRenderer2D()->GetResourceManager();
+
+    // NO ALBEDO AT ALL is a legitimate material, not an error: baseColorFactor exists so a mesh can be
+    // a flat colour, and every procedural MakeCubeMesh/MakeCapsuleMesh starts that way. Falling through
+    // to the IsTextureReady gate below made those meshes SILENTLY INVISIBLE -- no error, no warning,
+    // the object simply never drew. White is the identity for `baseColorFactor * albedo`, so
+    // substituting it makes the factor mean exactly what a caller expects.
+    //
+    // Substituting the HANDLE, not a patched Mesh copy: DrawItem stores `const Mesh*` and the batcher
+    // sorts on that pointer, so it has to outlive the frame -- a local copy would dangle immediately.
+    // The IsTextureReady gate below still applies, and still matters for a VALID handle that is only
+    // part-way through its async upload; that case really must skip a frame.
+    TextureHandle albedoH = mesh.material.albedo;
+    if (!albedoH.IsValid()) {
+        albedoH = WhiteTexture();
+        if (!albedoH.IsValid()) return;   // could not create it; nothing sensible left to bind
+    }
     // Albedo not ready yet (e.g. a glTF embedded texture still uploading, or never assigned)? Skip this
     // draw for now -- Resolve() THROWS until Ready, and binding a half-uploaded descriptor is a GPU
     // hazard. The model pops in fully textured within a few frames once PumpAsyncUploads() completes.
     // This is the same "gate on IsTextureReady before drawing" contract async 2D sprites already follow.
-    if (!rm->IsTextureReady(mesh.material.albedo)) return;
+    if (!rm->IsTextureReady(albedoH)) return;
     DrawItem it;
     it.mesh = &mesh;
     DirectX::XMStoreFloat4x4(&it.model, model);   // SIMD matrix -> plain 4x4 floats for root consts
     // Resolve the albedo descriptor ONCE, here on the main thread. Resolve() locks the AssetManager
     // mutex; doing it per-draw inside the parallel record loop serializes the workers on that lock.
-    it.albedo = rm->Resolve(mesh.material.albedo).gpuHandle;
+    it.albedo = rm->Resolve(albedoH).gpuHandle;
     // Optional maps: resolve each if it's valid AND uploaded; otherwise leave `albedo` as a harmless filler
     // (a valid bound texture) and keep its mapFlags bit 0 so the shader ignores it (falls back to the factor).
     it.metalRough = it.emissive = it.occlusion = it.normal = it.albedo;
@@ -1065,6 +1119,10 @@ void Renderer3D::RecordCommandList(int frame,
         // IBL is all-or-nothing: without a baked environment the shader takes the hemisphere path.
         ldst->iblOn       = m_EnvReady ? 1.0f : 0.0f;
         ldst->iblMipCount = (float)m_PrefilterMips;
+        // Live only when the gather actually produced a target this frame, not merely when asked.
+        // 0 = off, 1 = composited into ambient, 2 = DEBUG (bounce term alone; see Basic3D_PS).
+        ldst->giOn = (m_SsgiEnabled && m_SsgiTarget) ? (m_SsgiDebug ? 2.0f : 1.0f) : 0.0f;
+        ldst->envIntensity = m_EnvIntensity;
         const uint32_t n = (m_LightCount < kMaxLights) ? m_LightCount : kMaxLights;
         memcpy(ldst->lights, m_Lights, sizeof(GpuLight) * n);
 
@@ -1078,7 +1136,7 @@ void Renderer3D::RecordCommandList(int frame,
                 m_Lights[m_ShadowCasterOverride].type < 0.5f) {
                 m_ShadowLightIndex = m_ShadowCasterOverride;            // pinned directional
             } else if (m_ShadowCasterOverride >= 0 && (uint32_t)m_ShadowCasterOverride < n &&
-                       m_Lights[m_ShadowCasterOverride].type > 1.5f) {
+                       m_Lights[m_ShadowCasterOverride].type > 1.5f && m_Lights[m_ShadowCasterOverride].type < 2.5f) {
                 m_ShadowLightIndex = m_ShadowCasterOverride;            // pinned spot
             } else if (m_ShadowCasterOverride >= 0 && (uint32_t)m_ShadowCasterOverride < n) {
                 m_ShadowLightIndex = m_ShadowCasterOverride;            // pinned point light
@@ -1086,7 +1144,7 @@ void Renderer3D::RecordCommandList(int frame,
                 for (uint32_t i = 0; i < n && m_ShadowLightIndex < 0; ++i)
                     if (m_Lights[i].type < 0.5f) m_ShadowLightIndex = (int32_t)i;   // directional first
                 for (uint32_t i = 0; i < n && m_ShadowLightIndex < 0; ++i)
-                    if (m_Lights[i].type > 1.5f) m_ShadowLightIndex = (int32_t)i;   // else a spot
+                    if (m_Lights[i].type > 1.5f && m_Lights[i].type < 2.5f) m_ShadowLightIndex = (int32_t)i;   // else a spot (type 3 = area: never casts)
                 // A POINT light is never auto-picked: it costs six passes instead of one, so opting
                 // into that has to be deliberate (SetShadowCaster with its index).
             }
@@ -1114,7 +1172,7 @@ void Renderer3D::RecordCommandList(int frame,
                 : DirectX::XMVectorSet(0.0f, 1.0f, 0.0f, 0.0f);
 
             DirectX::XMMATRIX view, proj;
-            if (L.type > 1.5f) {
+            if (L.type > 1.5f && L.type < 2.5f) {
                 // SPOT: a real viewpoint, so this is an ordinary perspective camera sitting at the
                 // light and looking down its cone. FOV is the FULL outer cone angle (the stored value
                 // is the cosine of the half-angle), widened slightly so the shadow doesn't get clipped
@@ -1163,7 +1221,7 @@ void Renderer3D::RecordCommandList(int frame,
             // mid-range as the representative distance, same idea as the spot case.
             const GpuLight& L = m_Lights[m_ShadowLightIndex];
             ldst->shadowNormalOffset = (L.range) / (float)kCubeShadowSize;
-        } else if (m_ShadowLightIndex >= 0 && m_Lights[m_ShadowLightIndex].type > 1.5f) {
+        } else if (m_ShadowLightIndex >= 0 && m_Lights[m_ShadowLightIndex].type > 1.5f && m_Lights[m_ShadowLightIndex].type < 2.5f) {
             const GpuLight& L = m_Lights[m_ShadowLightIndex];
             float half = acosf(L.spotCosOuter < -1.0f ? -1.0f
                              : (L.spotCosOuter > 1.0f ? 1.0f : L.spotCosOuter));
@@ -1232,7 +1290,10 @@ void Renderer3D::RecordCommandList(int frame,
     // depends on has to have run first. Created lazily on first use (it needs the back-buffer size,
     // and a scene that never enables SSAO should not pay for a full-screen depth + AO target), and
     // rebuilt whenever the window size changes out from under it. ----
-    if (m_SsaoEnabled && !m_Batches.empty()) {
+    // SSAO and SSGI SHARE the camera depth prepass, so this list runs when EITHER is on. The
+    // resources are still created independently -- a scene wanting only one does not pay for the
+    // other's targets.
+    if ((m_SsaoEnabled || m_SsgiEnabled) && !m_Batches.empty()) {
         if (!m_SsaoTarget || m_SsaoWidth != width || m_SsaoHeight != height) {
             // Safe to drop the old textures without flushing here: the only way width/height change
             // is through RendererCore::Resize, which has already waited for every in-flight frame
@@ -1240,7 +1301,9 @@ void Renderer3D::RecordCommandList(int frame,
             m_SsaoDepth.Reset(); m_SsaoTarget.Reset();
             CreateSsaoResources(width, height);
         }
-        if (m_SsaoTarget) {
+        if (m_SsgiEnabled && (!m_SsgiTarget || m_SsgiWidth != width || m_SsgiHeight != height))
+            if (!CreateSsgiTargets(width, height)) m_SsgiEnabled = false;   // logged inside
+        if (m_SsaoTarget) {   // the prepass lives on this list, so it needs the depth resources
             RecordSsaoPass(frame);
             m_RecordedLists.push_back(m_SsaoList[frame].Get());
         }
@@ -1391,6 +1454,10 @@ void Renderer3D::RecordCommandList(int frame,
         avg = (avg == 0.0) ? m_LastRecordMs : (avg * 0.9 + m_LastRecordMs * 0.1);
     }
 
+    // Stash the camera for next frame's temporal reprojection. Must happen AFTER every pass that
+    // used m_ViewProj, or the denoise would reproject into the frame it is already rendering.
+    m_PrevViewProj = m_ViewProj;
+
     m_Items.clear();          // consumed this frame; the app re-submits next frame
     m_SkinnedItems.clear();
 }
@@ -1427,6 +1494,13 @@ void Renderer3D::RecordRange(const RecordTaskCtx& c) {
         // declared dimension even when gIblOn is 0 and nothing ever samples them.
         D3D12_GPU_DESCRIPTOR_HANDLE iblSrv = m_IrradianceSrvGpu.ptr ? m_IrradianceSrvGpu : m_CubeSrvGpu;
         if (iblSrv.ptr) c.list->SetGraphicsRootDescriptorTable(12, iblSrv);
+        // t10: SSGI bounce. Falls back to the SSAO target (a valid 2D SRV) when GI is off -- the
+        // table must be populated regardless, since the shader branches past it on gGiOn rather
+        // than the binding being absent.
+        // The DENOISED target, not the raw gather.
+        D3D12_GPU_DESCRIPTOR_HANDLE giSrv = m_SsgiBlurSrvGpu[m_SsgiBlurIndex].ptr ? m_SsgiBlurSrvGpu[m_SsgiBlurIndex]
+                                          : (m_SsaoSrvGpu.ptr ? m_SsaoSrvGpu : m_ShadowSrvGpu);
+        if (giSrv.ptr) c.list->SetGraphicsRootDescriptorTable(13, giSrv);
     }
     c.list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     // Slot 1 = this frame's instance buffer (whole thing). recordBatches selects each batch's slice via
@@ -1476,6 +1550,10 @@ void Renderer3D::RecordSkinnedList(int frame, D3D12_CPU_DESCRIPTOR_HANDLE rtv, D
         if (ssaoSrv.ptr) m_SkinnedList[frame]->SetGraphicsRootDescriptorTable(12, ssaoSrv);
         D3D12_GPU_DESCRIPTOR_HANDLE iblSrv = m_IrradianceSrvGpu.ptr ? m_IrradianceSrvGpu : m_CubeSrvGpu;
         if (iblSrv.ptr) m_SkinnedList[frame]->SetGraphicsRootDescriptorTable(13, iblSrv);
+        // The DENOISED target, not the raw gather.
+        D3D12_GPU_DESCRIPTOR_HANDLE giSrv = m_SsgiBlurSrvGpu[m_SsgiBlurIndex].ptr ? m_SsgiBlurSrvGpu[m_SsgiBlurIndex]
+                                          : (m_SsaoSrvGpu.ptr ? m_SsaoSrvGpu : m_ShadowSrvGpu);
+        if (giSrv.ptr) m_SkinnedList[frame]->SetGraphicsRootDescriptorTable(14, giSrv);
     }
     m_SkinnedList[frame]->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     recordSkinnedItems(m_SkinnedList[frame].Get(), 0, m_SkinnedItems.size(), frame);
@@ -2145,7 +2223,8 @@ void Renderer3D::RecordSsaoPass(int frame) {
         m_SsaoDepth.Get(), D3D12_RESOURCE_STATE_DEPTH_WRITE, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
     cmd->ResourceBarrier(1, &depthToRead);
 
-    // ---- pass 2: occlusion ----
+    // ---- pass 2: occlusion (skipped when only SSGI wants the prepass) ----
+    if (m_SsaoEnabled && m_SsaoTarget) {
     SsaoCBData cb{};
     cb.viewProj = m_ViewProj;
     DirectX::XMStoreFloat4x4(&cb.invViewProj,
@@ -2177,6 +2256,104 @@ void Renderer3D::RecordSsaoPass(int frame) {
     CD3DX12_RESOURCE_BARRIER aoToRead = CD3DX12_RESOURCE_BARRIER::Transition(
         m_SsaoTarget.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
     cmd->ResourceBarrier(1, &aoToRead);
+    }
+
+    // ---- pass 3: SSGI gather. Same depth prepass, same kernel shape as the occlusion pass above --
+    // it just reads colour from the history buffer instead of counting hits. Runs here, before the
+    // geometry pass, because Basic3D_PS consumes the result as an indirect-light term. ----
+    if (m_SsgiEnabled && m_SsgiTarget && m_HdrHistory) {
+        SsgiCBData gcb{};
+        gcb.viewProj = m_ViewProj;
+        DirectX::XMStoreFloat4x4(&gcb.invViewProj,
+            DirectX::XMMatrixInverse(nullptr, DirectX::XMLoadFloat4x4(&m_ViewProj)));
+        gcb.eyePos    = m_CamPos;
+        gcb.maxDist   = m_SsgiMaxDist;
+        gcb.intensity = m_SsgiIntensity;
+        gcb.maxLuma   = m_SsgiMaxLuma;
+        gcb.thickness = m_SsgiThickness;
+        gcb.steps     = (float)m_SsgiSteps;
+        gcb.rays      = (float)m_SsgiRays;
+        // Advancing every frame is what stops the sampling noise being a fixed screen-space pattern.
+        // A static pattern reads as a texture printed on the world and the eye locks onto it; one that
+        // changes reads as grain, which is far less objectionable and is what a later temporal filter
+        // would average away.
+        gcb.frame     = (float)(m_SsgiFrame++ & 1023u);
+        memcpy(m_SsgiCBMapped[frame], &gcb, sizeof(gcb));
+
+        CD3DX12_RESOURCE_BARRIER giToRt = CD3DX12_RESOURCE_BARRIER::Transition(
+            m_SsgiTarget.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+            D3D12_RESOURCE_STATE_RENDER_TARGET);
+        cmd->ResourceBarrier(1, &giToRt);
+
+        D3D12_CPU_DESCRIPTOR_HANDLE girtv = m_SsgiRtvHeap->GetCPUDescriptorHandleForHeapStart();
+        cmd->OMSetRenderTargets(1, &girtv, FALSE, nullptr);
+
+        ID3D12DescriptorHeap* gheaps[] = { m_Core->GetRenderer2D()->GetSrvHeap() };
+        cmd->SetDescriptorHeaps(1, gheaps);
+        cmd->SetPipelineState(m_SsgiPso.Get());
+        cmd->SetGraphicsRootSignature(m_SsgiRootSig.Get());
+        cmd->SetGraphicsRootConstantBufferView(0, m_SsgiCB[frame]->GetGPUVirtualAddress());
+        cmd->SetGraphicsRootDescriptorTable(1, m_SsaoDepthSrvGpu);   // this frame's depth
+        cmd->SetGraphicsRootDescriptorTable(2, m_HistSrvGpu);        // LAST frame's colour
+        cmd->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        cmd->IASetVertexBuffers(0, 0, nullptr);
+        cmd->IASetIndexBuffer(nullptr);
+        cmd->DrawInstanced(3, 1, 0, 0);
+
+        CD3DX12_RESOURCE_BARRIER giToRead = CD3DX12_RESOURCE_BARRIER::Transition(
+            m_SsgiTarget.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET,
+            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+        cmd->ResourceBarrier(1, &giToRead);
+
+        // ---- denoise: edge-aware blur of the raw gather into its own target ----
+        // A separate target rather than filtering in place, because a pass cannot sample the surface
+        // it is writing. The geometry pass then reads THIS, which is also why the 25-tap box that
+        // used to live in Basic3D_PS is gone: filtering once per screen pixel beats once per lit
+        // pixel, and having the depth buffer here is what lets it stop at silhouettes.
+        if (m_SsgiBlurTarget[0]) {
+            // Flip FIRST: the index that was "current" last frame becomes the history this frame.
+            m_SsgiBlurIndex ^= 1;
+            const int cur = m_SsgiBlurIndex, hist = cur ^ 1;
+
+            SsgiBlurCBData bcb{};
+            DirectX::XMStoreFloat4x4(&bcb.invViewProj,
+                DirectX::XMMatrixInverse(nullptr, DirectX::XMLoadFloat4x4(&m_ViewProj)));
+            bcb.prevViewProj = m_PrevViewProj;
+            bcb.texelX = 1.0f / (float)m_SsgiWidth;
+            bcb.texelY = 1.0f / (float)m_SsgiHeight;
+            bcb.stride = m_SsgiBlurStride;
+            bcb.depthSigma = m_SsgiBlurSigma;
+            bcb.alpha = m_SsgiAlpha;
+            bcb.historyValid = m_SsgiHistoryValid ? 1.0f : 0.0f;
+            memcpy(m_SsgiBlurCBMapped[frame], &bcb, sizeof(bcb));
+
+            CD3DX12_RESOURCE_BARRIER bToRt = CD3DX12_RESOURCE_BARRIER::Transition(
+                m_SsgiBlurTarget[cur].Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+                D3D12_RESOURCE_STATE_RENDER_TARGET);
+            cmd->ResourceBarrier(1, &bToRt);
+
+            const UINT bs = m_Core->GetDevice()->GetDescriptorHandleIncrementSize(
+                D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+            CD3DX12_CPU_DESCRIPTOR_HANDLE brtv(
+                m_SsgiBlurRtvHeap->GetCPUDescriptorHandleForHeapStart(), cur, bs);
+            cmd->OMSetRenderTargets(1, &brtv, FALSE, nullptr);
+            cmd->SetPipelineState(m_SsgiBlurPso.Get());
+            cmd->SetGraphicsRootSignature(m_SsgiBlurRootSig.Get());
+            cmd->SetGraphicsRootConstantBufferView(0, m_SsgiBlurCB[frame]->GetGPUVirtualAddress());
+            cmd->SetGraphicsRootDescriptorTable(1, m_SsgiSrvGpu);            // raw gather, this frame
+            cmd->SetGraphicsRootDescriptorTable(2, m_SsaoDepthSrvGpu);       // depth, for edge stopping
+            cmd->SetGraphicsRootDescriptorTable(3, m_SsgiBlurSrvGpu[hist]);  // LAST frame's result
+            cmd->DrawInstanced(3, 1, 0, 0);
+
+            CD3DX12_RESOURCE_BARRIER bToRead = CD3DX12_RESOURCE_BARRIER::Transition(
+                m_SsgiBlurTarget[cur].Get(), D3D12_RESOURCE_STATE_RENDER_TARGET,
+                D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+            cmd->ResourceBarrier(1, &bToRead);
+
+            // Only now is there something worth reprojecting into next frame.
+            m_SsgiHistoryValid = true;
+        }
+    }
 
     ThrowIfFailed(cmd->Close());
 }
@@ -2204,16 +2381,18 @@ void Renderer3D::CreateTonemapPipeline() {
     // ---- root signature: b0 = 4 root constants (exposure + operator), t0 = the HDR texture ----
     // Root constants rather than a per-frame CB: two live floats, changed at most once per frame,
     // so a CB resource per frame slot would be pure bookkeeping.
-    CD3DX12_DESCRIPTOR_RANGE rHdr, rBloom;
+    CD3DX12_DESCRIPTOR_RANGE rHdr, rBloom, rGiDbg;
     rHdr.Init  (D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0);   // t0: the FP16 scene
     rBloom.Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 1);   // t1: the finished bloom chain
+    rGiDbg.Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 2);   // t2: SSGI bounce, for the debug view
     // t0 and t1 need SEPARATE ranges rather than one range of 2, because the HDR target and
     // bloom[0] are allocated independently in the shared SRV heap and are not adjacent -- a
     // 2-descriptor range would require them to be.
-    CD3DX12_ROOT_PARAMETER tp[3] = {};
+    CD3DX12_ROOT_PARAMETER tp[4] = {};
     tp[0].InitAsConstants(4, 0, 0, D3D12_SHADER_VISIBILITY_PIXEL);            // b0
     tp[1].InitAsDescriptorTable(1, &rHdr,   D3D12_SHADER_VISIBILITY_PIXEL);   // t0
     tp[2].InitAsDescriptorTable(1, &rBloom, D3D12_SHADER_VISIBILITY_PIXEL);   // t1
+    tp[3].InitAsDescriptorTable(1, &rGiDbg, D3D12_SHADER_VISIBILITY_PIXEL);   // t2
     // POINT: the pass is 1:1 with the back buffer, so there is nothing to interpolate. A linear
     // sampler here would only soften the image for no reason.
     D3D12_STATIC_SAMPLER_DESC ss = {};
@@ -2223,7 +2402,7 @@ void Renderer3D::CreateTonemapPipeline() {
     ss.ShaderRegister   = 0;
     ss.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
     CD3DX12_ROOT_SIGNATURE_DESC sd;
-    sd.Init(3, tp, 1, &ss, D3D12_ROOT_SIGNATURE_FLAG_NONE);   // no input layout: vertex ID only
+    sd.Init(4, tp, 1, &ss, D3D12_ROOT_SIGNATURE_FLAG_NONE);   // no input layout: vertex ID only
     ComPtr<ID3DBlob> blob, err;
     HRESULT hr = D3D12SerializeRootSignature(&sd, D3D_ROOT_SIGNATURE_VERSION_1, &blob, &err);
     if (FAILED(hr)) { if (err) OutputDebugStringA((const char*)err->GetBufferPointer()); ThrowIfFailed(hr); }
@@ -2374,22 +2553,274 @@ void Renderer3D::RecordTonemapPass(int frame, D3D12_CPU_DESCRIPTOR_HANDLE backRt
     // shader branches past it) -- the HDR target itself is the placeholder, and intensity 0 is what
     // switches it off.
     const bool  bloomLive = m_BloomEnabled && m_BloomLevels > 0 && m_BloomTex[0];
+    // SSGI debug is a DISPLAY mode: it shows the bounce target instead of the scene, and deliberately
+    // does NOT alter what the geometry pass wrote. That matters because the HDR target is copied to
+    // the history buffer SSGI reads next frame -- putting the debug image there made the view feed
+    // itself a black scene and extinguish after one frame. The scale is generous because the bounce
+    // is a small fraction of a lit surface and would be near-invisible shown at 1:1.
+    const bool  giDbgLive = m_SsgiEnabled && m_SsgiDebug && m_SsgiTarget;
     const float consts[4] = { m_Exposure, (float)(uint32_t)m_Tonemapper,
-                              bloomLive ? m_BloomIntensity : 0.0f, 0.0f };
+                              bloomLive ? m_BloomIntensity : 0.0f,
+                              giDbgLive ? 6.0f : 0.0f };
     cmd->SetGraphicsRoot32BitConstants(0, 4, consts, 0);
     cmd->SetGraphicsRootDescriptorTable(1, m_HdrSrvGpu);
     cmd->SetGraphicsRootDescriptorTable(2, bloomLive ? m_BloomSrvGpu[0] : m_HdrSrvGpu);
+    // t2 must be populated whether or not the debug view is on -- D3D12 requires every declared
+    // table bound even where the shader branches past it.
+    cmd->SetGraphicsRootDescriptorTable(3, m_SsgiBlurSrvGpu[m_SsgiBlurIndex].ptr ? m_SsgiBlurSrvGpu[m_SsgiBlurIndex] : m_HdrSrvGpu);
     cmd->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     cmd->IASetVertexBuffers(0, 0, nullptr);
     cmd->IASetIndexBuffer(nullptr);
     cmd->DrawInstanced(3, 1, 0, 0);   // the fullscreen triangle SSAO_VS builds from SV_VertexID
 
-    CD3DX12_RESOURCE_BARRIER backToRt = CD3DX12_RESOURCE_BARRIER::Transition(
-        m_HdrTarget.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
-        D3D12_RESOURCE_STATE_RENDER_TARGET);
-    cmd->ResourceBarrier(1, &backToRt);
+    // SNAPSHOT THIS FRAME'S HDR FOR SSGI. Done here, at the end of the tonemap list, because that is
+    // the last point the finished scene exists and the HDR target is already in a readable state --
+    // and because next frame's SSGI gather runs BEFORE any geometry, so it can only ever read a
+    // previous frame. One full-res FP16 copy per frame is the price of a screen-space bounce that
+    // needs lit colour it cannot otherwise have.
+    // The size guard is deliberate belt-and-braces. CopyResource requires EXACTLY matching
+    // dimensions and a mismatch is a debug-layer ERROR that terminates the process, not a no-op --
+    // which is exactly what a resize did before the SSGI targets tracked their own size. The
+    // creation path fixes the cause; this makes the failure mode a skipped frame of GI instead of
+    // a crash if any future path ever gets them out of step again.
+    if (m_SsgiEnabled && m_HdrHistory &&
+        m_SsgiWidth == m_HdrWidth && m_SsgiHeight == m_HdrHeight) {
+        CD3DX12_RESOURCE_BARRIER toCopy[2] = {
+            CD3DX12_RESOURCE_BARRIER::Transition(m_HdrTarget.Get(),
+                D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_SOURCE),
+            CD3DX12_RESOURCE_BARRIER::Transition(m_HdrHistory.Get(),
+                D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST),
+        };
+        cmd->ResourceBarrier(2, toCopy);
+        cmd->CopyResource(m_HdrHistory.Get(), m_HdrTarget.Get());
+        CD3DX12_RESOURCE_BARRIER afterCopy[2] = {
+            CD3DX12_RESOURCE_BARRIER::Transition(m_HdrTarget.Get(),
+                D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET),
+            CD3DX12_RESOURCE_BARRIER::Transition(m_HdrHistory.Get(),
+                D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE),
+        };
+        cmd->ResourceBarrier(2, afterCopy);
+    } else {
+        CD3DX12_RESOURCE_BARRIER backToRt = CD3DX12_RESOURCE_BARRIER::Transition(
+            m_HdrTarget.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+            D3D12_RESOURCE_STATE_RENDER_TARGET);
+        cmd->ResourceBarrier(1, &backToRt);
+    }
 
     ThrowIfFailed(cmd->Close());
+}
+
+
+// ============================ SSGI ============================
+// One bounce of indirect light. Records onto the SSAO list (it needs that pass's camera depth
+// prepass), reading the PREVIOUS frame's HDR colour and writing a gathered-bounce target that
+// Basic3D_PS adds to its ambient term. See SSGI_PS.hlsl for the method and its limits.
+
+void Renderer3D::CreateSsgiPipeline() {
+    auto* device = m_Core->GetDevice();
+
+    // b0 params, t0 depth, t1 history. Two SEPARATE ranges, not one range of 2: the depth SRV comes
+    // from the SSAO allocation and the history from this one, so they are not adjacent in the heap.
+    CD3DX12_DESCRIPTOR_RANGE rDepth, rHist;
+    rDepth.Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0);
+    rHist.Init (D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 1);
+    CD3DX12_ROOT_PARAMETER sp[3] = {};
+    sp[0].InitAsConstantBufferView(0, 0, D3D12_SHADER_VISIBILITY_PIXEL);
+    sp[1].InitAsDescriptorTable(1, &rDepth, D3D12_SHADER_VISIBILITY_PIXEL);
+    sp[2].InitAsDescriptorTable(1, &rHist,  D3D12_SHADER_VISIBILITY_PIXEL);
+
+    D3D12_STATIC_SAMPLER_DESC ss[2] = {};
+    // s0 POINT for depth -- bilinear across a depth discontinuity blends two unrelated surfaces into
+    // a depth that exists nowhere, which is the same reason SSAO uses point.
+    ss[0].Filter = D3D12_FILTER_MIN_MAG_MIP_POINT;
+    ss[0].AddressU = ss[0].AddressV = ss[0].AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+    ss[0].MaxLOD = D3D12_FLOAT32_MAX; ss[0].ShaderRegister = 0;
+    ss[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+    // s1 LINEAR for colour -- here the smoothing is wanted: it is the cheapest denoise available on
+    // a 16-sample gather, and colour has no discontinuity problem the way depth does.
+    ss[1].Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+    ss[1].AddressU = ss[1].AddressV = ss[1].AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+    ss[1].MaxLOD = D3D12_FLOAT32_MAX; ss[1].ShaderRegister = 1;
+    ss[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+
+    CD3DX12_ROOT_SIGNATURE_DESC sd;
+    sd.Init(3, sp, 2, ss, D3D12_ROOT_SIGNATURE_FLAG_NONE);
+    ComPtr<ID3DBlob> blob, err;
+    HRESULT hr = D3D12SerializeRootSignature(&sd, D3D_ROOT_SIGNATURE_VERSION_1, &blob, &err);
+    if (FAILED(hr)) { if (err) OutputDebugStringA((const char*)err->GetBufferPointer()); ThrowIfFailed(hr); }
+    ThrowIfFailed(device->CreateRootSignature(0, blob->GetBufferPointer(), blob->GetBufferSize(),
+                                              IID_PPV_ARGS(&m_SsgiRootSig)));
+
+    auto vs = ReadFile(ExeRelative(L"shaders\\SSAO_VS.cso"));   // shared fullscreen triangle
+    auto ps = ReadFile(ExeRelative(L"shaders\\SSGI_PS.cso"));
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC pso = {};
+    pso.pRootSignature        = m_SsgiRootSig.Get();
+    pso.VS                    = { vs.data(), vs.size() };
+    pso.PS                    = { ps.data(), ps.size() };
+    pso.InputLayout           = { nullptr, 0 };
+    pso.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+    pso.RasterizerState       = CD3DX12_RASTERIZER_DESC(D3D12_DEFAULT);
+    pso.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+    pso.BlendState            = CD3DX12_BLEND_DESC(D3D12_DEFAULT);
+    pso.DepthStencilState     = CD3DX12_DEPTH_STENCIL_DESC(D3D12_DEFAULT);
+    pso.DepthStencilState.DepthEnable = FALSE;
+    pso.SampleMask            = UINT_MAX;
+    pso.NumRenderTargets      = 1;
+    pso.RTVFormats[0]         = DXGI_FORMAT_R11G11B10_FLOAT;
+    pso.DSVFormat             = DXGI_FORMAT_UNKNOWN;
+    pso.SampleDesc.Count      = 1;
+    ThrowIfFailed(device->CreateGraphicsPipelineState(&pso, IID_PPV_ARGS(&m_SsgiPso)));
+    m_SsgiPso->SetName(L"SSGI PSO");
+
+    // ---- denoise pipeline: b0 params, t0 raw gather, t1 depth ----
+    {
+        CD3DX12_DESCRIPTOR_RANGE rSrc, rDep, rHist;
+        rSrc.Init (D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0);
+        rDep.Init (D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 1);
+        rHist.Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 2);
+        CD3DX12_ROOT_PARAMETER bp[4] = {};
+        // A CBV, not root constants: two 4x4 matrices alone are 32 DWORDs of the 64-DWORD budget.
+        bp[0].InitAsConstantBufferView(0, 0, D3D12_SHADER_VISIBILITY_PIXEL);
+        bp[1].InitAsDescriptorTable(1, &rSrc,  D3D12_SHADER_VISIBILITY_PIXEL);
+        bp[2].InitAsDescriptorTable(1, &rDep,  D3D12_SHADER_VISIBILITY_PIXEL);
+        bp[3].InitAsDescriptorTable(1, &rHist, D3D12_SHADER_VISIBILITY_PIXEL);
+        D3D12_STATIC_SAMPLER_DESC bs[2] = {};
+        bs[0].Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;   // s0: colour, smoothing is wanted
+        bs[0].AddressU = bs[0].AddressV = bs[0].AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+        bs[0].MaxLOD = D3D12_FLOAT32_MAX; bs[0].ShaderRegister = 0;
+        bs[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+        bs[1] = bs[0];
+        bs[1].Filter = D3D12_FILTER_MIN_MAG_MIP_POINT;    // s1: depth, never interpolate across an edge
+        bs[1].ShaderRegister = 1;
+        CD3DX12_ROOT_SIGNATURE_DESC bd;
+        bd.Init(4, bp, 2, bs, D3D12_ROOT_SIGNATURE_FLAG_NONE);
+        ComPtr<ID3DBlob> bblob, berr;
+        HRESULT bhr = D3D12SerializeRootSignature(&bd, D3D_ROOT_SIGNATURE_VERSION_1, &bblob, &berr);
+        if (FAILED(bhr)) { if (berr) OutputDebugStringA((const char*)berr->GetBufferPointer()); ThrowIfFailed(bhr); }
+        ThrowIfFailed(device->CreateRootSignature(0, bblob->GetBufferPointer(), bblob->GetBufferSize(),
+                                                  IID_PPV_ARGS(&m_SsgiBlurRootSig)));
+        auto bps = ReadFile(ExeRelative(L"shaders\\SSGIBlur_PS.cso"));
+        D3D12_GRAPHICS_PIPELINE_STATE_DESC bpso = pso;   // same fullscreen-triangle setup as the gather
+        bpso.pRootSignature = m_SsgiBlurRootSig.Get();
+        bpso.PS = { bps.data(), bps.size() };
+        ThrowIfFailed(device->CreateGraphicsPipelineState(&bpso, IID_PPV_ARGS(&m_SsgiBlurPso)));
+        m_SsgiBlurPso->SetName(L"SSGI denoise PSO");
+    }
+
+    const UINT cbSize = (UINT)((sizeof(SsgiCBData) + 255) & ~255u);
+    CD3DX12_HEAP_PROPERTIES uploadHeap(D3D12_HEAP_TYPE_UPLOAD);
+    for (int i = 0; i < RendererCore::NumFrames; ++i) {
+        CD3DX12_RESOURCE_DESC b = CD3DX12_RESOURCE_DESC::Buffer(cbSize);
+        ThrowIfFailed(device->CreateCommittedResource(&uploadHeap, D3D12_HEAP_FLAG_NONE, &b,
+            D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&m_SsgiCB[i])));
+        ThrowIfFailed(m_SsgiCB[i]->Map(0, nullptr, &m_SsgiCBMapped[i]));
+    }
+}
+
+bool Renderer3D::CreateSsgiTargets(UINT width, UINT height) {
+    auto* device = m_Core->GetDevice();
+    if (!device || width == 0 || height == 0) return false;
+    auto* rm = m_Core->GetRenderer2D()->GetResourceManager();
+    CD3DX12_HEAP_PROPERTIES defaultHeap(D3D12_HEAP_TYPE_DEFAULT);
+
+    D3D12_RESOURCE_DESC td = {};
+    td.Dimension        = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    td.Width            = width;
+    td.Height           = height;
+    td.DepthOrArraySize = 1;
+    td.MipLevels        = 1;
+    td.SampleDesc.Count = 1;
+
+    // ---- gathered-bounce target ----
+    td.Format = DXGI_FORMAT_R11G11B10_FLOAT;
+    td.Flags  = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+    D3D12_CLEAR_VALUE clear = {};
+    clear.Format = DXGI_FORMAT_R11G11B10_FLOAT;   // black = no bounce, the safe default
+    m_SsgiTarget.Reset();
+    ThrowIfFailed(device->CreateCommittedResource(&defaultHeap, D3D12_HEAP_FLAG_NONE, &td,
+        D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, &clear, IID_PPV_ARGS(&m_SsgiTarget)));
+    m_SsgiTarget->SetName(L"SSGI bounce");
+
+    if (!m_SsgiRtvHeap) {
+        D3D12_DESCRIPTOR_HEAP_DESC rh = {};
+        rh.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV; rh.NumDescriptors = 1;
+        ThrowIfFailed(device->CreateDescriptorHeap(&rh, IID_PPV_ARGS(&m_SsgiRtvHeap)));
+    }
+    device->CreateRenderTargetView(m_SsgiTarget.Get(), nullptr,
+                                   m_SsgiRtvHeap->GetCPUDescriptorHandleForHeapStart());
+
+    // ---- history: a copy of last frame's HDR. COPY_DEST-capable, no RTV needed. ----
+    td.Format = RendererCore::HdrFormat;
+    td.Flags  = D3D12_RESOURCE_FLAG_NONE;
+    m_HdrHistory.Reset();
+    ThrowIfFailed(device->CreateCommittedResource(&defaultHeap, D3D12_HEAP_FLAG_NONE, &td,
+        D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, nullptr, IID_PPV_ARGS(&m_HdrHistory)));
+    m_HdrHistory->SetName(L"HDR history (SSGI gather source)");
+
+    // SRV slots REUSED across resizes -- AllocateSrvSlot has no free list.
+    D3D12_SHADER_RESOURCE_VIEW_DESC srv = {};
+    srv.ViewDimension           = D3D12_SRV_DIMENSION_TEXTURE2D;
+    srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    srv.Texture2D.MipLevels     = 1;
+
+    if (!m_SsgiSrvGpu.ptr && !rm->AllocateSrvSlot(m_SsgiSrvCpu, m_SsgiSrvGpu)) {
+        OutputDebugStringA("[Renderer3D] SRV heap full -- SSGI disabled.\n");
+        m_SsgiTarget.Reset(); m_HdrHistory.Reset(); return false;
+    }
+    srv.Format = DXGI_FORMAT_R11G11B10_FLOAT;
+    device->CreateShaderResourceView(m_SsgiTarget.Get(), &srv, m_SsgiSrvCpu);
+
+    if (!m_HistSrvGpu.ptr && !rm->AllocateSrvSlot(m_HistSrvCpu, m_HistSrvGpu)) {
+        OutputDebugStringA("[Renderer3D] SRV heap full -- SSGI disabled.\n");
+        m_SsgiTarget.Reset(); m_HdrHistory.Reset(); return false;
+    }
+    srv.Format = RendererCore::HdrFormat;
+    device->CreateShaderResourceView(m_HdrHistory.Get(), &srv, m_HistSrvCpu);
+    // ---- denoise targets: a PAIR, ping-ponged so one holds history while the other is written ----
+    td.Format = DXGI_FORMAT_R11G11B10_FLOAT;
+    td.Flags  = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+    if (!m_SsgiBlurRtvHeap) {
+        D3D12_DESCRIPTOR_HEAP_DESC brh = {};
+        brh.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV; brh.NumDescriptors = 2;
+        ThrowIfFailed(device->CreateDescriptorHeap(&brh, IID_PPV_ARGS(&m_SsgiBlurRtvHeap)));
+    }
+    const UINT brtvStride = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+    srv.Format = DXGI_FORMAT_R11G11B10_FLOAT;
+    for (int i = 0; i < 2; ++i) {
+        m_SsgiBlurTarget[i].Reset();
+        ThrowIfFailed(device->CreateCommittedResource(&defaultHeap, D3D12_HEAP_FLAG_NONE, &td,
+            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, &clear, IID_PPV_ARGS(&m_SsgiBlurTarget[i])));
+        m_SsgiBlurTarget[i]->SetName(L"SSGI denoised (ping-pong)");
+        CD3DX12_CPU_DESCRIPTOR_HANDLE brtv(m_SsgiBlurRtvHeap->GetCPUDescriptorHandleForHeapStart(),
+                                           i, brtvStride);
+        device->CreateRenderTargetView(m_SsgiBlurTarget[i].Get(), nullptr, brtv);
+
+        if (!m_SsgiBlurSrvGpu[i].ptr &&
+            !rm->AllocateSrvSlot(m_SsgiBlurSrvCpu[i], m_SsgiBlurSrvGpu[i])) {
+            OutputDebugStringA("[Renderer3D] SRV heap full -- SSGI disabled.\n");
+            m_SsgiTarget.Reset(); m_HdrHistory.Reset();
+            m_SsgiBlurTarget[0].Reset(); m_SsgiBlurTarget[1].Reset();
+            return false;
+        }
+        device->CreateShaderResourceView(m_SsgiBlurTarget[i].Get(), &srv, m_SsgiBlurSrvCpu[i]);
+    }
+    // Both targets hold garbage at a new size, so the first frame after this must not blend against
+    // them -- reprojecting into a history that describes a different resolution is pure smear.
+    m_SsgiHistoryValid = false;
+
+    if (!m_SsgiBlurCB[0]) {
+        const UINT cbSize = (UINT)((sizeof(SsgiBlurCBData) + 255) & ~255u);
+        CD3DX12_HEAP_PROPERTIES uploadHeap(D3D12_HEAP_TYPE_UPLOAD);
+        for (int i = 0; i < RendererCore::NumFrames; ++i) {
+            CD3DX12_RESOURCE_DESC b = CD3DX12_RESOURCE_DESC::Buffer(cbSize);
+            ThrowIfFailed(device->CreateCommittedResource(&uploadHeap, D3D12_HEAP_FLAG_NONE, &b,
+                D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&m_SsgiBlurCB[i])));
+            ThrowIfFailed(m_SsgiBlurCB[i]->Map(0, nullptr, &m_SsgiBlurCBMapped[i]));
+        }
+    }
+
+    m_SsgiWidth = width; m_SsgiHeight = height;
+    return true;
 }
 
 

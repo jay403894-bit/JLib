@@ -137,6 +137,32 @@
     </Link>
   </ItemDefinitionGroup>
 
+  <!-- ============================ COMPILED SHADERS ============================
+       Copy JLib's .cso next to the consuming exe, every build.
+
+       WHY THIS EXISTS. The renderer loads shaders as "shaders\<name>.cso" RELATIVE TO THE EXE (see
+       ExeRelative in Helpers.h), but FxCompile writes them into JLib's own build folder. Nothing
+       bridged that gap, so every consumer needed a hand copy after any shader change - and the
+       failure mode is silent: a missing .cso does not error, it makes a feature quietly fall back.
+       A stale shaders folder cost a full debugging session (rounded rectangles drawing square
+       corners because RoundRectPS.cso was absent), and three separate apps were found stale or
+       never populated at all.
+
+       An ItemGroup INSIDE the target, not outside: items at project scope are evaluated before the
+       build runs, so a glob would be empty on a clean tree and silently copy nothing. Evaluating it
+       here means it sees whatever the build just produced.
+
+       SkipUnchangedFiles gives incrementality without Inputs/Outputs bookkeeping - unchanged shaders
+       cost a timestamp comparison. -->
+  <Target Name="JLibCopyShaders" AfterTargets="Build" Condition="Exists('$(JLibBinDir)')">
+    <ItemGroup>
+      <JLibShaderCso Include="$(JLibBinDir)*.cso" />
+    </ItemGroup>
+    <Copy SourceFiles="@(JLibShaderCso)"
+          DestinationFolder="$(OutDir)shaders"
+          SkipUnchangedFiles="true" />
+  </Target>
+
   <!-- Fail with a sentence that says what to do, rather than 40 unresolved externals. -->
   <Target Name="JLibCheckBuilt" BeforeTargets="Link" Condition="!Exists('$(JLibBinDir)Scheduler.lib')">
     <Error Text="JLib has not been built for this configuration. Expected '$(JLibBinDir)Scheduler.lib'. Open $(JLibDir)JLib.slnx and build $(JLibConfig)|$(Platform) first. (Your configuration '$(Configuration)' maps to JLib's '$(JLibConfig)'; override with the JLibConfig property if that is wrong.)" />
