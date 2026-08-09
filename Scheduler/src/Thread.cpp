@@ -10,6 +10,33 @@
 using namespace JLib;
 thread_local Thread* Thread::instance = nullptr;
 
+#if !JLIB_PLATFORM_WINDOWS
+#include <sched.h>
+#include <pthread.h>
+
+// Bind another thread to a CPU set.
+//
+// glibc's pthread_setaffinity_np did not reach bionic until API 36, and Termux/NDK builds target
+// far lower than that, so on Android this goes through the syscall wrapper directly. That takes a
+// TID rather than a pthread_t -- and the caller here is the PARENT thread, which cannot pass 0
+// ("me") because that would pin itself instead of the worker. pthread_gettid_np is the bionic
+// extension that closes the gap; it has been there since API 21.
+//
+// Failure is deliberately swallowed on both paths, matching the Windows behaviour: a container or
+// cgroup may legitimately forbid the CPU, and an unpinned worker is a performance question, not a
+// correctness one. On Android that is not an edge case -- the platform's cgroups own thread
+// placement, so these calls routinely fail (or succeed and are then overridden) for an
+// unprivileged app. Treat Android placement as UNENFORCEABLE and never quote a number from it.
+static inline void BindThreadToSet(pthread_t handle, const cpu_set_t& set)
+{
+#if defined(__BIONIC__)
+	(void)sched_setaffinity(pthread_gettid_np(handle), sizeof(cpu_set_t), &set);
+#else
+	(void)pthread_setaffinity_np(handle, sizeof(cpu_set_t), &set);
+#endif
+}
+#endif
+
 Thread::Thread(TaskScheduler& scheduler) : scheduler(&scheduler) {
 	std::memset(&schedulerCtx, 0, sizeof(Context));
 }
@@ -99,10 +126,7 @@ void Thread::StartWorker(size_t cpu_affinity)
 		cpu_set_t set;
 		CPU_ZERO(&set);
 		CPU_SET((int)cpu_affinity, &set);
-		// Failure is deliberately ignored, matching the Windows path: a container or cgroup can
-		// legitimately forbid the CPU, and an unpinned worker is a performance question rather
-		// than a correctness one. The scheduler stays correct either way.
-		(void)pthread_setaffinity_np(nativeHandle, sizeof(cpu_set_t), &set);
+		BindThreadToSet(nativeHandle, set);
 		break;
 	}
 	case TaskScheduler::AffinityPolicy::Ideal: {
@@ -114,7 +138,7 @@ void Thread::StartWorker(size_t cpu_affinity)
 			CPU_ZERO(&set);
 			for (int c = 0; c < 64; ++c)
 				if (llc & (uint64_t(1) << c)) CPU_SET(c, &set);
-			(void)pthread_setaffinity_np(nativeHandle, sizeof(cpu_set_t), &set);
+			BindThreadToSet(nativeHandle, set);
 		}
 		break;
 	}

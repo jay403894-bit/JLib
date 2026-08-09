@@ -17,7 +17,9 @@
 #include <string>
 #include <unordered_map>
 #include <thread>
-#include <immintrin.h>
+// <immintrin.h> was here and is x86-only. Removed rather than guarded, for the same reason
+// LockFreeList.h lost its <intrin.h>: nothing in this header uses an intrinsic. The spin hint the
+// .cpp needs is platform::CpuRelax() in platform.h, which is arch-correct by construction.
 #include <queue>
 #include "GlobalFiberPool.h"
 #include "DirectEvent.h"
