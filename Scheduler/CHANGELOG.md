@@ -3,7 +3,66 @@
 Correctness fixes are marked **[CRITICAL]** with a note on what breaks without them —
 downstream users (forks/ports) should treat those as must-pull.
 
-## 2026-08-09
+## 1.0.0 — 2026-08-09
+
+First tagged release. The version number is a statement about API stability, not about the code
+suddenly becoming ready: the scheduler has been running a real engine for months. What changed is
+that it now builds and passes its suite on four verified platforms with CI enforcing that on every
+push, which is the point at which promising not to break the API costs something and therefore
+means something. Breaking changes from here need a 2.0.
+
+Everything below this heading shipped in 1.0.0.
+
+**BREAKING (the last break before the promise): `fastJob` is now `noFiber`.** Same meaning, same
+polarity, same `true` default — only the name changed. `CreateTask`'s parameter rename is invisible
+to callers (C++ has no named arguments), so this only affects code touching `Task::noFiber`
+directly, which realistically means nobody. Renamed now because it was the last free moment: the
+old name advertised a benefit while the flag's real content is a *constraint* — a task with no
+fiber underneath cannot suspend, and getting that wrong fail-fasts with no message. `noFiber` names
+something checkable and puts the constraint at the call site.
+
+**`ParallelForFJ` is not experimental** and the header no longer says it is. `ParallelFor`
+dispatches to it automatically past ~2 tasks per worker; below that the flat path is ~14% faster,
+above it flat is ~8x slower at ~15k tasks. The doc comment had been contradicting the code beside it.
+
+**Named events: the contract is now written down.** `GetEvent`/`WaitOnEvent` keep one entry per
+distinct name and never evict — correct and cheap for a bounded, static set of rendezvous points,
+which is what they are for. Minting a name per operation (`"fence_" + counter`) instead grows the
+map without bound and eventually convoys on `registryMtx` during a rehash, which presents in a
+debugger as a deadlock after about an hour of uptime. `WaitOnEventDirectArmed` is the API for
+per-operation waits: pooled, no name, no map, no global lock. No eviction policy is needed here
+because the unbounded case has its own API — that was always the design, it just was not documented.
+A debug/development build now warns once at 4096 named events, naming the last key inserted.
+
+**The supported API is `TaskScheduler.h`, `Task.h` and `TaskDAG.h`.** Every header is installed
+because the supported ones need them to compile, but the rest are implementation detail and are not
+covered by the version promise. Stated explicitly so that fixing internals later is not a breaking
+change by accident.
+
+### macOS / Apple Silicon support
+Builds and runs on macOS arm64, verified in CI on `macos-14` (AppleClang). The AAPCS64 context
+switch is unchanged — the calling convention belongs to the instruction set, not the kernel, so
+Apple arm64 uses the same `src/posix/aarch64/ContextSwitch.S` as Linux; only the Mach-O directives
+behind `#if defined(__APPLE__)` differ, and those now genuinely take effect (see the `.s`→`.S` note
+below). The ABI harness passes at `-O0` and `-O2` on both ARM64 platforms.
+
+New `src/darwin/` OS layer, selected by CMake alongside `src/win32/` and `src/posix/`, while the
+ABI layer under `src/posix/<arch>/` is shared by every POSIX target. `Topology.cpp` there reads
+`sysctl` rather than sysfs. `Thread.cpp`'s affinity helper now takes a plain 64-bit mask instead of
+a `cpu_set_t`, which keeps the policy switch free of a type macOS does not have.
+
+**Placement is a documented no-op on macOS.** There is no thread-affinity API on Apple arm64 —
+`THREAD_AFFINITY_POLICY` still links but has done nothing since Apple Silicon; the kernel owns
+placement and takes intent through QoS classes. Topology reports SMT honestly (Apple Silicon has
+none) but leaves the P/E class table empty: macOS publishes per-performance-level CPU *counts*, not
+a logical-CPU-index → level mapping, and a class table built on a guessed ordering could not be
+acted on even if it were right.
+
+### The benchmark no longer requires C++20
+`std::atomic<double>::fetch_add` (C++20, P0020R6) is absent from AppleClang's libc++, and it was the
+harness's only C++20 dependency. Replaced with a compare-exchange loop — which is what `fetch_add`
+lowers to anyway on hardware with no native atomic FP add — so the bench is C++17 like the library.
+Verified equivalent: the crossover sweep's sink prints the same value on x86-64 and AArch64.
 
 ### AArch64 support — the scheduler now builds and runs on ARM64
 Full benchmark suite passes on Android/Termux (clang, AArch64), including recursive fork-join —
@@ -35,6 +94,12 @@ Also in this release: `include/platform.h` gained an architecture axis alongside
 `_mm_pause()` calls; the stray `<immintrin.h>` in `TaskScheduler.h` is gone; and on bionic, worker
 affinity goes through `sched_setaffinity(pthread_gettid_np(...))`, since `pthread_setaffinity_np`
 did not reach Android until API 36 and the binding is applied by the parent thread.
+
+**CI now builds and runs the suite on every push** across Windows x64 (MSVC), Linux x86-64 (GCC)
+and Linux AArch64 (GCC), plus the standalone AAPCS64 ABI harness at `-O0` and `-O2`. The ARM64
+results therefore hold across two toolchains and two libcs — GCC/glibc in CI and Clang/bionic on
+Android — which is what makes the ABI claim more than one machine's anecdote. Raspberry Pi needs
+nothing extra: it is the same Debian-family aarch64/glibc configuration as the CI runner.
 
 **No AArch64 performance numbers are published, deliberately.** Android cgroups own thread
 placement, so affinity requests from an unprivileged app are routinely ignored, and thermal

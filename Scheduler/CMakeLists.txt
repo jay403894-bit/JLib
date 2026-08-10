@@ -64,14 +64,30 @@ endif()
 # thread layer) and an ARCH (which decides the context switch). Android is accepted alongside Linux
 # because bionic differs from glibc only in details the POSIX layer already handles -- Termux's
 # CMake reports one or the other depending on version, and both are the same target here.
-if(NOT WIN32 AND NOT CMAKE_SYSTEM_NAME MATCHES "^(Linux|Android)$")
+if(NOT WIN32 AND NOT CMAKE_SYSTEM_NAME MATCHES "^(Linux|Android|Darwin)$")
     message(FATAL_ERROR
-        "JLib::Scheduler supports Windows, Linux and Android. The context switch is hand-written "
-        "assembly per ABI, so a new platform needs a new ContextSwitch, not a compiler flag.")
+        "JLib::Scheduler supports Windows, Linux, Android and macOS. The context switch is "
+        "hand-written assembly per ABI, so a new platform needs a new ContextSwitch, not a "
+        "compiler flag.")
 endif()
 
 # Normalise the many spellings a toolchain may use for the same instruction set.
 if(WIN32)
+    # Windows is x64-only, and this refuses ARM64 rather than quietly handing the x64 MASM file to
+    # an ARM64 build (which fails deep inside ml64 with nothing pointing at the real cause).
+    #
+    # Windows-on-ARM is NOT "the Linux AAPCS64 switch with a different #ifdef". It needs a THIRD
+    # hand-written switch, because (1) MSVC's ARM64 assembler is armasm64, whose syntax is unrelated
+    # to the GAS syntax src/posix/aarch64/ContextSwitch.S is written in, and (2) a Windows fiber
+    # switch must update the TEB's StackBase/StackLimit -- the fixup the x64 MASM does and the
+    # Linux/macOS AAPCS64 switch deliberately omits because it has no equivalent. x18 is also
+    # reserved as the TEB pointer there (the current switch happens not to touch it).
+    if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(ARM64|arm64|aarch64)$" OR CMAKE_GENERATOR_PLATFORM MATCHES "^(ARM64|arm64)$")
+        message(FATAL_ERROR
+            "Windows on ARM64 is not supported: the context switch is MASM for x64 only. It needs a "
+            "third ContextSwitch (armasm64 syntax, plus the TEB stack-bounds fixup), not a compiler "
+            "flag. Linux and macOS on AArch64 ARE supported -- see src/posix/aarch64/.")
+    endif()
     set(JLIBSCHED_ARCH "x86_64")   # the MASM switch is x64-only; the MSVC guard above is the gate
 elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|amd64|AMD64)$")
     set(JLIBSCHED_ARCH "x86_64")
@@ -112,8 +128,21 @@ if(WIN32)
     file(GLOB JLIBSCHED_PLAT CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/src/win32/*.cpp")
     set(JLIBSCHED_ASM "${CMAKE_CURRENT_SOURCE_DIR}/src/win32/ContextSwitch.asm")
 else()
+    # OS layer: src/posix/ (Linux, Android) or src/darwin/ (macOS). They diverge wholesale --
+    # sysfs text versus sysctl, and macOS has no thread-affinity API at all -- so they are separate
+    # directories, not #ifdefs.
+    #
+    # The ARCH layer under src/posix/<arch>/ is shared by BOTH, because the ABI is a property of the
+    # instruction set and not of the kernel: Apple arm64 is AAPCS64, the same switch Linux/AArch64
+    # uses, and ContextSwitch.S carries the handful of Mach-O directive differences behind
+    # #if defined(__APPLE__). (That guard only works because the file is .S -- see below.)
+    if(APPLE)
+        set(JLIBSCHED_OSDIR "darwin")
+    else()
+        set(JLIBSCHED_OSDIR "posix")
+    endif()
     file(GLOB JLIBSCHED_PLAT CONFIGURE_DEPENDS
-        "${CMAKE_CURRENT_SOURCE_DIR}/src/posix/*.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/${JLIBSCHED_OSDIR}/*.cpp"
         "${CMAKE_CURRENT_SOURCE_DIR}/src/posix/${JLIBSCHED_ARCH}/*.cpp")
     # .S, not .s: the capital is what runs the file through the C preprocessor. The AArch64 switch
     # selects its Apple directives with #if defined(__APPLE__), and with a lowercase .s the
@@ -122,7 +151,11 @@ else()
     set(JLIBSCHED_ASM "${CMAKE_CURRENT_SOURCE_DIR}/src/posix/${JLIBSCHED_ARCH}/ContextSwitch.S")
 endif()
 
-message(STATUS "JLib::Scheduler: ${CMAKE_SYSTEM_NAME} / ${JLIBSCHED_ARCH}")
+if(WIN32)
+    message(STATUS "JLib::Scheduler: ${CMAKE_SYSTEM_NAME} / ${JLIBSCHED_ARCH} (os layer: win32)")
+else()
+    message(STATUS "JLib::Scheduler: ${CMAKE_SYSTEM_NAME} / ${JLIBSCHED_ARCH} (os layer: ${JLIBSCHED_OSDIR})")
+endif()
 
 add_library(Scheduler STATIC ${JLIBSCHED_SRC} ${JLIBSCHED_PLAT} ${JLIBSCHED_ASM})
 add_library(JLib::Scheduler ALIAS Scheduler)
@@ -144,12 +177,14 @@ else()
 endif()
 
 # ---- bench -----------------------------------------------------------------------------------
-# C++20 even though the library is C++17: the crossover sweep accumulates into a
-# std::atomic<double>, and atomic<floating-point>::fetch_add is C++20. That is a property of the
-# harness, not of the library's compatibility claim.
+# C++17, same as the library. This used to be C++20 solely because the crossover sweep accumulated
+# into a std::atomic<double> via fetch_add, which is C++20 (P0020R6). AppleClang's libc++ does not
+# ship that overload, so the macOS port replaced it with a compare-exchange loop -- which is what
+# fetch_add lowers to anyway -- and the whole C++20 requirement went with it. There is now no
+# caveat to attach to the project's C++17 claim.
 add_executable(SchedulerBench "${CMAKE_CURRENT_SOURCE_DIR}/bench/bench.cpp")
 target_link_libraries(SchedulerBench PRIVATE Scheduler)
-target_compile_features(SchedulerBench PRIVATE cxx_std_20)
+target_compile_features(SchedulerBench PRIVATE cxx_std_17)
 
 # ---- install (standalone only) ---------------------------------------------------------------
 # Inside the umbrella, JLib's own top-level file owns the export set and installs Scheduler as part
@@ -169,7 +204,10 @@ if(JLIBSCHED_STANDALONE)
 
     write_basic_package_version_file(
         "${CMAKE_CURRENT_BINARY_DIR}/JLibSchedulerConfigVersion.cmake"
-        VERSION 0.1.0 COMPATIBILITY SameMajorVersion)
+        # SameMajorVersion: a consumer writing find_package(JLibScheduler 1.0) accepts any 1.x,
+        # which is the semver promise this version number is making -- no breaking API change
+        # without a 2.0.
+        VERSION 1.0.0 COMPATIBILITY SameMajorVersion)
     file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/JLibSchedulerConfig.cmake.in"
 "@PACKAGE_INIT@\ninclude(CMakeFindDependencyMacro)\nif(NOT WIN32)\n  find_dependency(Threads)\nendif()\ninclude(\"\${CMAKE_CURRENT_LIST_DIR}/JLibSchedulerTargets.cmake\")\ncheck_required_components(JLibScheduler)\n")
     configure_package_config_file(
