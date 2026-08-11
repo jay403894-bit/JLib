@@ -78,6 +78,8 @@ int main() {
 }
 ```
 
+## Things to know
+
 Three things to know while writing against it. A task that will call `WaitFor` must be created with
 `noFiber = false` — `noFiber` defaults to true, and a task with no fiber under it cannot suspend, so
 it fail-fasts with no message. Tasks live in 256-byte slab slots, so a lambda capturing more than
