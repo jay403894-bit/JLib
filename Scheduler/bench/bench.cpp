@@ -180,11 +180,24 @@ static double BodyCost(int i) {
     return x;
 }
 
+// How far above 1.00x a cell has to be before it counts as a win.
+//
+// Not 1.00x. Run-to-run noise on a quiet machine reaches ~1.09x even for a body doing a microsecond
+// of total work, and the old rule -- first cell above 1.00x -- happily reported that as the
+// crossover. An M1 Air run produced "trivial: wins from N=1000 (serial work there: 1.0 us)", which
+// is nonsense: parallel does not beat serial on one microsecond of work, the row was just
+// 1.00/1.00/1.09/1.07/1.06 and the first sample over the line got picked.
+//
+// A real crossover also STAYS won as N grows, so a lone spike is required to be confirmed by the
+// next size up. Between the margin and the persistence check, the reported number means something.
+static constexpr double kWinMargin = 1.15;
+
 template <int kFlops>
 static void SweepOne(JLib::TaskScheduler& sched, const char* label, const std::vector<int>& sizes) {
     printf("  %-10s |", label);
-    int crossover = -1;
-    double crossoverSerialUs = 0.0;
+    std::vector<double> speedups, serialUs;
+    speedups.reserve(sizes.size());
+    serialUs.reserve(sizes.size());
 
     for (int n : sizes) {
         constexpr int kRuns = 7;
@@ -222,8 +235,21 @@ static void SweepOne(JLib::TaskScheduler& sched, const char* label, const std::v
         }
 
         const double speedup = bestSerial / std::max(bestPar, 1e-9);
-        if (crossover < 0 && speedup > 1.0) { crossover = n; crossoverSerialUs = bestSerial * 1000.0; }
+        speedups.push_back(speedup);
+        serialUs.push_back(bestSerial * 1000.0);
         printf(" %5.2fx", speedup);
+    }
+
+    // First size that clears the margin AND is confirmed by the next size up (the last column has
+    // nothing after it, so it stands alone).
+    int    crossover = -1;
+    double crossoverSerialUs = 0.0;
+    for (size_t i = 0; i < speedups.size(); ++i) {
+        if (speedups[i] < kWinMargin) continue;
+        if (i + 1 < speedups.size() && speedups[i + 1] < kWinMargin) continue;   // lone spike, not a crossover
+        crossover = sizes[i];
+        crossoverSerialUs = serialUs[i];
+        break;
     }
 
     // The number that actually generalizes: how much SERIAL WORK (in microseconds) the loop has to
@@ -231,7 +257,7 @@ static void SweepOne(JLib::TaskScheduler& sched, const char* label, const std::v
     // it is the threshold the scheduler should be using instead of an element count.
     if (crossover > 0) printf("   | wins from N=%-7d (serial work there: %7.1f us)\n",
                               crossover, crossoverSerialUs);
-    else               printf("   | serial wins throughout\n");
+    else               printf("   | never clears %.2fx\n", kWinMargin);
 }
 
 static void BenchParallelForCrossover(JLib::TaskScheduler& sched) {
@@ -240,6 +266,8 @@ static void BenchParallelForCrossover(JLib::TaskScheduler& sched) {
     const std::vector<int> sizes = { 256, 512, 1000, 2000, 4000, 10000, 40000, 200000 };
 
     printf("\nParallelFor crossover sweep (speedup = serial/parallel; >1.00 means parallel wins)\n");
+    printf("  a crossover is only reported at >=%.2fx confirmed by the next size -- below that is noise\n",
+           kWinMargin);
     printf("  gate: probe a prefix, extrapolate, parallelize when est. work >= 75us (was: N > 10000)\n");
     printf("  %-10s |", "body");
     for (int n : sizes) printf(" %5d", n);
