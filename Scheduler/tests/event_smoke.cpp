@@ -22,14 +22,30 @@
 #include <atomic>
 #include <thread>
 #include <chrono>
+#include <cstdlib>   // atoi
+#include <string>    // std::to_string
 
 static std::atomic<int> g_resumed{ 0 };
 static std::atomic<int> g_entered{ 0 };
 
-int main() {
+// usage: event_smoke [rounds] [waiters] [poolSize]
+//
+// Sizeable because ThreadSanitizer needs a much smaller run than a plain one: it slows execution
+// 5-15x, and the default configuration (31 workers, main hammering SignalAll in a spin loop) turns
+// into hours on a 2-4 core CI runner. Small numbers lose nothing under TSAN -- it reasons about the
+// happens-before graph and reports a race on FIRST observation, so repetitions buy nothing there.
+// They do buy something on real hardware, where a race only shows up if the interleaving actually
+// occurs, which is why the default stays large.
+int main(int argc, char** argv) {
+    const int  kRoundsArg  = (argc > 1) ? atoi(argv[1]) : 200;
+    const int  kWaitersArg = (argc > 2) ? atoi(argv[2]) : 24;
+    const size_t poolSize  = (argc > 3) ? (size_t)atoi(argv[3]) : 0;   // 0 = auto (hw-1)
+
     JLib::TaskScheduler::SetAffinityPolicy(JLib::TaskScheduler::AffinityPolicy::None);
-    JLib::TaskScheduler::Init();
+    JLib::TaskScheduler::Init(poolSize);
     JLib::TaskScheduler& sched = JLib::TaskScheduler::Instance();
+    printf("config              : %d rounds x %d waiters, pool=%s\n",
+        kRoundsArg, kWaitersArg, poolSize ? std::to_string(poolSize).c_str() : "auto");
 
     bool ok = true;
 
@@ -39,10 +55,8 @@ int main() {
     printf("empty signal        : ok\n");
 
     // ---- the real test: N waiters per round, many rounds ----
-    constexpr int kRounds  = 200;
-    constexpr int kWaiters = 24;
 
-    for (int round = 0; round < kRounds; ++round) {
+    for (int round = 0; round < kRoundsArg; ++round) {
         char name[32];
         snprintf(name, sizeof(name), "round_%d", round % 8);   // bounded name set, as documented
         auto& ev = sched.GetEvent(name);
@@ -51,8 +65,8 @@ int main() {
         const int before = g_resumed.load(std::memory_order_relaxed);
 
         JLib::WaitGroup wg;
-        wg.n.fetch_add(kWaiters, std::memory_order_relaxed);
-        for (int i = 0; i < kWaiters; ++i) {
+        wg.n.fetch_add(kWaitersArg, std::memory_order_relaxed);
+        for (int i = 0; i < kWaitersArg; ++i) {
             // noFiber=false: these suspend, so they need a fiber under them.
             JLib::Task* t = sched.CreateTask([&sched, name] {
                 g_entered.fetch_add(1, std::memory_order_relaxed);
@@ -74,15 +88,15 @@ int main() {
         sched.WaitFor(wg);
 
         const int gained = g_resumed.load(std::memory_order_relaxed) - before;
-        if (gained != kWaiters) {
-            printf("FAIL round %d: %d of %d waiters resumed\n", round, gained, kWaiters);
+        if (gained != kWaitersArg) {
+            printf("FAIL round %d: %d of %d waiters resumed\n", round, gained, kWaitersArg);
             ok = false;
             break;
         }
     }
 
     printf("concurrent waiters  : %s (%d rounds x %d waiters = %d resumes)\n",
-        ok ? "ok" : "FAILED", kRounds, kWaiters, g_resumed.load());
+        ok ? "ok" : "FAILED", kRoundsArg, kWaitersArg, g_resumed.load());
 
     // ---- signal a drained event again ----
     sched.GetEvent("round_0").SignalAll();
