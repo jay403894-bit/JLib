@@ -4,23 +4,16 @@
 #pragma once
 #include <functional>
 #include <atomic>
-#include <mutex>
-#include <unordered_set>
 #include <cassert>   // the slab-allocation guard in operator delete below
 
 namespace JLib {
     struct Fiber;
     struct Task;
     struct DirectEvent;
-    struct WaitGroup {
-        static constexpr int WAITER_BIT = 0x40000000;
-        static constexpr int COUNT_MASK = WAITER_BIT - 1;   // counts 
-        std::atomic<int> n{ 0 };
-        std::mutex mtx;
-        std::unordered_set<DirectEvent*> waiters;  // Tasks suspended on this WaitGroup
-
-        void WakeAll();
-    };
+    // Defined in WaitGroup.h. Forward-declared here because a Task only holds a WaitGroup*, and
+    // keeping the definition out means <mutex> and <unordered_set> stay out of the seven headers
+    // that include Task.h without ever naming a WaitGroup. Callers get it via TaskScheduler.h.
+    struct WaitGroup;
 
     enum class FiberSize : uint8_t { Standard, Heavy };
 

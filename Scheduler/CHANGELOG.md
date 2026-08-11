@@ -52,6 +52,23 @@ than waiting for them to settle — the interleaving that could actually lose a 
 four CI platforms, two of them weakly-ordered ARM64, which is the only reason coverage of new atomic
 code is worth much: x86 is TSO and hides a missing barrier.
 
+**`WaitGroup` moved to its own header, and `src/Task.cpp` became `src/WaitGroup.cpp`.** That file
+contained exactly one function — `WaitGroup::WakeAll()` — and nothing about `Task` at all, so anyone
+opening it looking for task internals found a synchronisation primitive. `WaitGroup` is a sibling of
+`Event` and `DirectEvent` and now has a header like they do.
+
+No caller changes: `TaskScheduler.h` includes `WaitGroup.h`, exactly as it already included
+`DirectEvent.h`. `Task.h` forward-declares it, since a `Task` only holds a `WaitGroup*` — which also
+keeps `<mutex>` and `<unordered_set>` out of the seven headers that include `Task.h` without ever
+naming a `WaitGroup`. CMake needed no change (it globs `src/*.cpp`); `Scheduler.vcxproj` lists
+sources explicitly and was updated.
+
+**`GetEvent()` is usable without a second include now.** `TaskScheduler.h` returns `Event&` but only
+forward-declared `Event`, so callers had to include `Event.h` themselves or get an incomplete-type
+error. The cause was a cycle — `Event.h` included `TaskScheduler.h` — and it was unnecessary: all
+`Event.h` ever needed was `Task` and `Fiber`, so it now includes `Fiber.h` and `TaskScheduler.h`
+includes `Event.h`. One header is enough for all three primitives.
+
 **`SchedulerMutex::Lock`'s documentation was wrong.** It said the caller must be a fiber. It has
 always had a non-fiber branch that spins while running stolen `noFiber` work. Corrected — along with
 the consequence, which is that it is the wrong lock for a short critical section reachable from a

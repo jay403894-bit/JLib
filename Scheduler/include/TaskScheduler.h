@@ -22,10 +22,15 @@
 // .cpp needs is platform::CpuRelax() in platform.h, which is arch-correct by construction.
 #include <queue>
 #include "GlobalFiberPool.h"
+// The three synchronisation primitives, all pulled in here so a caller needs only this header --
+// WaitFor takes a WaitGroup&, GetEvent returns an Event&, and WaitOnEventDirectArmed hands out a
+// DirectEvent*. Event.h used to be excluded because it depended on this header; it now depends on
+// Fiber.h instead, which is all it ever needed.
 #include "DirectEvent.h"
+#include "WaitGroup.h"
+#include "Event.h"
 namespace JLib {
 	class Thread;
-	class Event;	
 
 	class TaskScheduler {
 		friend class Thread;

@@ -3,7 +3,12 @@
 
 #pragma once
 #include <atomic>
-#include "TaskScheduler.h"
+// Fiber.h, not TaskScheduler.h: all this needs is Task (for Task*/nextWaiter) and Fiber (for
+// Resume), and Fiber.h brings Task.h with it. Depending on TaskScheduler.h created a cycle that
+// forced TaskScheduler.h to forward-declare Event -- so GetEvent() returned a reference callers
+// could not use without separately including this file. Breaking the cycle lets TaskScheduler.h
+// include Event.h like it already includes DirectEvent.h, and the papercut goes away.
+#include "Fiber.h"
 namespace JLib {
     // Named rendezvous point: any number of fibers park on it, one signal wakes them all.
     //

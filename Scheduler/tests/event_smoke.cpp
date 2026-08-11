@@ -16,8 +16,7 @@
 //      settling delay give that window a chance to open.
 //   3. Signalling an event nobody is waiting on, and one that has already been drained -- both
 //      must be no-ops rather than faults.
-#include <TaskScheduler.h>
-#include <Event.h>     // TaskScheduler.h only forward-declares Event; GetEvent() returns Event&
+#include <TaskScheduler.h>   // brings WaitGroup, Event and DirectEvent with it
 #include <cstdio>
 #include <atomic>
 #include <thread>
