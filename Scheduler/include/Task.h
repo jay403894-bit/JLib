@@ -83,6 +83,19 @@ namespace JLib {
         // uint8_t, so the byte block ends at offset 53 with 11 spare bytes under the 64-byte assert.
         CorePref corePref = CorePref::Default;
 
+        // Intrusive link for Event's waiter stack, living in the same tail padding -- the byte
+        // block above ends well short of 64, so this costs nothing and the one-cache-line assert
+        // still holds.
+        //
+        // It is a SEPARATE field from `next` on purpose. `next` belongs to the queues, and a task
+        // could in principle be reachable from one while the other is in use; aliasing them would
+        // be exactly the sort of overlap that produced the fiber-duplication bugs. A fiber only
+        // ever waits on one event at a time, so a single link is enough.
+        //
+        // Not atomic: it is published by the CAS in Event::AddWaiter (which is the release) and
+        // read only after Event::SignalAll has taken the whole list with an acquiring exchange.
+        Task* nextWaiter = nullptr;
+
         Task() : next(nullptr), fn(nullptr), data(nullptr), assignedFiber(nullptr) { ; }
         Task(Func f, void* d = nullptr, uint8_t hipri =false, FiberSize size = FiberSize::Standard)
             : fn(f), data(d), hiPri(hipri), requiredSize(size) {
