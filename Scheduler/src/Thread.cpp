@@ -364,7 +364,20 @@ void Thread::Worker() {
 		// this flag (via MarkQueuedWork(), called by whichever push targeted this worker) for
 		// the sleep predicate to see fresh, later in this same iteration. See hasQueuedWork's
 		// declaration comment in Thread.h for the full reasoning.
-		hasQueuedWork.store(false, std::memory_order_relaxed);
+		// seq_cst, NOT relaxed, and the whole comment above depends on it. A relaxed store is not
+		// ordered against the loads that follow, so it may SINK PAST the drain below: the worker
+		// searches and finds nothing, a push then lands and sets this flag seq_cst, and only then
+		// does the stale clear land and wipe it. The worker parks with a task in its own inbox and
+		// the only signal for it destroyed. That is the lost wakeup, and it is why the reasoning
+		// above ("a push landing AFTER the clear re-arms the flag") did not hold in practice: the
+		// clear had no defined position relative to the search it is supposed to precede.
+		//
+		// This is a tightening, not the guarantee. Ordering the clear cannot make the flag alone
+		// sufficient, because the flag and the queue are separate objects and no single operation
+		// observes both -- a push whose queue write is not yet visible to the drain can still be
+		// missed. That is why the park decision consults the inboxes directly; this just removes the
+		// reordering that made the window easy to hit.
+		hasQueuedWork.store(false, std::memory_order_seq_cst);
 		// --- 1. Execute task if found ---
 		if (task_to_run) {
 			// Fast path: run directly on THIS worker's own OS-thread stack, no fiber acquired
@@ -755,10 +768,19 @@ void Thread::Worker() {
 			// promoting one flag and leaving the others at acquire is precisely the bug that hung
 			// macOS arm64 in 1.2.0. `running` is the exception and does not need it, because Join()
 			// passes force=true and never takes the skip.
+			// The inbox checks are NOT redundant with hasQueuedWork, and the evidence says so. A
+			// captured hang shows a worker SLEEPING with a non-empty loPri inbox and the flag at 0:
+			// the flag is cleared blind at the top of each loop, so a push whose queue write is not
+			// yet visible to this worker's drain, but whose MarkQueuedWork landed before the clear,
+			// leaves the item present and the only signal wiped. Inboxes are not stealable, so that
+			// task strands and every waiter on it hangs.
+			// The flag stays as the cheap common case; the queue is the truth.
 			if (!running.load(std::memory_order_acquire)
 				|| immediate.load(std::memory_order_seq_cst)
 				|| (!scheduler->paused.load(std::memory_order_seq_cst)
-					&& hasQueuedWork.load(std::memory_order_seq_cst))) {
+					&& (hasQueuedWork.load(std::memory_order_seq_cst)
+						|| !scheduler->hiPriInboxes[qIndex]->empty()
+						|| !scheduler->loPriInboxes[qIndex]->empty()))) {
 				workerState.store(WS_AWAKE, std::memory_order_seq_cst);
 				if (!running.load(std::memory_order_acquire)) break;
 				continue;   // work landed while deciding: go search for it instead of parking
@@ -769,10 +791,18 @@ void Thread::Worker() {
 			workerState.compare_exchange_strong(expectedGoing, WS_SLEEPING,
 				std::memory_order_seq_cst, std::memory_order_relaxed);
 
+			// Same inbox checks as the recheck above, and for the same reason: the flag can be wiped
+			// while an item is present, so a predicate that trusts only the flag can decide to sleep
+			// on a non-empty inbox. Being evaluated under the mutex does not help -- the mutex
+			// orders this against a NOTIFIER, and the failure is a push that never notifies because
+			// its flag write was already lost.
 			cv.wait(lock, [this]() {
 				return !running.load(std::memory_order_acquire)
 					|| immediate.load(std::memory_order_acquire)
-					|| (!scheduler->paused.load(std::memory_order_acquire) && hasQueuedWork.load(std::memory_order_acquire));
+					|| (!scheduler->paused.load(std::memory_order_acquire)
+						&& (hasQueuedWork.load(std::memory_order_acquire)
+							|| !scheduler->hiPriInboxes[qIndex]->empty()
+							|| !scheduler->loPriInboxes[qIndex]->empty()));
 				});
 
 			// Back to AWAKE before releasing the mutex, so the very next push skips the signal.
