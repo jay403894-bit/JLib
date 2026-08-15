@@ -23,6 +23,17 @@ ResourceManager* Renderer2D::GetResourceManager() const { return m_ResourceManag
 
 // Call AFTER core.Initialize() -- builds every 2D-specific GPU object against core's
 // already-created device/queue. See the class comment in Renderer.h for the Core/2D split.
+// Worker qIndex k -> slot k+1; anything that is not a scheduler worker (main, an app thread) -> 0.
+// The bound is defensive only: qIndex < GetWorkerCount() holds by construction, so the fallback is
+// unreachable. It is here so that a malformed index can never be the thing that corrupts memory --
+// which is exactly what the old `qIndex < 64 ? qIndex : 0` did, silently, by aliasing onto slot 0.
+size_t Renderer2D::SubmitSlotForCurrentThread() const {
+	const JLib::Thread* t = JLib::Thread::GetCurrent();
+	if (!t) return kNonWorkerSlot;
+	const size_t slot = (size_t)t->qIndex + 1;
+	return (m_WorkerLocalStorage && slot < m_WorkerLocalStorage->size()) ? slot : kNonWorkerSlot;
+}
+
 void Renderer2D::Initialize(RendererCore& core)
 {
 	m_Core = &core;
@@ -35,7 +46,11 @@ void Renderer2D::Initialize(RendererCore& core)
 	m_Effects.push_back({ m_PipelineState });
 	CreateInstanceBuffer(device, kMaxInstances);   // per-frame instance capacity (see Renderer2D.h)
 	// Allocate per-worker submission buffers (heap-allocated to avoid stack overflow)
-	m_WorkerLocalStorage = std::make_unique<std::array<WorkerLocalSubmissionData, MAX_WORKERS>>();
+	// workerCount + 1: one slot per scheduler worker, plus slot 0 for non-worker submitters (main).
+	// Sized here rather than at construction because the scheduler must already be up -- same
+	// reason FlushTaskContextPool::Init moved out of its constructor.
+	m_WorkerLocalStorage = std::make_unique<std::vector<WorkerLocalSubmissionData>>(
+		JLib::TaskScheduler::Instance().GetWorkerCount() + 1);
 
 	// One context SLOT per (layer, task) pair -- see FlushBatchTask's pool-indexing comment
 	// for why zLayer ordering across tasks requires this instead of one context per task.
@@ -43,6 +58,10 @@ void Renderer2D::Initialize(RendererCore& core)
 	// worth lazily, the first time that layer is actually used (called from
 	// FlushBatchParallel). This lets NUM_LAYERS stay a generous cap with zero memory cost for
 	// layers the game never touches, instead of eagerly paying for all of them at startup.
+	// Ask the scheduler how many workers it actually has. Safe here: Init() runs before the
+	// renderer is initialized, and the count is fixed for the pool's lifetime.
+	m_FlushTaskContextPool.Init((int)JLib::TaskScheduler::Instance().GetWorkerCount());
+
 	const int taskCount = m_FlushTaskContextPool.taskCount;
 	m_CommandContextPool.resize((size_t)taskCount * NUM_LAYERS);
 	m_LayerProvisioned.assign(NUM_LAYERS, false);
@@ -301,10 +320,11 @@ void Renderer2D::Submit(
 
 	// Push to THIS WORKER'S local bucket, not the shared one. This eliminates concurrent
 	// vector modification races.
-	auto* thread = JLib::Thread::GetCurrent();
 	float hasTex = item.tex.IsValid() ? 1.0f : 0.0f;
 	float alphaFromRGB = item.useAlphaFromRGB ? 1.0f : 0.0f;
-	size_t workerIdx = (thread && thread->qIndex < MAX_WORKERS) ? (size_t)thread->qIndex : 0;
+	// Worker k -> slot k+1, non-worker (main) -> slot 0. Previously both main and worker 0 mapped
+	// to slot 0, and so did every worker past 64.
+	size_t workerIdx = SubmitSlotForCurrentThread();
 	if (m_WorkerLocalStorage) {
 		auto& workerLayerBuckets = (*m_WorkerLocalStorage)[workerIdx].buckets[item.zLayer];
 		if (index >= workerLayerBuckets.size()) workerLayerBuckets.resize((size_t)index + 1);
@@ -409,8 +429,9 @@ void Renderer2D::ResetWorkerAllocators(int frame) {
 int Renderer2D::FlushBatchParallel() {
 	const int frame = m_Core->GetFrameResourceIndex();
 
-	unsigned hw = std::thread::hardware_concurrency();
-	int taskCount = (hw > 1) ? (int)(hw - 1) : 1;
+	// The real worker count, fixed at Initialize -- not hardware_concurrency()-1, which disagrees
+	// with the pool whenever Init() was given an explicit size.
+	int taskCount = m_FlushTaskContextPool.taskCount;
 	if (taskCount > (int)m_CommandContextPool.size()) taskCount = (int)m_CommandContextPool.size();
 	if (taskCount < 1) taskCount = 1;
 
@@ -441,7 +462,9 @@ int Renderer2D::FlushBatchParallel() {
 		for (size_t i = 0; i < bucketCount; ++i) {
 			bucketInstanceOffsets[layer][i] = running;
 
-			for (int w = 0; w < MAX_WORKERS; ++w) {
+			// Bounded by the real slot count (workers + 1), not a fixed 64: on a small pool this
+			// used to scan 64 slots per bucket per layer per frame, most of them permanently empty.
+			for (size_t w = 0; w < m_WorkerLocalStorage->size(); ++w) {
 				auto& workerLayerBuckets = (*m_WorkerLocalStorage)[w].buckets[layer];
 				if (i >= workerLayerBuckets.size()) continue;
 				const auto& workerBucket = workerLayerBuckets[i];
@@ -571,7 +594,7 @@ void Renderer2D::CollectCommandListsForLayer(int layer, int frame, std::vector<I
 // so steady-state frames don't reallocate.
 void Renderer2D::ClearWorkerBucketsAndResetPool() {
 	if (m_WorkerLocalStorage) {
-		for (int w = 0; w < MAX_WORKERS; ++w) {
+		for (size_t w = 0; w < m_WorkerLocalStorage->size(); ++w) {
 			for (int layer = 0; layer < NUM_LAYERS; ++layer) {
 				auto& workerLayerBuckets = (*m_WorkerLocalStorage)[w].buckets[layer];
 				for (auto& bucket : workerLayerBuckets)

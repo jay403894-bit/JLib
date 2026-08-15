@@ -220,6 +220,42 @@ void Thread::SetQueueIndex(size_t index)
 {
 	qIndex = index;
 };
+
+bool Thread::DrainOwnInboxesToDeques() {
+	// Pushes to our OWN deque, and NOT via Requeue the way Worker()'s pre-immediate drain does. That
+	// difference is about THIS caller, not about Requeue -- the other drain is correct:
+	// PushToCore stores immediateCoresInUse BEFORE SetImmediateTask, so by the time that worker sees
+	// an immediate task its own core is already flagged, and PickNextWorker skips flagged workers.
+	// Requeue there provably cannot hand a task back into the inbox being emptied.
+	//
+	// A worker spinning in WaitFor carries NO such flag -- it is running an ordinary task -- so
+	// PickNextWorker can and will select it, and Requeue would put the task straight back where we
+	// found it. Taking the flag to borrow that guarantee is worse than it looks: it marks the core
+	// pinned for ALL placement, makes targeted Push(cpu, task) start returning false against us, and
+	// has to be cleared on every exit from the spin. push_bottom needs none of that and is monotone
+	// progress -- once on the deque the task is stealable by every other worker AND visible to our
+	// own GetTask, which scans every deque including this one.
+	const size_t BATCH = 64;
+	Task* batch[BATCH];
+	bool moved = false;
+
+	auto drain = [&](TaskMPSCQueue* inbox, TaskDeque* deque) {
+		for (;;) {
+			size_t count = 0;
+			while (count < BATCH && inbox->pop(batch[count])) count++;
+			if (count == 0) break;
+			for (size_t i = 0; i < count; ++i) {
+				if (!batch[i]) continue;
+				deque->push_bottom(batch[i]);
+				moved = true;
+			}
+		}
+	};
+
+	drain(scheduler->hiPriInboxes[qIndex].get(), scheduler->hiPri[qIndex].get());
+	drain(scheduler->loPriInboxes[qIndex].get(), scheduler->loPri[qIndex].get());
+	return moved;
+}
 void Thread::Join() {
 	bool expected = false;
 	if (!joining.compare_exchange_strong(expected, true)) return;
@@ -321,7 +357,21 @@ Fiber* Thread::AcquireFiber(Task* task) {
 	f = localCache.Pop();
 
 	if (!f) {
-		std::cerr << "CRITICAL: Global pool exhausted!" << std::endl;
+		// ONCE PER PROCESS, not once per failure. Exhaustion is not a single event: the caller
+		// re-queues the task and yields, so a pool that is genuinely short spins through this path
+		// millions of times. Printing each one turned an eight-minute stall into an eight-minute
+		// stall that also floods the console with synchronised writes, which is slower AND hides
+		// the one line that explains it. The condition is a capacity problem, so one line naming
+		// the cap and the cause is all a reader can act on.
+		static std::atomic<bool> warned{ false };
+		if (!warned.exchange(true, std::memory_order_relaxed)) {
+			std::cerr << "[JLib::Scheduler] fiber pool exhausted. A SUSPENDED task holds its fiber, "
+			             "so the number of tasks that may be blocked AT ONCE is capped at the pool "
+			             "size (64 per core). Past that, workers re-queue and retry instead of "
+			             "running, which looks like a stall rather than an error. Either block fewer "
+			             "tasks concurrently, or raise standardFiberCount in TaskScheduler::StartPool. "
+			             "This warning prints once.\n";
+		}
 	}
 	return f;
 }
@@ -354,6 +404,10 @@ void Thread::Worker() {
 	Task* batch[BATCH_SIZE];
 	static thread_local Task* task_to_run = nullptr;
 	static thread_local bool is_handling_fork = false;
+	// IdlePolicy spin state for THIS worker. Both are reset the moment work is found, not only on
+	// the fall-through to park -- otherwise a worker that spun most of its budget and then got a
+	// task would carry that count into its next idle episode and park early ever after.
+	unsigned idleSpins = 0;
 	while (running.load(std::memory_order_acquire)) {
 
 		ready.store(true, std::memory_order_release);
@@ -399,14 +453,16 @@ void Thread::Worker() {
 				busy.store(false, std::memory_order_relaxed);
 				currentRunningTask = nullptr;
 
-				bool was_forked = task_to_run->isForked;  // Save before destruction
 				scheduler->CleanupTaskMetadata(task_to_run);
-				task_to_run->~Task();
+				DestroyTask(task_to_run);
 				scheduler->GetAllocator()->Free(task_to_run);
-				scheduler->pendingTasks.fetch_sub(1, std::memory_order_acq_rel);
 
-				// Clear busy flag for both immediate (is_handling_fork) and load-balanced forks (was_forked)
-				if (is_handling_fork || was_forked) {
+				// Release the core claimed by PushImmediate/PushToCore. Sound because an immediate
+				// task goes into THIS worker's immediate slot and cannot be stolen, so the worker
+				// that releases the claim is always the one it was made against. Task::isForked was
+				// a second, unsound way in -- a queued, stealable task releasing whatever core the
+				// worker that happened to run it had claimed -- and went with PushFork in 1.3.4.
+				if (is_handling_fork) {
 					if (qIndex < (int)scheduler->immediateCoresInUse.size()) {
 						scheduler->immediateCoresInUse[qIndex]->store(false, std::memory_order_release);
 					}
@@ -440,8 +496,29 @@ void Thread::Worker() {
 						immediate.store(true, std::memory_order_seq_cst);
 					}
 					else {
-						scheduler->loPri[qIndex]->push_bottom(task_to_run);
+						// NOT push_bottom on our own deque. That end is LIFO for the owner (see
+						// TaskDeque's header), so the next pop_bottom takes THE SAME TASK back and
+						// this worker spins pop -> no fiber -> push -> pop forever on one task. It
+						// therefore never reaches its inbox drain -- which is exactly where a
+						// SignalAll deposits the resumed tasks whose completion would FREE the
+						// fibers this one is waiting for. Every worker doing that at once is a
+						// deadlock, not the "transient, fibers will free up" this comment used to
+						// claim: over-subscribing the pool hung the primitives suite until its
+						// watchdog fired.
+						//
+						// Requeue routes it through PickNextWorker to a worker inbox, so it leaves
+						// this worker's hands and this pass continues to the steal and inbox-drain
+						// steps that can actually make progress.
+						scheduler->Requeue(task_to_run);
 					}
+					// MUST clear it. task_to_run is a thread_local that survives `continue`, and the
+					// loop top runs `if (task_to_run)` before searching -- so leaving it set makes
+					// this worker keep re-processing a task it has already handed to a queue, adding
+					// one more copy each pass. With the old push_bottom that was hidden, because the
+					// worker re-popped the very same task and the duplicate was itself; routing the
+					// task anywhere else turns it into the same Task* live in two queues and run by
+					// two workers, which is a use-after-free.
+					task_to_run = nullptr;
 					std::this_thread::yield();
 					continue;
 				}
@@ -469,21 +546,16 @@ void Thread::Worker() {
 					if ((old & WaitGroup::COUNT_MASK) == 1 && (old & WaitGroup::WAITER_BIT))
 						task_to_run->waitGroup->WakeAll();   // only touches wg if someone registered
 				}
-				bool was_forked = task_to_run->isForked;  // Save before destruction
 				task_to_run->assignedFiber = nullptr;
 				ReleaseFiber(f);
 
 				scheduler->CleanupTaskMetadata(task_to_run);
-				task_to_run->~Task();
+				DestroyTask(task_to_run);
 				scheduler->GetAllocator()->Free(task_to_run);
-				scheduler->pendingTasks.fetch_sub(1, std::memory_order_acq_rel);
 
-				// Clear busy flag if this was a forked task
-				if (was_forked) {
-					if (qIndex < (int)scheduler->immediateCoresInUse.size()) {
-						scheduler->immediateCoresInUse[qIndex]->store(false, std::memory_order_release);
-					}
-				}
+				// No core release here: the is_handling_fork clear below this whole block covers the
+				// fiber path for PushImmediate. The isForked clear that used to sit here went with
+				// PushFork in 1.3.4.
 
 				currentFiber = nullptr;
 				currentRunningTask = nullptr;
@@ -541,13 +613,35 @@ void Thread::Worker() {
 				// net for that rarer case. Only the INBOX needs this treatment -- anything
 				// already sitting in this worker's own deque was already directly stealable via
 				// steal(), it was never actually at risk.
+				// DRAINS UNTIL EMPTY, not one BATCH_SIZE pass. It used to take at most 64 and stop,
+				// which was fine while an inbox rarely held more: PushLocal round-robins one task at
+				// a time. PushBatch now deliberately hands a large contiguous RUN to a single inbox
+				// (~645 tasks for a 20k batch at the default minPerSegment), so the 64 cap would leave
+				// hundreds behind -- in the inbox of a worker that is about to pin, where nothing can
+				// steal them. For a short fork that is latency; for a PERSISTENT pinned service, which
+				// is what this mechanism exists for (an audio mixer, a network poll loop), the pin
+				// never ends and those tasks are stranded for the life of the process. That is the
+				// particle-demo deadlock again, needing >64 queued instead of >0.
+				//
+				// TERMINATION rests on an invariant, since this no longer has a count bound: Requeue
+				// routes through PickNextWorker, which SKIPS any core whose immediateCoresInUse is
+				// set -- and PushToCore stores that flag BEFORE SetImmediateTask, so by the time this
+				// worker observes immediateTask its own core is already marked. Requeue therefore
+				// cannot hand a task back to the inbox being drained. The one exception is every
+				// worker being pinned at once, where Requeue already spins on its own
+				// while(immediateCoresInUse) loop regardless of this drain -- a pre-existing hazard,
+				// not one introduced here. Do NOT "fix" this loop by re-adding a cap: the cap is what
+				// stranded the overflow in the first place.
 				auto drainInbox = [&](TaskMPSCQueue* inbox, TaskDeque* deque) {
-					size_t count = 0;
-					while (count < BATCH_SIZE && inbox->pop(batch[count])) count++;
-					for (size_t i = 0; i < count; ++i) {
-						Task* t = batch[i];
-						if (!t) continue;
-						scheduler->Requeue(t);
+					for (;;) {
+						size_t count = 0;
+						while (count < BATCH_SIZE && inbox->pop(batch[count])) count++;
+						if (count == 0) break;
+						for (size_t i = 0; i < count; ++i) {
+							Task* t = batch[i];
+							if (!t) continue;
+							scheduler->Requeue(t);
+						}
 					}
 				};
 				drainInbox(scheduler->hiPriInboxes[qIndex].get(), scheduler->hiPri[qIndex].get());
@@ -720,6 +814,19 @@ void Thread::Worker() {
 						continue;
 					}
 				}
+				else {
+					// THE DEQUE WAS FULL AND THESE ARE ALREADY OUT OF THE INBOX. Dropping them here
+					// used to be silent: pop() had consumed them, batch[] is reused next iteration,
+					// so the tasks never ran, their slab slots leaked, and every WaitFor on their
+					// WaitGroup waited forever with nothing to show in a pool dump. Losing work is a
+					// worse failure than stalling on it -- a stall is at least diagnosable.
+					// Requeue instead: inboxes are unbounded MPSC queues, so it cannot fail the way
+					// a fixed-capacity deque can. Reachable only past 32768 queued on ONE worker's
+					// deque, which needs a deliberate single-core bulk push (PushBatch with an
+					// explicit cpuaffinity does not spread), but the cost of handling it is one loop.
+					for (size_t i = 0; i < count; ++i)
+						if (batch[i]) scheduler->Requeue(batch[i]);
+				}
 			}
 
 			if (!task_to_run) {
@@ -735,14 +842,50 @@ void Thread::Worker() {
 							continue;
 						}
 					}
+					else {
+						// Same as the hiPri branch above: these are already out of the inbox, so
+						// dropping them loses them silently. Requeue rather than discard.
+						for (size_t i = 0; i < count; ++i)
+							if (batch[i]) scheduler->Requeue(batch[i]);
+					}
 				}
 			}
 		}
 
 		if (task_to_run) {
+			idleSpins = 0;   // work found: this idle episode is over, next one starts fresh
 			continue;
 		}
 		else {
+			// IDLE POLICY. Found nothing this pass -- decide whether to search again or park.
+			//
+			// This sits BEFORE the WS_GOING_TO_SLEEP publish on purpose. A worker that spins here
+			// never advertises an intent to park, so it stays WS_AWAKE and pushers take the
+			// awake-preference skip instead of paying a notify for it: spinning does not merely
+			// avoid the wake, it removes the wake cost from the PRODUCER too.
+			//
+			// Deliberately NOT a timed wait. The park below stays an unconditional cv.wait, so a
+			// lost wakeup still hangs visibly rather than being masked by a timeout -- see the
+			// IdlePolicy comment in TaskScheduler.h for why that distinction is the whole point.
+			{
+				// Shutdown and Pause both override the policy. Pausing means "stop using the CPU",
+				// and a policy that spun through it would defeat the only thing Pause exists for.
+				const bool mayspin = TaskScheduler::GetIdlePolicy() == TaskScheduler::IdlePolicy::NoSleep
+					&& running.load(std::memory_order_acquire)
+					&& !scheduler->paused.load(std::memory_order_seq_cst);
+
+				if (mayspin) {
+					++idleSpins;
+					// Yield periodically even under NoSleep. A pure CpuRelax loop is pathological
+					// if the pool is oversubscribed or shares cores with the host's own threads,
+					// and "I own the machine" is a claim the caller makes, not one this can verify.
+					if ((idleSpins & 0xFF) == 0) std::this_thread::yield();
+					else platform::CpuRelax();
+					continue;   // search again rather than parking
+				}
+				idleSpins = 0;   // policy is Sleep, or shutting down/paused: fall through and park
+			}
+
 			// Per-worker signal, not a pool-wide counter: hasQueuedWork means "a task was pushed
 			// specifically to ME since my last search," which is the only thing that should
 			// keep THIS worker from actually sleeping. Stealable work on OTHER workers' deques

@@ -3,7 +3,310 @@
 Correctness fixes are marked **[CRITICAL]** with a note on what breaks without them -
 downstream users (forks/ports) should treat those as must-pull.
 
-## 1.2.4 - unreleased
+## 1.3.5 - 2026-08-15
+
+**`CreateTask` now accepts a NAMED callable, not only a temporary.** This did not compile:
+
+```cpp
+auto body = [&] { /* ... */ };
+sched.CreateTask(body);            // error: cannot bind rvalue reference to lvalue
+std::thread t(body);               // ...while this always did
+```
+
+`CreateTask` decays `F` before instantiating `LambdaTask<std::decay_t<F>>`, so that class's
+`LambdaTask(F&&)` is a plain **rvalue reference**, not a forwarding reference, and an lvalue had
+nothing to bind to. Fixed by adding a `LambdaTask(const F&)` overload that copies. **No API change:**
+`CreateTask`'s signature is untouched, an rvalue still selects `F&&` and still moves exactly as
+before, and an lvalue can only select the new overload, so there is no ambiguity. Rebuilt against
+the full JLib solution and Game01 to confirm no existing call site changed meaning.
+
+Guarded by a new case in `SchedulerPrimitivesTest`, which is mostly a compile-time assertion -- if
+the overload is removed the test file stops building.
+
+**Sync-primitive test coverage.** `SchedulerConditionVariable` had **no tests at all**, and the
+mutex was only exercised from bare threads -- never from a fiber, which takes an entirely different
+path (suspend rather than spin-and-help). Added: fiber-vs-fiber contention, mixed fiber-vs-bare
+contention, CV `Wait`/`Notify_One` with the mutex provably released while parked and re-acquired
+before returning, `Notify_All` across 8 waiters, and a semaphore permit returned by a thread that
+never took it.
+
+Also pinned down, because it is a genuine footgun: **on a bare thread `SchedulerConditionVariable::
+Wait()` does not wait for a notification.** It unlocks, takes one spin-help step, re-locks and
+returns. So `if (!ready) cv.Wait(m);` is correct on a fiber and broken on a bare thread; only a
+predicate LOOP is correct in both. There is now a test asserting exactly that.
+
+One note on the tests themselves. The first fiber-contention test asserted "never two holders" and
+passed -- and measured with the mutex REMOVED it still passed **1 run in 3**, because two fibers
+frequently never overlap at all. A mutual-exclusion test that passes while the mutex is broken is
+worse than no test. It now runs an unlocked probe first and asserts overlap was actually observed
+before trusting the locked result, behind a rendezvous so both fibers are resident before either
+starts.
+
+## 1.3.4 - 2026-08-14
+
+**[CRITICAL] fixes a deterministic deadlock when a task waits from inside a worker.** Affects every
+release. If any `noFiber` task calls `ParallelFor`, `WaitFor`, `SchedulerMutex::Lock` or
+`SchedulerConditionVariable::Wait` while running on a worker, take this.
+
+`noFiber` is the `CreateTask` default, so "push a task that runs a parallel-for" -- the obvious
+thing to write -- hangs, and hangs 100% of the time:
+
+1. `PushLocal` round-robins chunks across ALL workers, **including the calling one**.
+2. One chunk lands in the calling worker's own **inbox**.
+3. A `noFiber` task cannot suspend, so its `WaitFor` spins in place rather than parking, and the
+   worker never returns to `Worker()`'s loop.
+4. Inboxes are owner-drain-only and never stealable, so that chunk is now invisible to the entire
+   pool -- and the only thread that could drain it is the one spinning on it.
+
+The pool dump at the hang is unambiguous: the calling worker `AWAKE`, `busy=1`, one task in its lo
+inbox, every deque empty and all 30 other workers `SLEEPING`.
+
+`TryRunStolenNoFiberTask` now handles this. When a steal finds nothing AND the caller is a worker,
+it moves its own inboxes onto its own deques (`Thread::DrainOwnInboxesToDeques`) and retries.
+Deques are stealable, so the work becomes reachable by the whole pool and by the spinner's own
+`GetTask`, which already scans every deque including its own. A `NotifyAll` follows a productive
+drain, because a drained task may be fiber-backed and unrunnable by the fiberless spinner while
+every other worker is parked.
+
+**Non-workers skip the whole path** -- main and app threads have no inbox and are not part of the
+hazard. The drain runs only after a steal has already failed, so it is off the hot path: `latency`,
+`burst`, `fork-join`, `frame DAG` and both `ParallelFor` rows are unchanged. The single-`ParallelFor`
+repro goes from hanging 3/3 to completing in ~25 ms, matching the fiber-backed control. Verified on
+MSVC and on GCC/Linux, where the hang also reproduced.
+
+**It is not really a `ParallelFor` bug, and a fiber-backed outer caller does not protect you.** An
+8-case matrix, each case in a fresh process (see below), against a build with the drain disabled:
+
+```
+                                    drain OFF   drain ON
+1 level  ParallelFor    [noFiber]      HANG        OK
+2 levels ParallelFor    [noFiber]      HANG        OK
+3 levels ParallelFor    [noFiber]      HANG        OK
+manual WaitGroup fanout [noFiber]      HANG        OK     <- no ParallelFor involved at all
+1 level  ParallelFor    [fiber]        OK          OK
+2 levels ParallelFor    [fiber]        HANG        OK     <- outer caller is a FIBER
+3 levels ParallelFor    [fiber]        OK          OK
+manual WaitGroup fanout [fiber]        OK          OK
+```
+
+A hand-rolled `WaitGroup` fan-out hangs with no `ParallelFor` anywhere, so the trigger is the wait,
+not the loop. And nesting under a fiber-backed outer caller still hangs, because `ParallelFor`'s
+chunks are themselves `noFiber` tasks -- an inner `ParallelFor` therefore waits from inside one,
+regardless of what the outermost caller was. The cases that pass with the drain off pass by
+alignment, not by construction.
+
+**Test-design note, because the first version of this matrix was wrong:** run ONE case per process.
+`PickNextWorker`'s cursor is process-global, so whether a chunk ever lands back in the calling
+worker's own inbox depends on scheduler state left by earlier cases. Run sequentially in one
+process, all 8 cases passed with the drain disabled -- a clean false negative that would have
+"confirmed" a fix that was not being exercised.
+
+It pushes to the worker's OWN deque rather than going through `Requeue`, and that is about the
+caller rather than about `Requeue`. `Worker()`'s pre-immediate drain uses `Requeue` correctly:
+`PushToCore` stores `immediateCoresInUse` **before** `SetImmediateTask`, so that worker's core is
+already flagged by the time it sees the task, `PickNextWorker` skips flagged workers, and the task
+cannot come back to the inbox being emptied. A worker spinning in `WaitFor` carries no such flag --
+it is running an ordinary task -- so `PickNextWorker` can select it and `Requeue` would return the
+task to where it was found. `push_bottom` is monotone progress and needs no flag.
+
+**`PushFork` is REMOVED.** Use `Push`. To place a task on a known worker, `Push(cpu_affinity, task)`
+-- one-based, 0 meaning round-robin. Nothing in the library called it.
+
+It placed a child on the CALLING worker, on the theory that the parent was about to `WaitFor` and
+suspend, freeing that core, so the child would run there warm on the parent's data. "Fork" meant
+fork-a-child, never split-and-join. Removing it took answering three separate questions, and the
+answers are recorded here because each one looked like a reason to KEEP it at the time.
+
+**1. It never worked.** It passed a **zero-based** worker index to `PushLocal`'s **one-based**
+affinity parameter, in every release. The fiber path put the child on the NEIGHBOUR (`qIndex - 1`),
+and from worker 0 it passed 0, which that parameter reads as "round-robin", so the child went
+anywhere at all. The non-fiber path claimed `immediateCoresInUse[w]` and pushed the task to `w-1`,
+so the claim was released by whatever unrelated task worker `w` ran next -- or, for a claim made
+against worker 0, never released, silently removing that core from placement for the life of the
+process. Every other caller of that parameter (`Push(cpu, task)`, `PushBatch`, `PushToCore`) already
+used the one-based convention. **The one thing this function existed to do had never once happened**,
+so no code has ever depended on it.
+
+**2. Its fiber-only gate was load-bearing, and that is a mark against the design, not for it.** A
+forked child lands in the target worker's inbox, and inboxes are owner-drain-only -- never
+stealable. Only a parent that actually suspends can guarantee that worker returns to its loop to
+drain it. Widening the gate to "any worker" makes a `noFiber` parent strand its own child in its own
+inbox and spin on it forever. So the function was safe only for fiber parents, and a caller had no
+way to see why.
+
+**3. With the index fixed, it still lost every measurement.** In its own legal configuration -- fiber
+parent, fiber children, recursive fork-join over 1M elements, best-of-7 -- self-spawning is slower at
+every tree size and worst on small trees, where it serialises the top of the tree onto one worker
+until steals redistribute:
+
+```
+leaves            2      4      8     16     32     64    128    256    512
+PushFork / Push  1.01x  2.97x  4.63x  4.43x  3.58x  2.43x  1.82x  1.49x  1.48x
+```
+
+**And the locality premise itself was false.** Tested directly for the first time, with a parent that
+writes a buffer and a child that immediately reduces THAT buffer (median us, spawn->join, 200 reps):
+
+```
+working set        Push   PushFork   ratio
+16 KB  (L1)       10.40      6.70    0.64x
+256 KB (L2)       33.50     29.60    0.88x
+2 MB              203.90   199.20    0.98x
+16 MB            1612.90  1611.30    1.00x
+256 KB NO SHARING  61.10    55.10    0.90x   <- control saves MORE than the sharing case
+```
+
+The gain is a flat few microseconds that only looks large when the child is short, it does not grow
+when the child reuses the parent's data, and it **disappears entirely under
+`IdlePolicy::NoSleep`** (16 KB goes from 0.64x to 1.09x). It was never locality: it was one avoided
+worker WAKE, worth about one `latency`-bench round-trip (~5 us), available only on an idle pool, and
+paid for with a 1.5x-4.6x loss the moment the pool is busy -- which is exactly when a job system is
+being used. A name that reads as "fork-join" attached to that trade had already misled this
+project's own bench and its own docs.
+
+`Task::isForked` goes with it -- nothing else set it -- shrinking `Task` by a byte inside the same
+64-byte budget. `Thread::Worker`'s two `was_forked` core-releases are gone; `is_handling_fork`, which
+serves `PushImmediate` and is sound because an immediate task cannot be stolen off the worker that
+claimed the core, is untouched. `DESIGN.md`'s fork-join example now uses `Push`; it had been
+teaching the slower path.
+
+## 1.3.3 - 2026-08-14
+
+**[CRITICAL] fixes tasks being stranded permanently in the inbox of a pinned worker.** Affects every
+release before 1.3.3, and earlier ones worse. If you use `PushImmediate`/`PushFork` for a persistent
+service -- an audio mixer, a network poll loop -- and submit in bulk, take this.
+
+Before taking an immediate/fork task, a worker drains its inboxes and re-queues them. It has to:
+inboxes are owner-drain-only and not stealable, and a pinned worker never returns to its loop to
+drain its own. That drain stopped after ONE `BATCH_SIZE` pass, so anything past 64 entries stayed
+behind, unreachable by anything.
+
+The 64 cap was correct when it was written. `PushLocal` round-robins one task at a time, so an inbox
+rarely held more than a handful. What changed underneath it is `PushBatch`: it now hands a large
+contiguous RUN to a single inbox -- roughly 645 tasks for a 20k batch at the default
+`minPerSegment` -- and before 1.3.0 it was worse still, putting the ENTIRE batch into one worker.
+The overflow stopped being hypothetical without the drain ever being revisited.
+
+For a short fork the leftovers are latency. For a **persistent** pinned service, which is what the
+mechanism exists for, the pin never ends and those tasks are stranded for the life of the process,
+hanging anything that waits on them. That is the particle-demo deadlock again, needing >64 queued
+rather than >0.
+
+The drain now runs until the inbox is actually empty. Termination rests on an invariant rather than
+a count, so it is written down at the call site: `PushToCore` stores `immediateCoresInUse` BEFORE
+`SetImmediateTask`, so by the time a worker observes `immediateTask` its own core is already marked
+and `PickNextWorker` skips it -- `Requeue` cannot hand a task back to the inbox being drained. The
+comment also says not to "fix" the loop by re-adding a cap, because the cap is the bug.
+
+**This is the third defect this cycle of the same shape**, and the pattern is worth naming: code that
+was correct when written, invalidated later by a change somewhere else that quietly rewrote its
+preconditions. The `push_bottom` retry path was fine until fiber exhaustion made a worker re-pop the
+same task forever. `task_to_run` surviving the loop's `continue` was harmless until the task stopped
+going back to the same deque. This drain was sufficient until batches began arriving in runs. None
+were wrong when written; each became wrong when something else moved, and nothing in the tests or
+the type system noticed.
+
+## 1.3.2 - 2026-08-14
+
+**The AArch64 spin hint is now `isb` rather than `yield`.** Measured on an Android AArch64 device:
+`throughput/mp` -- four producers, the most contended row in the benchmark -- went **3.43 to 5.15 M
+tasks/sec, about 50%**.
+
+`CpuRelax()` had always been `yield` on AArch64 because it is the architectural analogue of x86's
+`PAUSE`. It is also, on nearly all AArch64 hardware, a no-op: `YIELD` is a hint asking an SMT
+implementation to favour the sibling thread, and almost no ARM core is SMT. So every spin loop in
+this scheduler -- the contended-lock path, the steal loop, and `IdlePolicy::NoSleep`'s idle search --
+had been backing off *not at all* on ARM, running at full instruction throughput and re-reading the
+contended line every iteration.
+
+`ISB` is an instruction synchronisation barrier, not a pause. It flushes the pipeline, and that is
+precisely why it works: it costs real cycles, so the loop actually slows down. Fewer iterations per
+microsecond means fewer memory accesses and less coherence traffic, which is why the throughput win
+and lower energy per spin are the same effect seen from two directions.
+
+**How it was measured, because the obvious way to run this on a phone produces a fake result.**
+Running the candidate first on a cool device and the control second on a throttled one manufactures
+exactly this shape. Both builds were therefore run in BOTH orders, on a device left to cool first,
+and `isb` came out ahead each time. `SchedulerBench` stamps the hint into its banner (`spin=isb`,
+`spin=yield`, `spin=nop8`, `spin=pause` on x86) so a pasted result says which variant produced it --
+the same reason it stamps the version.
+
+`-DJLIBSCHED_ARM_SPIN_HINT=yield` restores the old behaviour; `=nop` selects a fixed sled, which is
+the control that would distinguish "delay helps" from "`isb` specifically helps" and has not been
+run. x86-64 is unaffected and always uses `PAUSE`.
+
+**This does not change the mobile power story, and `Sleep` remains the default.** The two are
+different layers: `IdlePolicy` decides whether a worker spins at all -- under `Sleep` it parks on a
+condition variable, the kernel deschedules the thread, and the core is free to idle -- while
+`CpuRelax` only decides how to spin during the short search window before parking. `ISB` is not a
+sleep and does not pretend to be one. The instruction that does sleep a core is `WFE`, and it is
+deliberately not used here: it suspends the core but leaves the thread scheduled, so for a wait of
+unknown length -- which is what an idle worker faces -- descheduling via futex is strictly better,
+and on mobile it is what lets the SoC drop to a low-power state at all.
+
+Every ARM measurement in this project before now was taken with a spin loop that did not spin.
+
+## 1.3.1 - 2026-08-14
+
+**[CRITICAL] fixes a deadlock when more tasks block at once than the fiber pool holds.** A suspended
+task keeps its fiber, so the number of tasks that may be blocked SIMULTANEOUSLY is capped at the
+pool size. Past that cap the pool hung.
+
+THIS AFFECTS EVERY RELEASE BEFORE 1.3.1, NOT JUST 1.3.0. The defect dates to at least 2026-07-06 --
+it was FOUND while testing 1.3.0, not introduced by it -- so 1.2.3 and earlier are affected too.
+Anyone on any earlier version who fans out more blocking tasks than `64 x workers` should take this;
+the symptom is an unexplained stall, not a crash.
+
+Three separate defects, all found by writing the test for a limit that had just been documented:
+
+**The pool hung instead of degrading.** When `AcquireFiber` failed, the worker pushed the task onto
+the BOTTOM of its own deque -- the LIFO end it pops from -- so the next pop returned the same task.
+The worker span pop/no-fiber/push forever and never reached its inbox drain, which is exactly where
+`SignalAll` deposits the resumed tasks whose completion would have freed the fibers it was waiting
+for. Every worker doing that at once is a deadlock. The comment there called the condition
+"transient -- fibers are in use and will free up", and that claim had already been copied into the
+warning text and the README before anyone tested it. Now routed through `Requeue`.
+
+**The retry path leaked `task_to_run`.** It is a `thread_local` that survives the loop's `continue`,
+and the loop top tests it before searching, so a worker kept re-processing a task it had already
+queued and added another copy each pass. The old `push_bottom` hid this, because the task it
+re-popped WAS the duplicate; routing the task anywhere else turns it into one `Task*` live in two
+queues and run by two workers. It surfaced as a segfault the moment the deadlock was fixed.
+
+**The fiber pool was sized from the machine rather than the pool.** `coreCount` was
+`hardware_concurrency() - 1` instead of the resolved worker count, so `Init(4)` on a 32-thread
+machine allocated 1984 standard + 248 heavy fibers -- about 248 MB of commit for four workers -- and
+`Init(8)` on a 128-thread machine allocated roughly 1 GB. That is backwards for the embedding case
+this library exists for. It remains fully automatic and the default `Init()` is unchanged; only an
+explicitly smaller pool costs less than it used to.
+
+**The exhaustion warning now prints once per process.** It fired on every failed acquire, and since
+the caller re-queues and retries, a short pool spun through that path millions of times -- so the
+warning made the stall slower and buried the one line explaining it.
+
+**Test.** `SchedulerPrimitivesTest` now pushes more blocking tasks than the pool has fibers and
+requires completion. The watchdog is the assertion: there is no honest threshold for "too slow", but
+"finishes at all" is the property that broke. It fails on any earlier version by timeout and on
+the intermediate fix by segfault, so it tells the three states apart.
+
+### Also
+
+`Event::SignalAll` re-queues woken fibers in one batch instead of one at a time. Each individual
+re-queue is a placement, an inbox push, a `seq_cst` flag and a condition-variable signal, and a
+broadcast waking 64 fibers paid all of it 64 times, serially, on the signalling thread. Measured on
+the marl blocking comparison: the broadcast-heavy case went 13.5 -> 8.5 ms. Cases with a single
+broadcast per batch are unchanged, so this helps where wakes are frequent rather than large.
+
+`PushBatch` gained a `hiPri` parameter and `PushArray` gained one too, both defaulting to low.
+`PushBatch` routed every batch into the low-priority inboxes unconditionally, which was a silent
+priority inversion for anyone batching high-priority work.
+
+`WaitOnEvent` and `WaitOnEventArmed` gained `Event&` overloads; the name-taking versions forward
+through `GetEvent`. A caller waiting on the same event repeatedly can hoist the lookup to startup and
+keep a global mutex and a string hash off the hot path. The reference is stable for the process
+lifetime -- the registry owns `unique_ptr<Event>`, so a rehash moves the pointer, not the object.
+
+## 1.3.0 - 2026-08-14
 
 **[CRITICAL] fixes a lost wakeup that could strand a task permanently.** A worker could park while
 its own inbox held work, and inboxes are not stealable, so that task never ran and everything
@@ -152,6 +455,165 @@ helper happens to steal one of the queued tasks that wants the held lock. Hence 
 code does not produce a wrong answer, it produces a hang, and a hang in CI burns the whole job
 timeout before reporting anything -- which is precisely what the 1.2.0 macOS bug did for thirty
 minutes a run. Wired into all four CI targets.
+
+### New: `IdlePolicy` -- workers do not have to sleep
+
+`SetIdlePolicy(IdlePolicy::NoSleep)` makes idle workers keep searching instead of parking on their
+condition variable. Default stays `Sleep`. Measured on the reference machine, medians of three:
+
+| | `Sleep` (default) | `NoSleep` | |
+|---|---|---|---|
+| Round-trip latency | 4.68 µs | **1.15 µs** | 4.1x |
+| 6-node frame DAG | 22.50 µs | **7.76 µs** | 2.9x |
+| 1M fork-join | 0.22 ms | **0.07 ms** | 3.1x |
+| throughput/1p | 1.21 M/s | **6.30 M/s** | 5.2x |
+| throughput/mp | 8.89 M/s | 12.40 M/s | 1.4x |
+| burst from idle | 11.6x of 16 | 12.6x of 16 | flat |
+
+The wake path was the largest single cost in the scheduler and nothing here had measured it. That is
+the honest summary: 3-5x on everything latency-shaped, for the price of holding the cores.
+
+**Burst barely moved, and that is the control.** Its shortfall was predicted BEFORE measuring to be
+frequency scaling rather than wake latency -- 16 heavy tasks at once settle toward base clock on a
+chip at Intel spec power limits, where one task alone boosts. It stayed flat while everything else
+moved 3-5x, which is what makes the other rows a signal rather than drift.
+
+**The default stays `Sleep`, deliberately.** Spinning workers are a battery and thermal problem on
+the ARM64/Android target, where throttling costs more clock than the wake ever costs in dispatch;
+they starve whatever else the host runs; and they make the oversubscription policy incoherent, since
+it reserves a core per persistent busy thread and this would make every worker one. `NoSleep` is for
+an application that owns the machine.
+
+**Negative result: there is no middle setting, and not for lack of trying.** A `SpinBriefly` mode
+was built and measured -- search for a configurable number of microseconds, then park -- on the
+classic spin-then-block reasoning that spinning for the cost of a block is 2-competitive. It was
+worse than BOTH neighbours, monotonically worse as the budget grew (frame DAG, µs per graph:
+`Sleep` 22.5 | 2 µs 23.6 | 5 µs 23.6 | 20 µs 27.3 | 100 µs 34.4 | `NoSleep` 7.8). The 2-competitive
+argument assumes spinning is free for everyone else on the machine, and with 31 workers it is not:
+spinners burn memory bandwidth and contend on steal CASes against the workers that actually have
+work, then park anyway and pay the wake plus continuous park/unpark cv churn. Both extremes avoid
+one half of that; the middle collects both. Removed rather than shipped as a trap for anyone
+reasonably expecting a compromise setting.
+
+`Pause()` parks regardless of policy. This is NOT a timed wait: it changes whether a worker parks,
+never how long it stays parked, so the park is still an unconditional `cv.wait` and a lost wakeup
+still hangs visibly rather than being papered over by a timeout.
+
+The primitives suite now takes a `nosleep` argument and CI runs it twice, once per policy. The
+policy changes the park path, which is precisely where the 1.2.0 lost wakeup lived, so the existing
+blocking cases are worth more there than a bespoke test would be.
+
+### Removed: `WaitAll()` and the `pendingTasks` counter
+
+**API REMOVAL, and the reason 1.2.4 became 1.3.0.** `TaskScheduler::WaitAll()` is gone. It spun on a
+global `pendingTasks` atomic that every push and every completion had to maintain, and it had no
+callers anywhere -- not in the library, the bench, or the tests. Wait on a `WaitGroup` instead, which
+is scoped to the work you actually submitted; "all work everywhere" stops being an answerable
+question as soon as two systems share the pool.
+
+It was not removed for tidiness. That counter was **24 ns per task, 27% of the entire per-task
+cost** -- one contended cache line bounced between every producer and all 31 consumers, twice per
+task. Measured by deleting it and re-running, after a first estimate of "3-9 ns" from a
+consumer-only proxy proved badly wrong:
+
+| | before | after |
+|---|---|---|
+| `throughput/mp` (4 producers) | 3.24 M/s | **10.61 M/s** |
+| `throughput/bt` (`PushBatch`) | 11.81 M/s | **12.42 M/s** |
+| `throughput/1p` (1 producer) | 0.81 M/s | **0.89 M/s** |
+| per-task total, 20k tasks | 88.9 ns | **67.2 ns** |
+
+The 3.3x on multi-producer is the counter's real signature: four producers issuing `fetch_add` on
+the same line that 31 workers are issuing `fetch_sub` on.
+
+`DumpPoolState` now SUMS the per-worker deques instead of printing the counter. That is strictly
+better diagnostics -- it says where the work is, not just how much -- and it costs nothing, because
+it only runs when a watchdog has already given up. The per-worker `<-- SLEEPING WITH WORK` line,
+which is what actually identified the lost wakeup above, is untouched.
+
+### Submission throughput
+
+**`PushBatch` now spreads a batch across workers instead of stacking it on one.** It picked a single
+worker and pushed every task into that worker's inbox. Inboxes are owner-drain-only, so that one
+worker then moved the whole batch into its local deque `BATCH_SIZE` at a time while every other
+worker stole from it ONE ITEM AT A TIME -- a 20k-task batch became one drain loop plus ~20k
+single-item steal CASes contending on a single deque, with the producer that had just paid to build
+the batch sitting idle. Segmenting costs nothing (the `next` links were being written anyway, just
+as one long chain instead of several short ones) and turns one hot deque into several warm ones.
+Measured at 31 workers, 20k tasks: dispatch **90 ns -> ~56 ns per task**.
+
+Batches are NOT split below 64 tasks per segment. Each segment costs a `NotifyWorker`, which takes
+the target's mutex, and splitting a small batch every which way pays those wake-ups for parallelism
+it is too small to use -- that was a measured regression on small batches before the floor existed.
+Explicit `cpuaffinity` is still honoured exactly and never spread; it is an explicit request.
+
+**`ParallelFor`'s flat path submits with one `PushBatch`** instead of `numTasks-1` individual
+`Push` calls, collected into a stack buffer so nothing is allocated on a path that runs per frame.
+It passes `minPerSegment=1`, not the default 64: this path only runs at <= 2 tasks per worker, so a
+64-task floor would collapse the batch onto ONE worker -- strictly worse than the per-task `Push` it
+replaces, which at least round-robined.
+
+Reported as neutral, because that is what it measured. ParallelFor floors `chunkSize` so
+`numTasks <= workers*4`, and dispatches to fork-join above `workers*2`, so the flat path only ever
+sees small task counts and the bench moved no further than its run-to-run spread. It is kept for
+being strictly fewer notifies at equal distribution, not for a number.
+
+**Fork-join's dispatch threshold was re-tested and stays.** The comment justifying it blames flat's
+"O(#tasks) serial CreateTask+Push+NotifyWorker on one thread", and `PushBatch` removes exactly that
+notify storm -- so the threshold might have become obsolete. Measured instead of assumed: forcing
+the flat path for a 79-task ParallelFor gives **0.485 ms against fork-join's 0.400 ms**, with 26%
+spread against 7%. Fork-join still wins and the threshold is still earned. The likely mechanism,
+untested: from an idle pool flat issues every notify serially to a SLEEPING worker, while fork-join's
+cascade wakes a few, and the deeper levels' notifies then hit already-awake workers and are skipped
+by the awake-preference fast path.
+
+**New: `PushArray(begin, end, chunkSize, fn, wg)`.** Submits a range as `ceil(n/chunkSize)` tasks,
+each looping its own chunk and calling `fn(i)` per index, instead of one task per item. Per-task
+overhead is a per-TASK cost, not a per-item one -- it buys queueing, stealing, completion accounting
+and reclamation, none of which n known-up-front items each need separately -- so chunking divides the
+whole figure by `chunkSize`. Measured per item at 20k items: **80 ns at chunk 1 -> 14 ns at 8 ->
+4.9 at 32 -> 1.3 at 128**. It is the fire-and-forget sibling of `ParallelFor`, which probes the work,
+picks its own split, runs a chunk on the calling thread and blocks; use `PushArray` when the caller
+has other work to do, wants to submit several ranges before waiting on them together, or already
+knows its own grain.
+
+**Task completion can skip the virtual destructor** when the concrete type provably has nothing to
+destroy (`Task::trivialDtor`, set by both `CreateTask` overloads; the lambda overload keys off
+`std::is_trivially_destructible_v<F>`). Reported for completeness rather than as a win: A/B measured
+**~2.6 ns against a 49-61 ns run-to-run spread**, so it is not distinguishable from noise here. Kept
+because it is free and correct, and the default is 0 -- "not known to be trivial" -- so a task built
+anywhere other than `CreateTask` keeps paying the call and an oversight can only ever be slow,
+never wrong.
+
+Not done: batching the per-task `WaitGroup` decrement. A contended shared atomic measures ~3-9 ns of
+the ~80 ns total here, and deferring a completion signal so it can be flushed in bulk reintroduces
+exactly the lost-wakeup shape this release exists to fix. `PushArray` already collapses those
+decrements to one per chunk, which is the same benefit with none of the risk.
+
+Tests: `PushArray` index coverage (exactly once, no gap and no duplicate -- the failure mode of a
+chunked API is an off-by-one at a chunk boundary, which no timing benchmark would catch), chunk
+larger than the range, empty and inverted ranges, `chunkSize == 0`, and a 5000-task spread
+`PushBatch` arrival check.
+
+### Comparison harness
+
+**New opt-in `bench/compare`** measuring against enkiTS -- the closest architectural peer, so a gap
+localises to implementation rather than design. Requires `-DJLIBSCHED_ENKITS_DIR`; without it the
+target does not exist, so normal builds and CI never see it, and enkiTS is not vendored.
+
+It takes an optional `nosleep` argument, and the file says in capitals not to quote that run as a
+comparison. Both schedulers live in the harness's one process, so under `NoSleep` JLib's workers spin
+through enkiTS's benchmarks as well -- 63 threads on 32 CPUs. The confound is visible in enkiTS's own
+column, which cannot legitimately move when a JLib setting changes and does: ranged per-item 15.3 →
+8.7 ns, latency 21.4 → 18.2 µs. enkiTS measured ~40% FASTER because JLib stopped sleeping, almost
+certainly core parking. Head-to-head numbers come from the default run; `NoSleep` figures come from
+`SchedulerBench`, which runs JLib alone.
+
+Five workloads, with predictions recorded in the file before measuring and every harness fault
+recorded next to the number it corrupted -- the first draft reported enkiTS as 15x slower and all
+four faults were the harness (N waits against one, `WaitforAll` not being a per-batch wait,
+`sleep_for(20us)` costing a full 15.6 ms Windows quantum, and mismatched baselines). It also fixes
+one pointed the other way: the JLib column now reports `PushBatch` as well as per-task `Push`.
 
 ## 1.2.3 - 2026-08-13
 

@@ -11,7 +11,9 @@
 #include <cstdint>
 #include <chrono>
 #include <unordered_map>
-#include <thread>   // std::thread::hardware_concurrency() -- FlushTaskContextPool
+#include <thread>   // no longer needed here (FlushTaskContextPool now asks the scheduler for the
+                    // worker count); kept because this is a public header and downstream code may
+                    // be relying on it transitively.
 #include <atomic>   // std::atomic<size_t> -- FlushTaskContextPool
 #include <array>    // std::array -- WorkerLocalSubmissionData::buckets
 #include "Colors.h"
@@ -182,15 +184,25 @@ namespace JLib {
             int endBucket;
         };
         struct FlushTaskContextPool {
-            unsigned hw = std::thread::hardware_concurrency();
-            int taskCount = (hw > 1) ? (int)(hw - 1) : 1;
+            int taskCount = 1;                          // real pool size; set by Init()
             std::vector<FlushTaskContext> pool;
             std::atomic<size_t> nextIndex{ 0 };
 
+            // Sized from TaskScheduler::GetWorkerCount(), NOT hardware_concurrency() - 1. The pool
+            // size is a scheduler configuration (Init(poolSize)) rather than a property of the
+            // machine: the auto size is hw-1, but an app with a persistent audio thread is told to
+            // pass hw-2, and an explicit size may claim up to full hw. Deriving it from the CPU
+            // count is wrong on exactly the machines that were configured deliberately.
+            //
+            // Called from Renderer2D::Initialize, which runs after TaskScheduler::Init -- hence an
+            // explicit Init rather than a constructor, since a member's constructor would run too
+            // early to ask.
+            //
             // One slot per (layer, task) pair -- worst case every layer is active. Empty layers
             // are skipped at dispatch time (see FlushBatchParallel), so unused slots just sit
             // idle; this is a one-time size, not a per-frame cost.
-            FlushTaskContextPool() {
+            void Init(int workerCount) {
+                taskCount = (workerCount > 0) ? workerCount : 1;
                 pool.resize((size_t)taskCount * NUM_LAYERS);
             }
             FlushTaskContext* Acquire() {
@@ -230,9 +242,17 @@ namespace JLib {
         std::vector<Batch> m_Buckets[NUM_LAYERS];
         std::unordered_map<uint64_t, uint32_t> m_MaterialHandles[NUM_LAYERS];
 
-        // Per-worker (fiber) submission buffers. Index by Thread::GetCurrent()->qIndex.
-        // Heap-allocated to avoid stack overflow (2MB+ of vectors).
-        static constexpr int MAX_WORKERS = 64;
+        // Per-submitter buffers, so concurrent Submit() calls never touch the same vectors.
+        // SLOT 0 IS THE NON-WORKER SLOT (main, or any app thread); worker qIndex k uses slot k+1.
+        // Sized workerCount+1 at Initialize from TaskScheduler::GetWorkerCount().
+        //
+        // This replaced a fixed `std::array<..., 64>` indexed by
+        //   (thread && qIndex < 64) ? qIndex : 0
+        // which did not clamp, it ALIASED: main (thread == nullptr) shared slot 0 with worker 0,
+        // and on a pool wider than 64 every worker from 64 up piled onto slot 0 as well. Both are
+        // concurrent writes to the same buckets -- lost or corrupted sprite submissions, no
+        // diagnostic. The scheduler allows up to CpuMask::kMaxCpus (256) workers, so the second
+        // case was reachable hardware, not a hypothetical.
         // Per-frame instance capacity. ONE definition -- the buffer allocation and the overflow check
         // both read this, because when they were two separate 65536 literals with a "must match"
         // comment, nothing enforced that they did.
@@ -248,7 +268,17 @@ namespace JLib {
         // rather than by per-frame CPU upload. This buffer is for SPRITES the game logic controls.
         static constexpr UINT kMaxInstances = 262144;
         bool m_WarnedInstanceOverflow = false;   // one message per run, not per frame
-        std::unique_ptr<std::array<WorkerLocalSubmissionData, MAX_WORKERS>> m_WorkerLocalStorage;
+        // Heap-allocated (2MB+ of vectors) and sized once at Initialize; never resized afterwards,
+        // so a Submit() on any thread can index it without synchronisation.
+        std::unique_ptr<std::vector<WorkerLocalSubmissionData>> m_WorkerLocalStorage;
+
+        // Slot for a submitter that is not a scheduler worker. Always 0; named so the mapping is
+        // stated once rather than inferred from a magic index at each use.
+        static constexpr size_t kNonWorkerSlot = 0;
+        // qIndex k -> slot k+1, non-worker -> kNonWorkerSlot. Defined in the .cpp deliberately: an
+        // inline body would need <Thread.h> here, and that would put the scheduler in the include
+        // graph of everything that pulls in this public header.
+        size_t SubmitSlotForCurrentThread() const;
 
         static inline const uint32_t indices[] = { 0, 1, 2, 1, 3, 2 };
         Microsoft::WRL::ComPtr<ID3D12Resource> m_IndexBuffer;

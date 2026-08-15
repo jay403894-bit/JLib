@@ -42,7 +42,7 @@
 #include <cstdio>
 #include <cassert>   // globals-lifecycle misuse: fires in debug, compiled out by NDEBUG in release
 #include <vector>
-#include <thread>            // hardware_concurrency (GetMaxConcurrency)
+#include <thread>            // (no longer used: GetMaxConcurrency now asks the scheduler)
 #include <TaskScheduler.h>   // JLib::TaskScheduler -- run Jolt's jobs on the fiber work-stealing pool
 
 JPH_SUPPRESS_WARNINGS
@@ -133,8 +133,22 @@ public:
     explicit SchedulerJobSystem(uint inMaxBarriers) : JobSystemWithBarrier(inMaxBarriers) {}
 
     virtual int GetMaxConcurrency() const override {
-        unsigned hw = std::thread::hardware_concurrency();
-        return (int)(hw > 1 ? hw : 1);   // ~ the pool's worker count; Jolt uses it to size how it splits work
+        // Jolt uses this to decide how finely to split work, so it must be the pool's ACTUAL worker
+        // count. This used to return hardware_concurrency() against a pool of hw-1, which
+        // over-split by one worker's worth every time -- by two on an app that passed hw-2 for a
+        // persistent audio thread. The comment already claimed to be "the pool's worker count"; it
+        // just had no way to ask before GetWorkerCount() existed.
+        // IsInitialized() first, deliberately. The class already requires TaskScheduler::Init() to
+        // have run (QueueJob cannot work without it), but this is a VIRTUAL Jolt calls on its own
+        // schedule, and Instance() THROWS when the pool is absent -- the previous
+        // hardware_concurrency() version could not fail. Throwing out through a Jolt virtual, in a
+        // build where Jolt may have exceptions disabled, turns a clear precondition violation into a
+        // terminate with no message. Degrade to 1 instead: serial, obviously wrong in a profile,
+        // and diagnosable.
+        const int workers = JLib::TaskScheduler::IsInitialized()
+            ? (int)JLib::TaskScheduler::Instance().GetWorkerCount()
+            : 0;
+        return workers > 0 ? workers : 1;
     }
 
     virtual JobHandle CreateJob(const char* inName, ColorArg inColor, const JobFunction& inJobFunction,

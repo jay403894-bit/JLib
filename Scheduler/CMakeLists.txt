@@ -28,13 +28,22 @@ cmake_minimum_required(VERSION 3.21)
 # than waiting for release day. The number's job is to tell two trees apart, and it cannot do that
 # while a modified tree still reports the last tag. CMake's project() rejects a "-dev" suffix, so
 # there is no pre-release form to hide behind: a tree ahead of a tag simply carries the next number.
-set(JLIBSCHED_VERSION "1.2.4")
+set(JLIBSCHED_VERSION "1.3.3")
 
 # Steal-path instrumentation. OFF by design: the counters live in the steal loop, which is precisely
 # where contention is being investigated, so leaving them in a shipping build would tax the thing
 # they exist to measure. Turn on only for an experiment, and do not compare its numbers against a
 # normal build's.
 option(JLIBSCHED_STEAL_STATS "Count steal probes and hits (diagnostic; perturbs the steal path)" OFF)
+
+# AArch64 spin hint. Default is isb, which is NOT the architectural analogue of x86 PAUSE -- that is
+# YIELD, and YIELD retires as a NOP on non-SMT cores, which is nearly all of them, so it gives a spin
+# loop no backoff at all. ISB flushes the pipeline and therefore costs real cycles. Measured on an
+# Android AArch64 device: throughput/mp 3.43 -> 5.15 M tasks/sec, ~50%, reproduced in both run orders
+# on a cool device. Set to yield to restore the old behaviour, or nop for a fixed sled.
+# Ignored on x86-64, which always uses PAUSE.
+set(JLIBSCHED_ARM_SPIN_HINT "isb" CACHE STRING "AArch64 spin hint: isb, yield or nop")
+set_property(CACHE JLIBSCHED_ARM_SPIN_HINT PROPERTY STRINGS yield isb nop)
 
 set(JLIBSCHED_STANDALONE OFF)
 if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
@@ -200,6 +209,14 @@ endforeach()
 if(WIN32)
     file(GLOB JLIBSCHED_PLAT CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/src/win32/*.cpp")
     set(JLIBSCHED_ASM "${CMAKE_CURRENT_SOURCE_DIR}/src/win32/ContextSwitch.asm")
+    # Pin the language explicitly rather than letting CMake infer it from the .asm extension.
+    # Inference works right up until something ELSE in the same build tree enables the generic ASM
+    # language -- a third-party add_subdirectory is enough -- at which point .asm becomes ambiguous,
+    # CMake stops routing this file through MASM, and the whole library links with ContextSwitch and
+    # FiberTrampoline undefined. Found when the marl comparison target was added: it broke every
+    # other target in that tree, not just its own, and the error names our symbols rather than
+    # anything to do with marl.
+    set_source_files_properties("${JLIBSCHED_ASM}" PROPERTIES LANGUAGE ASM_MASM)
 else()
     # OS layer: src/posix/ (Linux, Android) or src/darwin/ (macOS). They diverge wholesale --
     # sysfs text versus sysctl, and macOS has no thread-affinity API at all -- so they are separate
@@ -241,6 +258,18 @@ add_library(JLib::Scheduler ALIAS Scheduler)
 if(JLIBSCHED_STEAL_STATS)
     target_compile_definitions(Scheduler PUBLIC JLIBSCHED_STEAL_STATS=1)
     message(STATUS "JLib::Scheduler: steal-path instrumentation ON (diagnostic build, not for perf numbers)")
+endif()
+
+# PUBLIC because CpuRelax() is inline in a header -- every translation unit that spins must agree,
+# or the library and its caller compile different spin loops and the measurement is meaningless.
+if(JLIBSCHED_ARM_SPIN_HINT STREQUAL "yield")
+    target_compile_definitions(Scheduler PUBLIC JLIB_SPIN_HINT_YIELD=1)
+    message(STATUS "JLib::Scheduler: AArch64 spin hint = yield (measured ~50%% slower on the contended path than the isb default)")
+elseif(JLIBSCHED_ARM_SPIN_HINT STREQUAL "nop")
+    target_compile_definitions(Scheduler PUBLIC JLIB_SPIN_HINT_NOP=1)
+    message(STATUS "JLib::Scheduler: AArch64 spin hint = nop sled (control; default is yield)")
+elseif(NOT JLIBSCHED_ARM_SPIN_HINT STREQUAL "isb")
+    message(FATAL_ERROR "JLIBSCHED_ARM_SPIN_HINT must be isb, yield or nop (got: ${JLIBSCHED_ARM_SPIN_HINT})")
 endif()
 
 target_include_directories(Scheduler PUBLIC
@@ -292,6 +321,10 @@ target_compile_features(SchedulerTopologyTest PRIVATE cxx_std_17)
 # The fiber-aware locks. Least-tested code in the library and the most recently changed, including a
 # regression test for the 1.2.3 self-deadlock. Every blocking case runs under a watchdog, so a
 # regression fails in seconds instead of hanging CI for the whole job timeout.
+# Third-party comparison harness. Adds nothing unless -DJLIBSCHED_ENKITS_DIR is passed, so a normal
+# build and CI never see it -- see bench/compare/CMakeLists.txt for why it is opt-in.
+add_subdirectory("${CMAKE_CURRENT_SOURCE_DIR}/bench/compare")
+
 add_executable(SchedulerPrimitivesTest "${CMAKE_CURRENT_SOURCE_DIR}/tests/primitives_test.cpp")
 target_link_libraries(SchedulerPrimitivesTest PRIVATE Scheduler)
 target_compile_features(SchedulerPrimitivesTest PRIVATE cxx_std_17)

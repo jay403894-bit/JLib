@@ -63,7 +63,11 @@ static void InstallCrashHandler()
 	// SA_ONSTACK with an alternate stack is REQUIRED, not optional: if this fault turns out to be a
 	// fiber stack overflow hitting the arena's guard page, there is no usable stack left to run a
 	// handler on, and without this the handler would itself fault and we would learn nothing.
-	static char altStack[SIGSTKSZ * 4];
+	// Was SIGSTKSZ*4. glibc 2.34 redefined SIGSTKSZ as a sysconf() call, so it is no longer a
+	// constant expression and that line stopped compiling on every current distro -- which is
+	// unfortunate for a file whose whole job is to be the AArch64 repro. The historical SIGSTKSZ is
+	// 8-16 KiB, so a fixed 64 KiB is the same order and comfortably above MINSIGSTKSZ anywhere.
+	static char altStack[64 * 1024];
 	stack_t ss{};
 	ss.ss_sp = altStack;
 	ss.ss_size = sizeof(altStack);
@@ -117,7 +121,7 @@ int main() {
 
             child->waitGroup = &inner;
             inner.n.fetch_add(1, std::memory_order_relaxed);
-            sched.PushFork(child);
+            sched.Push(child);
             printf("  [stage 2: outer suspending in WaitFor]\n"); fflush(stdout);
             sched.WaitFor(inner);                 // <-- suspends THIS fiber
             printf("  [stage 2: outer resumed]\n"); fflush(stdout);

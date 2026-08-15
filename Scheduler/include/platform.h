@@ -183,8 +183,48 @@ inline void CpuRelax() {
     // unreachable, since CMake refuses Windows on ARM64 (that needs a third context switch), but
     // this file should not be the thing that breaks if anyone ever does the port by hand.
     __yield();
-#else
+#elif defined(JLIB_SPIN_HINT_YIELD)
+    // The architectural analogue of x86 PAUSE, and the old default. It is a hint for SMT
+    // implementations to favour the sibling thread -- and almost no AArch64 core is SMT, so on most
+    // of them it RETIRES AS A NOP and the spin loop backs off not at all. Kept selectable because it
+    // is never wrong and a future SMT AArch64 part would want it.
     __asm__ __volatile__("yield" ::: "memory");
+#elif defined(JLIB_SPIN_HINT_NOP)
+    // Crude but predictable: a fixed sled with no architectural meaning beyond burning issue slots.
+    // Here as the control -- if isb beats yield it should also beat this, and if it does not then
+    // what was measured is delay rather than anything specific to isb.
+    __asm__ __volatile__("nop; nop; nop; nop; nop; nop; nop; nop" ::: "memory");
+#else
+    // DEFAULT on AArch64, and it is deliberately NOT the architectural "pause" analogue.
+    //
+    // ISB is an Instruction Synchronization Barrier -- it flushes the pipeline, which is exactly why
+    // it works here: it costs real cycles (tens, varying by implementation), so a spin loop actually
+    // backs off. YIELD, the obvious choice, is a hint for SMT implementations to favour the sibling
+    // thread, and almost no AArch64 core is SMT -- on most it retires as a NOP, so every spin loop
+    // in this scheduler backed off not at all on ARM.
+    //
+    // MEASURED, not assumed, on an Android AArch64 device: throughput/mp (four producers, the most
+    // contended row in the bench) went 3.43 -> 5.15 M tasks/sec, about 50%. Reproduced with the two
+    // builds run in BOTH orders on a cool device, because running the candidate first on a phone and
+    // the control second is exactly how thermal throttling manufactures a result like this.
+    //
+    // Build with -DJLIBSCHED_ARM_SPIN_HINT=yield to go back, or =nop for a fixed sled.
+    // SchedulerBench stamps the hint into its banner.
+    __asm__ __volatile__("isb" ::: "memory");
+#endif
+}
+
+// Which spin hint this build compiled in, for the benchmark banner. A spin-hint experiment is
+// exactly the kind whose results get pasted without saying which variant produced them.
+inline const char* SpinHintName() {
+#if JLIB_ARCH_X86_64
+    return "pause";
+#elif defined(JLIB_SPIN_HINT_ISB)
+    return "isb";
+#elif defined(JLIB_SPIN_HINT_NOP)
+    return "nop8";
+#else
+    return "yield";
 #endif
 }
 

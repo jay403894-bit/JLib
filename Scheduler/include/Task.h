@@ -70,11 +70,25 @@ namespace JLib {
         // (Named fastJob until 1.0. "noFiber" states what is checkable -- whether a fiber exists --
         // rather than advertising a benefit, and it puts the constraint in view at the call site.)
         uint8_t noFiber = 0;
-        uint8_t isForked = 0;  // Set by PushFork, cleared when task completes
         uint8_t priorityBoost = 0;  // Original priority before boost (0 = no boost, otherwise original hiPri)
         // P/E-core placement hint (see CorePref above). Lives in what was tail PADDING -- FiberSize is
         // uint8_t, so the byte block ends at offset 53 with 11 spare bytes under the 64-byte assert.
         CorePref corePref = CorePref::Default;
+
+        // Set when this task's destructor provably has nothing to do, letting the completion path
+        // skip `t->~Task()` -- a virtual call through the vtable on every single task.
+        //
+        // The vptr cannot go (see the note above: it is what runs ~LambdaTask and any captured
+        // objects' destructors), but the CALL can, whenever the concrete type has no captures to
+        // destroy: the (fn, data) overload builds a plain Task with an empty ~Task, and the lambda
+        // overload builds a LambdaTask<F> whose only member is F, so it is a no-op exactly when F
+        // is trivially destructible.
+        //
+        // DEFAULT IS 0 -- "not known to be trivial" -- on purpose. Tasks built anywhere other than
+        // CreateTask (the MPSC queues' stub_, TaskDAG's nodes) never set it and keep paying the
+        // call, which costs those cold paths nothing and means a missed set can only ever be slow,
+        // never wrong. The inverse default would make an oversight leak captures silently.
+        uint8_t trivialDtor = 0;
 
         // Intrusive link for Event's waiter stack, living in the same tail padding -- the byte
         // block above ends well short of 64, so this costs nothing and the one-cache-line assert
@@ -121,6 +135,13 @@ namespace JLib {
             fn(data);
         }
     };
+
+    // Completion-path destructor, skipping the virtual call when the task provably has nothing to
+    // destroy (see Task::trivialDtor). Every site that finishes a task goes through here so the
+    // rule lives in one place rather than being re-derived at each of them.
+    inline void DestroyTask(Task* t) noexcept {
+        if (!t->trivialDtor) t->~Task();
+    }
     // One cache line, exactly -- if this fires, a new field pushed Task over 64 bytes and every
     // per-task access just started paying a second line. Grow deliberately or shrink elsewhere.
     static_assert(sizeof(Task) == 64, "Task must stay exactly one 64-byte cache line");
@@ -130,9 +151,26 @@ namespace JLib {
         F func;
     public:
         static_assert(sizeof(F) <= (256 - sizeof(Task)), "LambdaTask exceeds 256-byte slab capacity");
+        // NOTE: F here is the CLASS template parameter, which CreateTask has already run through
+        // std::decay_t. So this is a plain rvalue reference, NOT a forwarding reference, and it
+        // accepts temporaries only. That is why a NAMED callable used to fail to compile:
+        //     auto body = [&]{ ... };
+        //     sched.CreateTask(body, ...);      // F deduced as lambda&, could not bind here
+        // which is a perfectly reasonable thing to write, especially when the same body is also
+        // handed to a std::thread. The const& overload below fixes it by copying.
         LambdaTask(F&& f)
             : Task(LambdaTask::ExecuteWrapper, nullptr),
-            func(std::forward<F>(f))
+            func(std::move(f))
+        {
+            this->data = this;
+        }
+
+        // Lvalue overload: copies the callable. No ambiguity with the one above -- an rvalue prefers
+        // F&&, an lvalue can only bind here -- and no API change, since CreateTask's own signature is
+        // untouched and callers that pass a temporary still move exactly as before.
+        LambdaTask(const F& f)
+            : Task(LambdaTask::ExecuteWrapper, nullptr),
+            func(f)
         {
             this->data = this;
         }

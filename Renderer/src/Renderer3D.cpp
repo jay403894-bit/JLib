@@ -10,7 +10,7 @@
 #include <cstdint>
 #include <Thread.h>                // scheduler (worker command-list recording)
 #include <TaskScheduler.h>         // JLib::TaskScheduler::Instance()/CreateTask/WaitFor
-#include <thread>                  // hardware_concurrency
+#include <thread>                  // (no longer used: worker count now comes from the scheduler)
 #include <algorithm>               // std::min/std::max
 #include <cstdio>                  // sprintf_s (device-hung binding diagnostics)
 #include <DirectXTex.h>            // LoadFromHDRFile -- the IBL environment bake decodes the HDRI here
@@ -187,11 +187,15 @@ void Renderer3D::Initialize(RendererCore& core) {
         m_ParticleList[i]->SetName(L"3D particle pass");
     }
 
-    // One worker context per scheduler thread (hw-1, leaving a core for the main thread) -- each has its
-    // own per-frame allocators AND per-frame lists, so tasks record concurrently AND no list is ever
-    // Reset while a prior frame's copy is still executing on the GPU.
-    unsigned hw = std::thread::hardware_concurrency();
-    int taskCount = (hw > 1) ? (int)(hw - 1) : 1;
+    // One worker context per scheduler thread -- each has its own per-frame allocators AND per-frame
+    // lists, so tasks record concurrently AND no list is ever Reset while a prior frame's copy is
+    // still executing on the GPU.
+    //
+    // Asked of the scheduler rather than derived from hardware_concurrency()-1. That derivation was
+    // right only for the AUTO pool size: Init(poolSize) takes an explicit count, and an app with a
+    // persistent audio thread is told to pass hw-2, which would have left a worker context short.
+    int taskCount = (int)JLib::TaskScheduler::Instance().GetWorkerCount();
+    if (taskCount < 1) taskCount = 1;
     m_Workers.resize(taskCount);
     for (auto& wkr : m_Workers) {
         for (int i = 0; i < RendererCore::NumFrames; ++i) {

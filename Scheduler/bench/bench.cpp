@@ -28,6 +28,7 @@
 #include <TaskScheduler.h>
 #include <TaskDAG.h>
 #include <Thread.h>    // StealStatsRead/Reset -- no-ops unless built with JLIBSCHED_STEAL_STATS
+#include <platform.h>  // SpinHintName -- stamped into the banner, see CpuRelax
 #include <chrono>
 #include <cstdio>
 
@@ -89,6 +90,8 @@ static void StartSectionWatchdog(int perSectionSeconds) {
                 printf("\n*** WATCHDOG: section '%s' exceeded %ds -- treating as a HANG.\n",
                        last, perSectionSeconds);
                 printf("*** This is the scheduler failing to drain, not a slow machine.\n");
+                if (JLib::TaskScheduler::IsInitialized())
+                    JLib::TaskScheduler::Instance().DumpPoolState(last);
                 fflush(stdout);
                 std::_Exit(1);
             }
@@ -596,6 +599,14 @@ int main(int argc, char** argv) {
             // the default and silently run the whole suite, so asking for help started a multi-
             // minute benchmark under a policy you did not choose.
             printf("usage: SchedulerBench [ideal|hard|none|physical] [poolSize] [nosweep]\n"
+                   "                     [sleep|nosleep|both]\n"
+                   "  sleep     (default) idle workers park on a condition variable.\n"
+                   "  nosleep   never park. Holds every worker core; lowest dispatch latency.\n"
+                   "            Measured 4.1x on latency, 2.9x on the frame DAG, 3.1x on fork-join.\n"
+                   "  both      run the whole suite once per policy, for a side-by-side paste.\n"
+                   "            Re-runs this binary twice: the scheduler is a one-shot singleton,\n"
+                   "            so one process cannot host both policies. Each therefore gets a\n"
+                   "            genuinely cold pool rather than inheriting the other's state.\n"
                    "  ideal     (default, and the library's default) Windows: SetThreadIdealProcessor.\n"
                    "            Linux: bind to the whole LLC domain\n"
                    "  hard      bind each worker to one logical CPU. Measured ~45%% worse on wake\n"
@@ -620,12 +631,54 @@ int main(int argc, char** argv) {
 
     size_t poolSize = 0;                 // 0 = auto (hw-1)
     bool   runSweep = true;
+    // Idle policy is a trailing token so existing invocations keep working unchanged.
+    auto   idle = JLib::TaskScheduler::IdlePolicy::Sleep;
+    const char* idleName = "sleep";
+    bool   runBoth = false;
     for (int a = 2; a < argc; ++a) {
         if (JLIB_STRICMP(argv[a], "nosweep") == 0) { runSweep = false; continue; }
+        if (JLIB_STRICMP(argv[a], "sleep") == 0) { continue; }
+        if (JLIB_STRICMP(argv[a], "nosleep") == 0)      { idle = JLib::TaskScheduler::IdlePolicy::NoSleep;       idleName = "nosleep";   continue; }
+        if (JLIB_STRICMP(argv[a], "both") == 0) { runBoth = true; continue; }
         poolSize = (size_t)strtoul(argv[a], nullptr, 10);
     }
 
+    // "both" runs the suite once per idle policy so the two are directly comparable in one paste.
+    //
+    // It RE-RUNS THIS BINARY rather than looping in-process, and that is forced rather than lazy:
+    // TaskScheduler::Init throws if an instance already exists and nothing ever clears it, so a
+    // process hosts exactly one scheduler for its lifetime. Making that resettable to serve a
+    // benchmark convenience would mean tearing down worker threads, the fiber pool and the epoch
+    // manager's retired lists and trusting all of it to come back clean -- a real lifecycle change
+    // with real risk, for a dev tool. Two processes cost a few seconds and cannot be subtly wrong.
+    //
+    // A side benefit worth having: each policy gets a genuinely cold pool, so neither inherits the
+    // other's cache or clock state.
+    if (runBoth) {
+        std::string self = argv[0];
+        int rc = 0;
+        for (const char* pol : { "sleep", "nosleep" }) {
+            std::string cmd = "\"" + self + "\"";
+            for (int a = 1; a < argc; ++a) {
+                if (JLIB_STRICMP(argv[a], "both") == 0) continue;   // don't recurse
+                cmd += " "; cmd += argv[a];
+            }
+            cmd += " "; cmd += pol;
+#if defined(_WIN32)
+            // cmd.exe strips the outermost quote pair, so a path containing spaces needs the WHOLE
+            // command wrapped again or it splits at the first space and runs the wrong thing.
+            cmd = "\"" + cmd + "\"";
+#endif
+            printf("\n########## idle policy: %s ##########\n", pol);
+            fflush(stdout);
+            const int r = std::system(cmd.c_str());
+            if (r != 0) rc = r;
+        }
+        return rc;
+    }
+
     JLib::TaskScheduler::SetAffinityPolicy(policy);
+    JLib::TaskScheduler::SetIdlePolicy(idle);
 
     // The version is stamped here on purpose. Results get pasted into issues and threads, and the
     // suite changes: the ParallelFor case was split in two, the default affinity policy moved from
@@ -635,10 +688,11 @@ int main(int argc, char** argv) {
 #ifndef JLIBSCHED_VERSION
 #define JLIBSCHED_VERSION "unknown"   // hand-built outside CMake
 #endif
-    printf("JLib::Scheduler %s bench  (sizeof(Task)=%zu, hw threads=%u, affinity=%s, pool=%s)\n",
+    printf("JLib::Scheduler %s bench  (sizeof(Task)=%zu, hw threads=%u, affinity=%s, idle=%s, pool=%s, spin=%s)\n",
         JLIBSCHED_VERSION,
-        sizeof(JLib::Task), std::thread::hardware_concurrency(), policyName,
-        poolSize ? std::to_string(poolSize).c_str() : "auto");
+        sizeof(JLib::Task), std::thread::hardware_concurrency(), policyName, idleName,
+        poolSize ? std::to_string(poolSize).c_str() : "auto",
+        JLib::platform::SpinHintName());
     printf("----------------------------------------------------------------\n");
 
     // 180s per section. Generous on purpose: the crossover sweep is legitimately the slowest part
@@ -720,16 +774,19 @@ static void RecursiveForkJoinImpl(JLib::TaskScheduler& sched, int start, int end
     right->waitGroup = &wg;
     wg.n.fetch_add(2, std::memory_order_relaxed);
 
-    if (!sched.PushFork(left)) {
+    // Push. This used PushFork until 1.3.4, which put both children on the CALLING worker and left
+    // stealing as the only way a 128-leaf tree could spread: 0.32 ms against 0.25 ms here, and up
+    // to 4.6x slower on smaller trees. That measurement is what retired PushFork.
+    if (!sched.Push(left)) {
         fj_failed.fetch_add(1);
-        printf("ERROR: PushFork(left) failed\n");
+        printf("ERROR: Push(left) failed\n");
     } else {
         fj_pushed.fetch_add(1);
     }
 
-    if (!sched.PushFork(right)) {
+    if (!sched.Push(right)) {
         fj_failed.fetch_add(1);
-        printf("ERROR: PushFork(right) failed\n");
+        printf("ERROR: Push(right) failed\n");
     } else {
         fj_pushed.fetch_add(1);
     }
@@ -771,7 +828,7 @@ static void BenchRecursiveForkJoin(JLib::TaskScheduler& sched) {
 
         task->waitGroup = &wg;
         wg.n.fetch_add(1, std::memory_order_relaxed);
-        sched.Push(task);  // Use Push (load-balanced), not PushFork (main thread)
+        sched.Push(task);  // load-balanced; submitted from the main thread
         sched.WaitFor(wg);
 
         double ms = MsBetween(t0, Clock::now());
