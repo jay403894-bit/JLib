@@ -1,15 +1,13 @@
 # JLib::Scheduler
-
-A fiber-based, work-stealing task scheduler for real-time engines. Hand-written context switching,
-lock-free Chase-Lev deques, a slab-allocated task system, frame DAGs with logic gates, and
-hybrid-core aware placement.
-
-Windows x64 (MSVC) · Linux x86-64 · Linux/Android AArch64 · macOS Apple Silicon · C++17 · BSD
-
 [![CI](https://github.com/jay403894-bit/JLib-Scheduler/actions/workflows/ci.yml/badge.svg)](https://github.com/jay403894-bit/JLib-Scheduler/actions/workflows/ci.yml)
 
-I built this scheduler to solve the problem of scheduling for my custom 2d/3d engine  -- it was built to be the backbone of multithreaded simulation engines.
-I needed tasks that could wait on a gpu fence without parking a worker thread, enkiTS and taskflow cannot do this, marl can but was archived in April.
+a hybrid runtime for C++17+ that gives you:
+
+Cilk‑style work‑stealing for fast parallel loops (PushArray, ParallelFor),
+TaskFlow‑style dependency graphs (TaskDAG) with AND/OR gates,
+Middleware‑safe threads by default (no TLS surprises),
+Fiber‑based blocking only when you actually suspend — so you never pay fiber overhead unless you need it.
+Built for real‑time engines that mix compute‑heavy loops, dependency‑aware pipelines, and I/O‑bound middleware in the same frame.
 
 **Maturity.** Test it in your own project before you depend on it. Run your workload, run your
 tests, and if it holds up, use it. What it should not be is dropped into a commercial project
@@ -19,7 +17,17 @@ Bugs do get fixed: four defects were found and released inside a day in 1.3.x, t
 hang a pool. But that was a day off. This is one person with a full-time job, so read it as evidence
 that reports get acted on -- not as a response time. During a work week the same four fixes would
 have taken weeks, and a report may sit for a while before anyone looks at it. Nothing here is
-staffed.
+staffed. Hand-written context switching,
+lock-free Chase-Lev deques, a slab-allocated task system, frame DAGs with logic gates, and
+hybrid-core aware placement.
+
+Windows x64 & ARM64 (MSVC) · Linux x86-64 · Linux/Android AArch64 · macOS Apple Silicon · C++17 · BSD
+
+
+I built this scheduler to solve the problem of scheduling for my custom 2d/3d engine  -- it was built to be the backbone of multithreaded simulation engines.
+I needed tasks that could wait on a gpu fence without parking a worker thread, enkiTS and taskflow cannot do this, marl can but was archived in April.
+
+
 
 ---
 ## How it compares
@@ -70,11 +78,19 @@ predicted before measuring to be frequency scaling rather than wake latency -- 1
 once settle toward base clock on a chip at Intel spec power limits, where one task alone boosts. It
 stayed flat while everything else moved 3-6x.
 
-The default stays `Sleep` and should, for a library: spinning workers are a battery and thermal
-problem on Android, they starve whatever else the host process runs, and they make the
-oversubscription policy incoherent. `NoSleep` is for an application that owns the machine, which a
-fullscreen game does. There is deliberately no middle setting -- a spin-then-park mode was built,
-measured worse than both extremes, and removed; the reasoning is in [CHANGELOG.md](CHANGELOG.md).
+The default stays `Sleep`. Spinning workers are a battery and thermal problem on Android, they starve
+whatever else the host process runs, and they make the oversubscription policy incoherent.
+
+**A fullscreen game is NOT the case for `NoSleep`,** despite the table above -- an earlier version of
+this README said it was, and measurement says otherwise. The benchmarks flatter `NoSleep` because in
+a scheduler benchmark the pool *is* the workload: there is no render or audio thread for the spinning
+to tax, so only the wake saving shows up. Measured with an idle pool against a memory-bound main
+thread, `NoSleep` costs ~3.5% to every other thread in the process; measured inside a real 2D game it
+cost **23%**. `NoSleep` is for batch and offline work where the task graph is the entire program, or
+for pipelines whose idle gaps are under ~100 µs.
+
+There is deliberately no middle setting -- a spin-then-park mode was built, measured worse than both
+extremes, and removed; the reasoning is in [CHANGELOG.md](CHANGELOG.md).
 
 Structural properties, which do not vary by policy:
 
