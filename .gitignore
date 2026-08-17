@@ -32,6 +32,19 @@ x64/
 Win32/
 [Aa][Rr][Mm]64/
 
+# ...but those patterns are UNANCHORED and git's ignore matching is CASE-INSENSITIVE on Windows, so
+# `Win32/` above also matches the SOURCE directories src/win32/ and tests/win32/. That failure is
+# silent and nasty: Scheduler/src/win32/ContextSwitch.asm only survives because it was tracked
+# before the rule existed, and a NEW file added there is invisible to `git add -A` -- which is
+# exactly what happened while syncing the Windows-on-ARM64 port (2026-08-17). The library would then
+# be pushed referencing a context switch that is not in the repository.
+# Re-include the directories themselves, not just their contents: git cannot re-include a file whose
+# parent directory is excluded.
+# Note `[Aa][Rr][Mm]64/` has the same hazard for any future src/arm64/ -- the AArch64 directories
+# are named "aarch64", which is the only reason they are not caught too.
+!Scheduler/src/win32/
+!Scheduler/tests/win32/
+
 # MSBuild incremental-build bookkeeping and linker leftovers.
 *.tlog
 *.ilk
