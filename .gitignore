@@ -38,12 +38,22 @@ Win32/
 # before the rule existed, and a NEW file added there is invisible to `git add -A` -- which is
 # exactly what happened while syncing the Windows-on-ARM64 port (2026-08-17). The library would then
 # be pushed referencing a context switch that is not in the repository.
-# Re-include the directories themselves, not just their contents: git cannot re-include a file whose
-# parent directory is excluded.
-# Note `[Aa][Rr][Mm]64/` has the same hazard for any future src/arm64/ -- the AArch64 directories
-# are named "aarch64", which is the only reason they are not caught too.
-!Scheduler/src/win32/
-!Scheduler/tests/win32/
+# Fixed GENERALLY rather than one directory at a time, because the hazard is not specific to win32:
+# `[Aa][Rr][Mm]64/` would swallow a future src/arm64/ exactly the same way, and the only reason it
+# does not today is that the AArch64 source directories happen to be named "aarch64". Naming a
+# directory after a platform is a completely reasonable thing for the next person to do.
+#
+# No source tree ever contains build output, so re-include src/ and tests/ wholesale. The
+# directories themselves have to be re-included, not just their contents -- git cannot re-include a
+# file whose parent directory is excluded, which is why `!*/src/**` alone would not be enough.
+#
+# ORDER IS LOAD-BEARING. These sit BEFORE the artifact patterns below (*.tlog, *.pdb, *.iobj), so if
+# anyone ever builds in-tree, those later patterns still win for the artifacts themselves -- last
+# matching pattern decides. Do not move this block down.
+!*/src/
+!*/src/**
+!*/tests/
+!*/tests/**
 
 # MSBuild incremental-build bookkeeping and linker leftovers.
 *.tlog
