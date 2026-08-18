@@ -3,7 +3,7 @@
 Correctness fixes are marked **[CRITICAL]** with a note on what breaks without them -
 downstream users (forks/ports) should treat those as must-pull.
 
-## 1.4.0 - unreleased
+## 1.4.0 - 2026-08-18
 
 **`ParallelFor` NO LONGER PROBES. It is now demand-driven, and the probe is gone rather than
 demoted.** This is the headline change of 1.4 and it is a behaviour change to the primary API.
@@ -165,6 +165,60 @@ payload's spare bits are new. Re-verified with GenMC after the change and all th
 reproduce exactly: no errors and 174 complete executions on both the `acq_rel` and the paper's
 `seq_cst` steal CAS, and the permanent `-DNO_POP_FENCE` negative control still produces a safety
 violation. The TSan probe went from 4 reports to **0**.
+
+**[CRITICAL] The stale-library guard could not see this release's own ABI break, and a partial
+rebuild crashed at `0x0000000000100000`.** Anyone who upgrades to 1.4 without a *full* rebuild of
+every translation unit that includes `TaskScheduler.h` hits this, so it is a must-pull for
+downstream forks.
+
+1.4 added `nonWorkerLane` and `nonWorkerLaneClaimed` and made `consecutiveHiPriSteals`
+`thread_local`. Those moved `taskAllocator` from offset **304 to 312** -- while
+`sizeof(TaskScheduler)` stayed at exactly **1664**, because the new members landed in padding that
+already existed. `sizeof(Task)`, `sizeof(TaskAllocator)` and `sizeof(EpochManager)` did not move
+either, and those four sizes were the whole signature. The guard therefore *matched* across a real
+ABI break and reported success.
+
+What that produced was not a corrupt heap. It was a correctly-formed read of the wrong member:
+`CreateTask` is header-inline, so a TU compiled against the new headers reached +312 into an object
+laid out for +304, landed on `TaskAllocator::memSlots` instead of `mem`, and dereferenced its value.
+`memSlots` is `1024*1024`, so the access violation read address `0x0000000000100000` -- a number
+that reads like a wild pointer and is really a slot count. It surfaced inside the allocator, several
+subsystems away from anything that had changed, and free-list instrumentation found nothing because
+the bad pointer never went through the free list.
+
+Two fixes, and the second was a bug in the first attempt at the first:
+
+- The signature now includes **offsets**, not just sizes. `TaskScheduler::abiCanary` is a public
+  one-byte member sitting immediately after `taskAllocator`; its `offsetof` moves whenever anything
+  above it is added, removed, resized or reordered. Sizes remain for the types inline code allocates
+  or copies whole.
+- The signature and the check that consumes it now have **internal linkage**. They were written
+  first as an `inline` function and an `inline const bool`, which have *external* linkage -- so the
+  linker folds the library's copy and the application's copy into one, both sides evaluate the same
+  body, and the comparison is a value against itself. Measured: with the library built at offset 296
+  and the application at 312, the folded guard compared equal and let the program run into the
+  corruption. Per-TU copies are the mechanism, not an oversight.
+
+The report also had to change, because the first version of it was useless in the place it fires.
+It printed two hashed 64-bit numbers to `stderr`, and a GUI-subsystem process has no console -- so
+the entire diagnostic was "Fatal program exit requested" at `__scrt_common_main_seh`. It now carries
+the components field by field and names the ones that disagree:
+
+```
+[JLib::Scheduler] FATAL: this translation unit was compiled against DIFFERENT
+Scheduler headers than the Scheduler library it is linked to.
+  Fields that disagree (library vs this TU):
+    offsetof(TaskScheduler,abiCanary)    408 vs 424
+```
+
+and it goes to `OutputDebugStringA` as well as `stderr`, so it lands in the debugger's Output
+window. The message says to rebuild **every** library that includes `TaskScheduler.h`, because that
+is the case that actually bit: `Sound`, `Renderer`, `Physics3D`, `Assets` and `PlatformerPhysics2D`
+each carry their own inlined copy of `CreateTask`, so a stale one of those reaches the wrong offset
+in a perfectly good scheduler object. Rebuilding only the Scheduler does not fix it.
+
+Verified both ways: a deliberately shifted header now aborts naming the field, and a matched pair
+still runs clean. A guard that reports success is worse than no guard, which is what this was.
 
 **[CRITICAL] `~TaskMPSCQueue` corrupted the heap.** It ended with `::delete stub_`, but `init()`
 allocates `stub_` from the TaskAllocator slab -- and the `::` forces the *global* deallocation

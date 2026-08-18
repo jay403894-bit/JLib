@@ -577,6 +577,7 @@ namespace JLib {
 		void Resume();
 		void Stop(Task* worker_task);
 		TaskAllocator* GetAllocator();
+
 		// WaitAll() was REMOVED in 1.3.0. It spun on a global `pendingTasks` atomic that every push
 		// and every completion had to maintain -- 24 ns per task in contention, 27% of the whole
 		// per-task cost, to serve one method with no callers anywhere. Wait on a WaitGroup instead,
@@ -816,6 +817,26 @@ namespace JLib {
 		// 1M tasks. Eager unless SetLazyTaskSlab(true) was called before Init -- see that setter for
 		// why the default is the expensive one.
 		TaskAllocator taskAllocator{ 1024 * 1024, LazyTaskSlabEnabled() };
+
+	public:
+		// ABI LAYOUT CANARY. Not used by anything at runtime; its OFFSET is the payload.
+		//
+		// It sits immediately after taskAllocator, so it moves whenever any member above it is
+		// added, removed, resized or reordered -- which is exactly the change class that the
+		// stale-library guard needs to see and that sizeof() cannot report. 1.4 shifted
+		// taskAllocator by 8 bytes with sizeof(TaskScheduler) pinned at 1664, and the guard matched
+		// straight through it.
+		//
+		// It is PUBLIC so the guard can take offsetof() from a free function with no access to this
+		// class. The alternative -- a member function that reports its own offsets -- cannot work:
+		// it would have external linkage, the linker would fold the copies from the library and the
+		// application into one, and both sides would then read the SAME layout and always agree.
+		// A guard that compares a value against itself is worse than no guard, because it reports
+		// success.
+		struct AbiCanary { char unused; };
+		AbiCanary abiCanary{};
+
+	private:
 		std::unordered_map<std::string, std::unique_ptr<Event>> eventRegistry;
 		std::mutex registryMtx;
 		EventPool eventPool{ 1024 };   // pooled DirectEvents for WaitOnEventDirectArmed
@@ -973,15 +994,71 @@ namespace JLib {
 	// _ITERATOR_DEBUG_LEVEL is in the signature deliberately: on MSVC it changes std::vector's
 	// layout, so mixing /MDd (level 2) with /MD (level 0) breaks exactly the same way and is the
 	// other half of this failure mode.
-	namespace detail {
-		inline constexpr uint64_t kHeaderAbiSignature =
-			(uint64_t)sizeof(EpochManager) * 1000003ull
-			^ (uint64_t)sizeof(Task) * 10007ull
-			^ (uint64_t)sizeof(TaskAllocator) * 65537ull
-#if defined(_ITERATOR_DEBUG_LEVEL)
-			^ ((uint64_t)_ITERATOR_DEBUG_LEVEL << 48)
+	// Declared here rather than by including <windows.h>, which this header deliberately does not
+	// pull in. The declaration matches the one in winbase.h exactly, so including both is fine.
+#if defined(_WIN32)
+}
+extern "C" __declspec(dllimport) void __stdcall OutputDebugStringA(const char*);
+namespace JLib {
 #endif
-			;
+
+	namespace detail {
+		// WHAT THIS MUST COVER: every type whose LAYOUT a header-inline function depends on.
+		//
+		// Until 1.4 this was sizeof() only, and it did not cover TaskScheduler at all. Both of those
+		// were wrong, and the second hid the first: 1.4 added nonWorkerLane and nonWorkerLaneClaimed
+		// and made consecutiveHiPriSteals thread_local, which moved `taskAllocator` from offset 304
+		// to 312 -- while sizeof(TaskScheduler) stayed at 1664, because the new members landed in
+		// padding that was already there. sizeof(Task), sizeof(TaskAllocator) and
+		// sizeof(EpochManager) did not move either. So the signature MATCHED across a genuine ABI
+		// break, and the guard stayed silent through precisely the failure it exists to catch.
+		//
+		// THE RULE, corrected: sizeof is not a proxy for layout. Anything header-inline code reaches
+		// into contributes an OFFSET (TaskScheduler::abiCanary carries that for the scheduler
+		// itself), not just a size. Sizes stay for the types inline code allocates or copies whole.
+		//
+		// WHY THE ANONYMOUS NAMESPACE, WHICH IS NORMALLY WRONG IN A HEADER: internal linkage is the
+		// entire mechanism. This has to evaluate SEPARATELY in the library's translation unit and in
+		// each application translation unit, because comparing those two evaluations is the test.
+		// An `inline` function -- what this was first written as -- has external linkage, so the
+		// linker folds the copies into one and both sides call the SAME body. Tested: with the
+		// library built at offset 296 and the application at 312, the folded version compared equal
+		// and the program ran into the corruption unchecked. Per-TU copies are the point, not a
+		// smell, and the ODR is satisfied precisely because these are distinct entities.
+		#if defined(__GNUC__) || defined(__clang__)
+		#	pragma GCC diagnostic push
+		#	pragma GCC diagnostic ignored "-Winvalid-offsetof"
+		#endif
+		// Carried FIELD BY FIELD rather than hashed down to one number, because "signature
+		// 4417359680416 != 4417354841872" tells you that something is stale and nothing about what.
+		// Naming the field that moved tells you which header changed, which usually tells you which
+		// library was not rebuilt.
+		struct AbiComponents {
+			uint32_t sizeEpochManager, sizeTask, sizeTaskAllocator, sizeTaskDeque;
+			uint32_t sizeTaskMPSCQueue, sizeWaitGroup, sizeTaskScheduler;
+			uint32_t offsetAbiCanary, iteratorDebugLevel;
+		};
+
+		namespace {
+			inline AbiComponents LocalAbiComponents() {
+				AbiComponents c{};
+				c.sizeEpochManager    = (uint32_t)sizeof(EpochManager);
+				c.sizeTask            = (uint32_t)sizeof(Task);
+				c.sizeTaskAllocator   = (uint32_t)sizeof(TaskAllocator);
+				c.sizeTaskDeque       = (uint32_t)sizeof(TaskDeque);
+				c.sizeTaskMPSCQueue   = (uint32_t)sizeof(TaskMPSCQueue);
+				c.sizeWaitGroup       = (uint32_t)sizeof(WaitGroup);
+				c.sizeTaskScheduler   = (uint32_t)sizeof(TaskScheduler);
+				c.offsetAbiCanary     = (uint32_t)offsetof(TaskScheduler, abiCanary);
+#if defined(_ITERATOR_DEBUG_LEVEL)
+				c.iteratorDebugLevel  = (uint32_t)_ITERATOR_DEBUG_LEVEL;
+#endif
+				return c;
+			}
+		}
+		#if defined(__GNUC__) || defined(__clang__)
+		#	pragma GCC diagnostic pop
+		#endif
 
 		// Defined in TaskScheduler.cpp, so it carries the value as the LIBRARY saw it.
 		//
@@ -992,25 +1069,64 @@ namespace JLib {
 		//     LibraryAbiSignature" tells you nothing; this tells you what to do.
 		//   - The library was rebuilt but from different headers. Then it links, and the runtime
 		//     comparison below fires with a real message.
-		uint64_t JLibScheduler_STALE_LIBRARY_rebuild_the_Scheduler_for_this_configuration();
+		AbiComponents JLibScheduler_STALE_LIBRARY_rebuild_the_Scheduler_for_this_configuration();
 
-		// Runs once per program, in every TU that includes this header. No caller action required --
-		// a guard you have to remember to invoke is a guard that is not there when it matters.
-		inline const bool g_abiChecked = [] {
-			const uint64_t lib = JLibScheduler_STALE_LIBRARY_rebuild_the_Scheduler_for_this_configuration();
-			if (lib != kHeaderAbiSignature) {
-				std::fprintf(stderr,
-					"[JLib::Scheduler] FATAL: the Scheduler library was built against DIFFERENT headers "
-					"than this translation unit (library signature %llu, header signature %llu).\n"
-					"  Rebuild the Scheduler for THIS configuration. Note the library ships Debug, "
-					"Development and Release, and rebuilding only some of them causes exactly this.\n"
-					"  Continuing would corrupt the heap at an unrelated address -- refusing instead.\n",
-					(unsigned long long)lib, (unsigned long long)kHeaderAbiSignature);
-				std::fflush(stderr);
-				std::abort();
+		// Runs once per TRANSLATION UNIT, not once per program -- and that distinction is the whole
+		// guard. This was `inline const bool`, which has external linkage and therefore gets folded
+		// to a single copy, so exactly one TU's view was ever checked and every other TU went
+		// unexamined. Internal linkage means each TU tests ITS OWN layout against the library's.
+		// (See LocalAbiComponents above for the same mistake and the measurement that caught it.)
+		namespace {
+		[[maybe_unused]] const bool g_abiChecked = [] {
+			const AbiComponents lib = JLibScheduler_STALE_LIBRARY_rebuild_the_Scheduler_for_this_configuration();
+			const AbiComponents hdr = LocalAbiComponents();
+
+			char msg[1600];
+			int n = std::snprintf(msg, sizeof msg,
+				"[JLib::Scheduler] FATAL: this translation unit was compiled against DIFFERENT "
+				"Scheduler headers than the Scheduler library it is linked to.\n"
+				"  Fields that disagree (library vs this TU):\n");
+
+			const struct { const char* name; uint32_t l, h; } fields[] = {
+				{ "sizeof(EpochManager)",              lib.sizeEpochManager,   hdr.sizeEpochManager   },
+				{ "sizeof(Task)",                      lib.sizeTask,           hdr.sizeTask           },
+				{ "sizeof(TaskAllocator)",             lib.sizeTaskAllocator,  hdr.sizeTaskAllocator  },
+				{ "sizeof(TaskDeque)",                 lib.sizeTaskDeque,      hdr.sizeTaskDeque      },
+				{ "sizeof(TaskMPSCQueue)",             lib.sizeTaskMPSCQueue,  hdr.sizeTaskMPSCQueue  },
+				{ "sizeof(WaitGroup)",                 lib.sizeWaitGroup,      hdr.sizeWaitGroup      },
+				{ "sizeof(TaskScheduler)",             lib.sizeTaskScheduler,  hdr.sizeTaskScheduler  },
+				{ "offsetof(TaskScheduler,abiCanary)", lib.offsetAbiCanary,    hdr.offsetAbiCanary    },
+				{ "_ITERATOR_DEBUG_LEVEL",             lib.iteratorDebugLevel, hdr.iteratorDebugLevel },
+			};
+			bool differs = false;
+			for (const auto& f : fields) {
+				if (f.l == f.h) continue;
+				differs = true;
+				n += std::snprintf(msg + n, (n < (int)sizeof msg) ? sizeof msg - n : 0,
+					"    %-36s %u vs %u\n", f.name, f.l, f.h);
 			}
-			return true;
+			if (!differs) return true;
+
+			std::snprintf(msg + n, (n < (int)sizeof msg) ? sizeof msg - n : 0,
+				"  Rebuild EVERY library that includes TaskScheduler.h, not just the Scheduler --\n"
+				"  a stale Sound/Renderer/Physics library carries its own inlined copy of CreateTask\n"
+				"  and reaches the wrong offset in a correctly-built scheduler object.\n"
+				"  Note the Scheduler ships Debug, Development and Release; rebuilding only some of\n"
+				"  them causes exactly this. _ITERATOR_DEBUG_LEVEL differing means /MDd vs /MD.\n"
+				"  Continuing would fault at an unrelated address -- refusing instead.\n");
+
+			std::fputs(msg, stderr);
+			std::fflush(stderr);
+			// A GUI-subsystem process has no console, so the text above goes nowhere and all the
+			// user sees is "Fatal program exit requested" at __scrt_common_main_seh. This is the
+			// one channel that works there, and it lands in the debugger's Output window.
+#if defined(_WIN32)
+			OutputDebugStringA(msg);
+#endif
+			std::abort();
+			return false;
 		}();
+		}
 	}
 }
 
