@@ -470,7 +470,6 @@ thread is already splitting.
 | `ParallelFor(begin,end,grain,func)` | yes | same, your grain floored to ≥64 leaves/worker | you know the body's cost and want a coarser or finer split than the default |
 | `PushArray(begin,end,chunk,fn,wg)` | **no** | fixed `chunk`, one task per chunk, submitted up front | fire-and-forget: the caller has other work, or wants several arrays in flight before waiting on them together |
 | `RunCursorRange(begin,end,grain,func)` | yes | one task per worker sharing an atomic cursor | see the caveat below — normally you do not call this |
-| `ParallelForNB(begin,end,chunk,func)` | no | fixed `chunk` | legacy non-blocking form; `PushArray` is the better-specified sibling |
 
 `PushArray` is the one with a genuinely different contract: it **returns as soon as the work is
 queued**, so it is the only one of these you can use to overlap submission with other work on the
@@ -620,6 +619,12 @@ decisions that were tried and removed.
 not break without a 2.0. Every header is installed because the supported ones need them to compile,
 but the rest are implementation detail and may change in any release. If you need something only
 reachable through one of those, that is a missing feature -- open an issue rather than depend on it.
+
+That promise has been broken exactly once, deliberately, and it is listed here rather than only in
+the changelog: **`ParallelForNB` was removed in a minor release.** It offered no way to observe
+completion, so it had no correct usage to break; it was undocumented, untested and uncalled, and it
+predated the range APIs that superseded it. Use `PushArray`. If the count of exceptions in this
+paragraph ever reaches two, the policy is the thing that is wrong, not the releases.
 
 [CHANGELOG.md](CHANGELOG.md) has the release history and the negative results.
 
