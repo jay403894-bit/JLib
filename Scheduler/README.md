@@ -3,7 +3,8 @@
 
 A hybrid runtime for C++17+ that gives you:
 
-- **Cilk-style work-stealing** for fast parallel loops (`PushArray`, `ParallelFor`)
+- **Cilk-style work-stealing** for fast parallel loops (`ParallelFor`, `PushArray`)
+- **No cost model in the range APIs** -- `ParallelFor` has no probe and no calibrated constant; steals decide how work is divided
 - **TaskFlow-style dependency graphs** (`TaskDAG`) with AND/OR gates
 - **Middleware-safe threads by default** -- no TLS surprises
 - **Fiber-based blocking only when you actually suspend**, so you never pay fiber overhead unless you need it
@@ -52,34 +53,77 @@ and never learns fibers exist. [Why that matters](DESIGN.md#the-hybrid-is-a-corr
 This was tested on my machine, third party tests have come back and some are faster than mine depending on hardware and platform.
 Needs and welcomes more testing for research!
 
-i9-13900K at Intel spec power limits, Release, 1.3.0. Medians of three runs on the default affinity
-policy. **The two columns are one library under its two idle policies**, not two products -- `Sleep`
-parks idle workers and is the default, `NoSleep` keeps them searching.
+i9-13900K at Intel spec power limits, Release, **1.4.0**. Medians of five runs on the default
+affinity policy, with the observed range in brackets. **The two columns are one library under its
+two idle policies**, not two products -- `Sleep` parks idle workers and is the default, `NoSleep`
+keeps them searching.
 
 | | `Sleep` (default) | `NoSleep` | |
 |---|---|---|---|
-| Task enqueue → dequeue latency | 4.67 µs | **1.21 µs** | 3.9x |
-| 6-node frame DAG (build, validate, execute) | 22.5 µs | **7.8 µs** | 2.9x |
-| 1M-element recursive fork-join (10k leaves) | 0.23 ms | **0.06 ms** | 3.8x |
-| Single-producer submission | 0.99 M/s | **6.4 M/s** | 6.5x |
-| Bulk submission via `PushBatch` | **12.2 M/s** | 10.8 M/s | 0.9x |
-| Bulk submission, 4 producers | 9.8 M/s | **12.7 M/s** | 1.3x |
-| Per-item cost via `PushArray` (chunk 128) | 1.0 ns | 1.0 ns | -- |
-| 16 heavy tasks from an idle pool | 11.2x of 16 | 12.6x of 16 | flat |
+| Task enqueue → dequeue latency | 4.6 µs <br><sub>[4.28-4.72]</sub> | **1.0 µs** <br><sub>[0.94-2.8]</sub> | 4.6x |
+| 6-node frame DAG (build, validate, execute) | 21.1 µs <br><sub>[20.2-22.1]</sub> | **7.4 µs** <br><sub>[7.2-8.4]</sub> | 2.9x |
+| 1M-element recursive fork-join (10k leaves) | 0.25 ms <br><sub>[0.17-0.29]</sub> | **0.06 ms** <br><sub>[0.06-0.13]</sub> | 4.2x |
+| Single-producer submission | 1.2 M/s <br><sub>[0.90-1.48]</sub> | **7.0 M/s** <br><sub>[5.9-7.2]</sub> | 5.8x |
+| Bulk submission via `PushBatch` | **14.7 M/s** <br><sub>[14.2-18.2]</sub> | 14.3 M/s <br><sub>[13.1-16.4]</sub> | 1.0x |
+| Bulk submission, 4 producers | 2.9 M/s <br><sub>[2.3-3.9]</sub> | **12.5 M/s** <br><sub>[12.1-13.0]</sub> | 4.3x |
+| Per-item cost via `PushArray` (chunk 128) | 0.55 ns | 0.59 ns | -- |
+| 16 heavy tasks from an idle pool | 10.8x of 16 | 12.6x of 16 | flat |
 
-Run-to-run spread is a few percent on latency and the DAG, wider on single-producer submission --
-treat the last digit as noise. Reproduce either column with `SchedulerBench`, or both side by side
-with `SchedulerBench both`.
+Reproduce either column with `SchedulerBench`, or both side by side with `SchedulerBench both`.
+The brackets matter: the last digit is not meaningful on several of these rows -- bulk submission
+and fork-join move ~20% run to run on an otherwise idle machine, and the `NoSleep` latency row is
+bimodal -- so read the order of magnitude and the ratio, not the number.
+
+**A quiet machine means quiet.** Two rounds of these numbers were thrown away because a WSL2 VM
+that had been shut down seconds earlier was still tearing down in the background, which pulled the
+whole `NoSleep` column down by up to 40%. If you reproduce this, give the machine real idle time
+first and take the run twice.
+
+**Rows that moved against the 1.3.0 version of this table.** `PushBatch` went 12.2 → 14.7 M/s and
+`PushArray` 1.0 → 0.55 ns/item; both follow from 1.4 cutting the task allocator's round trip from
+9.3 ns to 2.1 ns. Everything else reproduces 1.3.0 within noise except one row: 4-producer
+submission under `Sleep` reads 2.9 M/s where the 1.3.0 table said 9.8.
+
+**That was assumed to be a regression. It is not -- the row is BISTABLE, and neither number is
+wrong.** v1.3.0 was checked out, rebuilt and measured beside 1.4.0: it reads 2.5-4.4 M/s against
+1.4.0's 3.0-3.7, the same distribution, so nothing regressed between them. Sweeping pool size then
+showed what the row actually does:
+
+| pool | 4 | 8 | 16 | 18 | 20 | 22 | 24 | 31 |
+|---|---|---|---|---|---|---|---|---|
+| 4-producer M/s | 11.08 | 11.39 | 10.13 | 10.93 | 10.50 | **2.37** | 5.36 | 3.60 |
+
+A cliff at ~21 workers. Below it the four producers keep the pool saturated, so workers never park
+and a `Push` costs the ~1 ns of an awake-worker notify. Above it the consumers drain faster than the
+producers submit, workers run dry and park, and every `Push` buys a kernel wake instead. Those are
+two regimes, ~10-11 M/s and ~3 M/s, and this 31-worker machine sits just past the edge -- so the row
+lands in either depending on how the run settles.
+
+**This is the same failure mode the single-producer row is already documented for**, one crossover
+to the right: four producers feed more consumers than one, so the cliff moves from ~14 workers to
+~21. `bench.cpp` claimed the multi-producer case was flat across that sweep and served as the
+control for it. That claim was wrong and is now corrected -- fork-join and the frame DAG are the
+flat ones.
+
+So the 9.8 was a real reading from the saturated regime, and `best-of-5` on a bistable metric
+publishes whichever regime got lucky -- which is also why the row was recorded as 8.4 M/s and then
+9.8 M/s sixteen minutes later on identical code. **Read this row as a submission-rate measurement
+with a crossover, not a capacity number, and expect either regime.** Published as measured rather than quietly dropped.
+
+**Measure on your own hardware before relying on any of this.** These numbers come from one desktop
+with a large L3 and no competing load; a different cache hierarchy or a machine the application does
+not own will move them, in some cases below 1.0x.
 
 **The wake path turned out to be the largest single cost in the scheduler**, and nothing here had
 measured it until 1.3.0. That is what the first four rows are: whether a worker had to be woken by
-the kernel. `NoSleep` is not uniformly better, which is why both columns are shown -- it costs you
-on `PushBatch`, and on the blocking workload further down.
+the kernel. `NoSleep` is not uniformly better, which is why both columns are shown -- it ties on
+`PushBatch` (where submission, not wake-up, is the cost) and loses on the blocking workload further
+down.
 
 That last row is the control, and it is the reason to believe the others. Its shortfall was
 predicted before measuring to be frequency scaling rather than wake latency -- 16 heavy tasks at
 once settle toward base clock on a chip at Intel spec power limits, where one task alone boosts. It
-stayed flat while everything else moved 3-6x.
+stayed flat while everything else moved 2.9-5.8x.
 
 The default stays `Sleep`. Spinning workers are a battery and thermal problem on Android, they starve
 whatever else the host process runs, and they make the oversubscription policy incoherent.
@@ -132,21 +176,23 @@ workers, Release, 1.3.0. `--` is not measured yet.
 
 | | this (Sleep) | this (NoSleep) | enkiTS | Taskflow | marl |
 |---|---|---|---|---|---|
-| Round-trip submit→run→wait | 4.6 µs | 0.97 µs | 21.7 µs | 1.30 µs | **0.88 µs** |
-| Independent tasks, per task | 74 ns | **69 ns** | 21.8 µs | 310 ns | 290 ns |
-| Range work, per item | 36 ns | 24 ns | **15 ns** | -- | -- |
-| Bulk parallel-for, 20k items (`ParallelRange`, 1.4) | 0.38 ms | -- | 0.375 ms | 0.49 ms | -- |
-| &nbsp;&nbsp;same row via `ParallelFor` | 0.44 ms | 0.29 ms | 0.375 ms | -- | -- |
-| 25% of tasks blocked 600 µs | **7.4 ms** | 10.1 ms | 15.4 ms | -- | 8.8 ms |
+| Round-trip submit→run→wait | 4.3 µs | 1.70 µs | 21.7 µs | 1.30 µs | **0.88 µs** |
+| Independent tasks, per task | 67 ns | **65 ns** | 21.8 µs | 310 ns | 290 ns |
+| Range work, per item | 38 ns | 25 ns | **15 ns** | -- | -- |
+| Bulk parallel-for, 20k items | 0.36 ms | 0.18 ms | 0.373 ms | 0.49 ms | -- |
+| 25% of tasks blocked 600 µs | **7.2 ms** | 10.2 ms | 15.4 ms | -- | 8.8 ms |
 
-**The two bulk rows are the same work through two of our APIs**, added in 1.4. `ParallelRange` is
-the mechanism-matched counterpart to enkiTS — both hand workers slices off a shared cursor rather
-than creating a task per chunk — and at **0.38 ms against 0.375 ms it is a tie**, not a win; enkiTS
-is marginally ahead and far steadier (2% spread against our 13%). The gap to `ParallelFor` on the
-second row is its **probe**: it runs ~312 of the 20,000 items serially to decide whether
-parallelising is worth it, which is a third of the wall time on a job this size. That probe is the
-right default when you don't know your workload and pure overhead when you do, which is exactly why
-both exist. See [Choosing a range API](#choosing-a-range-api-parallelfor-vs-parallelrange).
+**Our two columns were re-measured at 1.4.0; the other three were not.** enkiTS, Taskflow and marl
+have not changed and their cells are carried over -- but they were taken on the same machine in the
+same harness, so the comparison still holds. The `NoSleep` round-trip cell is the one to distrust:
+it read 0.97 µs at 1.3.0 and 1.70 µs here with an **83% spread across repeats**, which is the
+harness being noisy on that row rather than a real move.
+
+**The bulk row was re-measured after `ParallelFor` moved to recursive splitting**, because the
+earlier figure was taken against the shared-cursor path that was mechanism-matched to enkiTS. It did
+not move: **0.355 ms against enkiTS 0.373 ms**, which is a tie either way — inside both harnesses'
+spreads (8% ours, 9% theirs). Read it as neither library having an edge on a uniform bulk range, not
+as a win. See [Parallel loops](#parallel-loops).
 
 Blank cells are not measured yet, not zero. Versions: enkiTS at `main`, Taskflow 4.1.0, marl at `main`
 (**archived**, last commit 2026-04-27 — its column calibrates the fiber path, it is not a
@@ -393,37 +439,87 @@ blocked *simultaneously*. Raise `standardFiberCount` in `StartPool` if you need 
 each standard fiber carries a 64 KB stack, so the cap is a memory decision rather than an arbitrary
 one.
 
-### Choosing a range API: `ParallelFor` vs `ParallelRange`
+### Parallel loops
 
-Both take a `(lo, hi)` callable and block until the whole range has run. They differ in how the
-range is split, and **the right one depends on the shape of your workload, not on which is
-"faster"** — each loses to the other on the wrong input.
+`ParallelFor` takes a `(lo, hi)` callable, covers the range in disjoint subranges, and blocks until
+every one has run. It **splits recursively and lets steals decide**: it publishes the right half of
+the range onto the calling thread's own deque and carries on with the left. If nobody takes a split
+it takes it straight back and runs it inline for ~11 ns — no dispatch, no notify. If somebody does,
+the pool was hungry and the split was right. It predicts nothing.
 
-**`ParallelFor`** measures before it splits. It runs a small prefix serially, times it, and
-parallelizes only if the extrapolated work is worth it — then hands out coarse chunks, up to 4 per
-worker. Use it when iterations cost roughly the same, or when you don't know what they cost. Coarse
-chunks mean fewer scheduling entities and less coordination, which is what you want when there is
-nothing to balance.
+It is the only range entry point. `ParallelRange` was added earlier in 1.4 as the probe-free
+alternative and removed in the same release, before either shipped; its shared-cursor mechanism
+survives internally as the fallback when a second non-worker thread is already splitting.
 
-**`ParallelRange`** skips the probe and slices 16x finer, up to 64 slices per worker, handed out
-from a shared cursor. A worker that draws a cheap region comes straight back for more instead of
-idling while another grinds through the expensive end. Use it when iteration cost **varies** —
-early-out branches, per-element data sizes, spatial queries whose depth depends on position — or
-when you already know the range is big and don't want to pay for the probe.
+**Those two mechanisms cross over, and the crossover is the reason `ParallelFor` uses the splitter.**
+Measured with the crossover sweep — 32 points over four body costs, medians of 3, non-overlapping
+distributions below N=200,000:
 
-Measured, 4M items, 31 workers:
+| heavy body | N=1000 | N=2000 | N=4000 | N=10000 | N=200000 |
+| --- | --- | --- | --- | --- | --- |
+| recursive splitter | **10.3x** | **12.6x** | **13.6x** | **13.9x** | 18.5x |
+| shared cursor | 6.6x | 7.8x | 9.4x | 9.3x | **22.6x** |
 
-| body | `ParallelFor` | `ParallelRange` |
-| --- | --- | --- |
-| uniform cost per item | **0.09–0.11 ms** | 0.18–0.23 ms |
-| cost varies ~20x across the range | 0.95–1.07 ms | **0.80–0.89 ms** |
+The splitter is 1.4–1.6x ahead across the whole mid-range — hundreds to thousands of items with real
+per-item work, which is the frame-graph shape this library is for — and gives up ~1.2x only at very
+large N.
 
-The uniform row is the important one to notice: finer slicing is **not free**. It buys load
-balancing at the price of more coordination, so it loses by ~2x when there is no imbalance to fix.
-Reach for `ParallelRange` because your work is irregular, not because it sounds better.
+**A "tied" verdict was published briefly on the strength of three large-N samples**, which is the one
+region where the two agree. If you compare them again, use the sweep: three points chosen by hand
+missed a crossover that 32 points made obvious.
 
-If in doubt, use `ParallelFor` — the probe exists precisely so it can decline to parallelize work
-that isn't worth it, and a wrong guess there costs more than a wrong guess about grain.
+### How do I pick a grain?
+
+Mostly you don't. **`ParallelFor(begin, end, func)` derives one for you** from the two things known
+exactly — the range and the pool size — and never consults the body: `range / (workers * 8)`, the
+same rule Cilk's `cilk_for` uses for its default.
+
+Pass a grain only if you have measured. The number that matters is **wall-clock per slice, not
+elements**: aim for a few microseconds of work in each. If you have timed the loop serially once —
+a two-line experiment in a dev build — then `grain = range * (target_slice_time / total_serial_time)`
+gets you there without knowing anything per-element.
+
+The floor protects against guessing too *fine*. Nothing protects against guessing too *coarse*: a
+grain larger than `range / workers` leaves workers with nothing to take.
+
+**What none of this can do is decline.** Nothing probe-free can refuse to parallelize a body too
+cheap to be worth it — TBB's `simple_partitioner`, Rayon and Cilk all share this. 1.3.x could,
+because it probed. It was dropped anyway, and the root of it is that **iteration count is a useless
+proxy for execution time**. Everything else follows from trying to recover time from a number that
+does not carry it.
+
+Static probing hits four walls, and they are independent — fixing one leaves the rest:
+
+- **Probe overhead.** A timer read is 15–30 ns plus pipeline serialisation, against a ~69 ns task
+  overhead. A probe fine-grained enough to see divergence costs more than the decision is worth.
+- **Cache perturbation.** The prefix warms L1/L2 while the remaining 99% streams from DRAM, so the
+  estimate is biased *low systematically* rather than noisily — always the same direction, so it
+  never averages out and more sampling cannot help.
+- **Data-dependent work.** In frustum culling, ray tracing and narrow-phase — what this library is
+  for — iteration 1 early-outs at 2 ns and iteration 50 does full mesh collision at 4,000 ns. No
+  sample predicts divergence.
+- **Asymmetric topology.** Measuring on a P-core describes a profile that means nothing once an
+  E-core steals the remainder. That is the normal case on the ARM targets, not an edge case.
+
+Only the first of those did *not* apply here: our probe called the clock twice per `ParallelFor`,
+outside the loop, so ~30–60 ns amortised over the whole range. That is worth stating because it cuts
+the other way — this was the cheapest possible probe, calibrated to within measurement error of the
+right constant on the machine it was tuned on, and the other three walls took it anyway.
+
+There was also a fifth failure that is about people rather than hardware: the gate **looked
+deterministic while being wrong**. Same input, same answer, every run — so it read as a measurement
+rather than a guess, and nothing ever prompted a check. A noisy predictor advertises its own
+unreliability. This one did not.
+
+**This is not a novel position.** No mainstream work-stealing runtime gates parallelism on a timed
+serial prefix. Cilk-5 let spawn/steal decide; oneTBB's `auto_partitioner` uses a depth budget with
+steal feedback; Rayon resets a split budget on observed steals. All of them infer demand from
+**steals — something that actually happened** — rather than from a cost model. 1.4 converges with
+that rather than inventing against it.
+
+The 20k cheap-body row above is what that costs: 0.08x with a guessed grain, 0.24x with the default.
+If you need to know whether a loop should have been parallel at all, `SetParallelForSerial(true)`
+answers it in one run without a rebuild.
 
 ### You can take garbage collection off the workers
 

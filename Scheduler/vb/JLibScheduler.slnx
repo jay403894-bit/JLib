@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Solution>
+	<Configurations>
+		<BuildType Name="Debug"/>
+		<BuildType Name="Development"/>
+		<BuildType Name="Release"/>
+		<Platform Name="x64"/>
+	</Configurations>
+	<Project Path="ALL_BUILD.vcxproj" Type="8bc9ceb8-8b4a-11d0-8d11-00a0c91bc942" Id="fbd4e439-92a5-3b03-8ed7-9ac41020c10c" DefaultStartup="true">
+		<BuildDependency Project="Scheduler.vcxproj"/>
+		<BuildDependency Project="SchedulerBench.vcxproj"/>
+		<BuildDependency Project="SchedulerEventSmoke.vcxproj"/>
+		<BuildDependency Project="SchedulerPrimitivesTest.vcxproj"/>
+		<BuildDependency Project="SchedulerTopologyTest.vcxproj"/>
+		<BuildDependency Project="ZERO_CHECK.vcxproj"/>
+	</Project>
+	<Project Path="INSTALL.vcxproj" Type="8bc9ceb8-8b4a-11d0-8d11-00a0c91bc942" Id="dd132059-f067-327e-8360-38c3eef91246">
+		<BuildDependency Project="ALL_BUILD.vcxproj"/>
+		<BuildDependency Project="ZERO_CHECK.vcxproj"/>
+		<Build Solution="Debug|*" Project="false"/>
+		<Build Solution="Development|*" Project="false"/>
+		<Build Solution="Release|*" Project="false"/>
+	</Project>
+	<Project Path="Scheduler.vcxproj" Type="8bc9ceb8-8b4a-11d0-8d11-00a0c91bc942" Id="94373255-769a-3695-9719-bb163d195039">
+		<BuildDependency Project="ZERO_CHECK.vcxproj"/>
+	</Project>
+	<Project Path="SchedulerBench.vcxproj" Type="8bc9ceb8-8b4a-11d0-8d11-00a0c91bc942" Id="2dbe1489-50ec-3c6e-979d-ad05a73a48aa">
+		<BuildDependency Project="Scheduler.vcxproj"/>
+		<BuildDependency Project="ZERO_CHECK.vcxproj"/>
+	</Project>
+	<Project Path="SchedulerEventSmoke.vcxproj" Type="8bc9ceb8-8b4a-11d0-8d11-00a0c91bc942" Id="0798d38d-2834-3ad8-b7a3-5ce31e2397e0">
+		<BuildDependency Project="Scheduler.vcxproj"/>
+		<BuildDependency Project="ZERO_CHECK.vcxproj"/>
+	</Project>
+	<Project Path="SchedulerPrimitivesTest.vcxproj" Type="8bc9ceb8-8b4a-11d0-8d11-00a0c91bc942" Id="e8480f55-11f1-3ec8-bd94-d225cb0bb011">
+		<BuildDependency Project="Scheduler.vcxproj"/>
+		<BuildDependency Project="ZERO_CHECK.vcxproj"/>
+	</Project>
+	<Project Path="SchedulerTopologyTest.vcxproj" Type="8bc9ceb8-8b4a-11d0-8d11-00a0c91bc942" Id="9958d809-a93a-36a4-8d5b-2de3cca4911a">
+		<BuildDependency Project="Scheduler.vcxproj"/>
+		<BuildDependency Project="ZERO_CHECK.vcxproj"/>
+	</Project>
+	<Project Path="ZERO_CHECK.vcxproj" Type="8bc9ceb8-8b4a-11d0-8d11-00a0c91bc942" Id="a9d744c0-96a0-3da8-8fce-f7e95ad81a76"/>
+</Solution>

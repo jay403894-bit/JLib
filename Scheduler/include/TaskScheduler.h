@@ -234,65 +234,150 @@ namespace JLib {
 		static void SetSelfReclaim(bool on);
 		static bool SelfReclaimEnabled();
 
-		static void   SetParallelForThresholdUs(double us);
-		static double GetParallelForThresholdUs();
-
-		void ParallelFor(int start, int end, int chunkSize, std::function<void(int, int)> func);
-		// Fork-join (recursive-split) variant of ParallelFor. Splits the range in half, spawns the
-		// right half as a task and recurses on the left inline; `grain` is the base-case size. It
-		// parallelizes task CREATION -- the tree is built by the whole pool -- instead of the caller
-		// spawning every chunk serially.
+		// Force every ParallelFor to run its whole range inline, on the calling thread.
 		//
-		// NOT experimental, and usually not the one to call: ParallelFor DISPATCHES HERE AUTOMATICALLY
-		// once a range needs more than ~2 tasks per worker, which is where the measurements put the
-		// crossover. Below that the flat path is ~14% faster (no tree to build); above it, flat's
-		// O(#tasks) serial CreateTask+Push+NotifyWorker on one thread collapses -- ~8x slower at
-		// ~15k tasks. Call this directly only to bypass ParallelFor's serial-vs-parallel probe, which
-		// is what the crossover benchmark does deliberately.
-		void ParallelForFJ(int start, int end, int grain, std::function<void(int, int)> func);
-		// Shared slice-stealing core behind ParallelFor's large-range path and ParallelRange. Takes func
+		// Replaces `SetParallelForThresholdUs`, which was removed in 1.4 along with the probe it
+		// tuned. That setter's genuinely useful job was not tuning: it was answering "is ParallelFor
+		// responsible for this?" in one run, without a rebuild, by being set enormous. This keeps
+		// that affordance and drops the pretence that the number meant anything portable.
+		static void SetParallelForSerial(bool on);
+		static bool ParallelForSerial();
+
+		// Parallel range loop. Calls func(lo, hi) over disjoint subranges covering [begin, end),
+		// blocks until every one has run, and the calling thread participates rather than idling.
+		//
+		// IT NEVER PREDICTS -- this is the 1.4 change, and it replaced the probe outright.
+		//
+		// Until 1.4 this ran a serial prefix, timed it, extrapolated, and parallelized only if the
+		// estimate cleared a ~75us gate. That works on a uniform body and CANNOT work on a
+		// data-dependent one, which is what this library is for. A prefix over items 0..311 says
+		// nothing about item 50,000 when the early ones early-out at 2 ns and the later ones do full
+		// mesh collision at 4,000 ns. Worse, the prefix WARMS THE CACHE while the remainder streams
+		// from DRAM, so the estimate is biased low SYSTEMATICALLY rather than noisily; and on a
+		// hybrid part the probe runs on the caller's core class and the work runs on another.
+		//
+		// THE ROOT OF IT: ITERATION COUNT IS A USELESS PROXY FOR EXECUTION TIME. Everything below is
+		// a consequence of trying to recover time from a number that does not carry it.
+		//
+		// Static probing hits four walls. They are independent -- fixing one leaves the rest:
+		//
+		//   1. PROBE OVERHEAD. A timer read is 15-30 ns plus pipeline serialisation, against a
+		//      ~69 ns task overhead, so a probe fine-grained enough to see divergence costs more
+		//      than the thing it is deciding about.
+		//      *** THIS ONE DID NOT BITE US, and the distinction is worth keeping: our probe called
+		//      the clock exactly TWICE per ParallelFor, outside the loop, so ~30-60 ns amortised
+		//      over the whole range. Do not cite it as a reason ours failed. It matters the other
+		//      way -- ours was the CHEAPEST POSSIBLE probe and the other three walls still took it.
+		//   2. CACHE PERTURBATION. The prefix warms L1/L2; the remaining 99% streams from DRAM. The
+		//      estimate is therefore biased LOW systematically rather than noisily -- always the
+		//      same direction, so it never averages out and more sampling cannot help.
+		//   3. DATA-DEPENDENT WORK. In the workloads this library targets -- frustum culling, ray
+		//      tracing, narrow-phase -- iteration 1 early-outs at 2 ns and iteration 50 does full
+		//      mesh collision at 4,000 ns. No sample predicts divergence.
+		//   4. ASYMMETRIC TOPOLOGY. Measuring on a P-core describes an execution profile that means
+		//      nothing once an E-core steals the remainder. The normal case on the Android/ARM
+		//      targets, not an edge case.
+		//
+		// And a fifth that is about people rather than hardware: the gate LOOKED DETERMINISTIC while
+		// being wrong. Same input, same answer, every run -- so it read as a measurement rather than
+		// a guess, and nothing ever prompted a check. A noisy predictor advertises its own
+		// unreliability; this one did not.
+		//
+		// NOT A NOVEL POSITION. No mainstream work-stealing runtime gates parallelism on a timed
+		// serial prefix: Cilk-5 let spawn/steal decide, oneTBB's auto_partitioner uses a depth
+		// budget with steal feedback, and Rayon resets a split budget on observed steals. All of
+		// them infer demand from STEALS -- something that actually happened -- rather than from a
+		// cost model. This is converging with a settled answer, not inventing against it.
+		//
+		// WHAT REPLACED IT: RECURSIVE LAZY SPLITTING, and STEALS DECIDE. This publishes the right
+		// half of the range onto the calling thread's own deque and carries on with the left. Nobody
+		// took it -> the splitter takes it straight back and runs it inline for ~11 ns, no dispatch
+		// and no notify. Somebody took it -> the pool was hungry and the split was right.
+		//
+		// Everything it needs lives on THIS stack frame, which is sound only because ParallelFor
+		// BLOCKS: the wait group and callable outlive every task by construction. That is exactly
+		// why PushArray, which does NOT block, cannot use it.
+		//
+		// A SHARED-CURSOR ALTERNATIVE EXISTS AND IS USED AS A FALLBACK (RunCursorRange): one task per
+		// worker, each pulling [lo, lo+grain) off one atomic. ParallelFor was switched to it for a
+		// single commit and switched back. The bench crossover sweep -- 32 points over four body
+		// costs, which is the instrument for this question -- shows the two CROSS OVER rather than
+		// tie, medians of 3 and non-overlapping below 200k:
+		//
+		//     heavy body   N=1000   2000    4000    10000   200000
+		//       splitter   10.3x   12.6x   13.6x   13.9x    18.5x
+		//       cursor      6.6x    7.8x    9.4x    9.3x    22.6x
+		//
+		// The splitter is 1.4-1.6x better across the whole mid-range -- hundreds to thousands of
+		// items with real per-item work, i.e. the frame-graph shape this library is for -- and gives
+		// up ~1.2x only at very large N. A "tied" verdict was published briefly on the strength of
+		// three samples that were all large-N, which is the one region where they agree. Do not
+		// re-run that comparison without the sweep.
+		// GRAIN (was `chunkSize`) is the smallest subrange worth handing to another thread. It is
+		// floored at 64 slices per worker with an absolute floor of 64 items -- a statement about
+		// the POOL, whose size is known exactly, never about the BODY.
+		//
+		// WHAT YOU GIVE UP with the probe gone, stated plainly: nothing here can decline to
+		// parallelize a body too cheap to be worth it. Pass a grain far smaller than the body
+		// justifies and it will faithfully slice that fine and lose to a serial loop -- ~0.19x on a
+		// 20k range of a ~0.4 ns/element body, where the old probe held 1.00x. Give it a grain worth
+		// a few microseconds of work and the same case is ~1.00x. If you cannot say, use the
+		// overload below; if you need to know whether a loop should be parallel at all,
+		// SetParallelForSerial(true) answers it in one run without a rebuild.
+		void ParallelFor(int begin, int end, int grain, std::function<void(int, int)> func);
+
+		// The same thing WITHOUT having to name a grain, and this is the one most callers want.
+		//
+		// "How do I know what grain to pass?" is the fair objection to the overload above, and for
+		// most callers the honest answer is that they cannot know: they know their body is "a
+		// collision check" or "a matrix multiply", not what it costs in nanoseconds per element.
+		// Requiring a number nobody has is how you get 32 passed in because it looked reasonable.
+		//
+		// So this derives one from the two things that ARE known exactly -- the range and the pool
+		// size -- and never consults the body: `range / (workers * 8)`, the rule Cilk's `cilk_for`
+		// uses for its own default.
+		//
+		// A TUNING CONSTANT IS PART OF THE ALGORITHM IT WAS TUNED FOR, and this number has now been
+		// wrong in BOTH directions inside a single release. 8 per worker suits the recursive
+		// splitter, which pays per split and has a serial spine and so wants fewer, larger leaves.
+		// While ParallelFor was briefly pointed at the shared cursor -- which publishes every lane at
+		// once and pays one fetch_add per slice, so it wants the finer division -- keeping 8
+		// measured 6.23x against 16.55x at an explicit grain on a 64 MB memory-bound body. Changing
+		// it to defer to the cursor's floor then measured 4.36x against 11.33x once ParallelFor went
+		// back to splitting. If the algorithm underneath changes again, this is a measurement to
+		// redo, not a constant to carry across.
+		//
+		// PASS A GRAIN ONLY IF YOU HAVE MEASURED. The number that matters is wall-clock per leaf,
+		// not elements: aim for a few microseconds of work in each. If you have timed the loop
+		// serially once -- which is a two-line experiment in a dev build -- then
+		// `grain = range * (target_leaf_time / total_serial_time)` gets you there without knowing
+		// anything per-element.
+		//
+		// This does NOT rescue a body too cheap to parallelize; nothing probe-free can, and the
+		// explicit overload's comment says why. What it does is bound the damage: leaves are capped
+		// at `workers * 64`, so the worst case is that many dispatches rather than one per element.
+		void ParallelFor(int begin, int end, std::function<void(int, int)> func);
+		// `ParallelForFJ` was REMOVED in 1.4. It was the fork-join variant: split in half, spawn the
+		// right half, recurse left. ParallelFor stopped dispatching to it when the slice-stealing
+		// cursor path replaced per-chunk tasks, which left it public with no caller anywhere.
+		//
+		// USE `ParallelFor`. It is the drop-in -- same shape, same blocking behaviour -- and it still
+		// decides serial-vs-parallel for you.
+
+
+
+		// Shared slice-stealing core behind ParallelFor. Takes func
 		// by REFERENCE: both callers block, so the object outlives every task, and copying a
 		// std::function per worker would reintroduce an allocation this exists to remove.
 		void RunCursorRange(int start, int end, int grain, std::function<void(int, int)>& func);
 		void ParallelForNB(int start, int end, int chunkSize, std::function<void(int, int)> func);
 
 		// Blocking range loop with ATOMIC SLICE-STEALING, and no probe.
-		//
-		// Same shape and same guarantees as ParallelFor -- calls func(lo, hi) over disjoint
-		// sub-ranges covering [begin, end) exactly once each, and returns when all of them have run.
-		// Two differences, both deliberate:
-		//
-		//   NO PROBE. ParallelFor cannot know what an element costs, so it runs a prefix SERIALLY,
-		//   times it, and decides serial-vs-parallel from that. That is the right default, but it is
-		//   serialization on the critical path before any parallelism starts, and it is pure waste
-		//   for a caller who already knows the range is large. This skips it and goes straight to
-		//   work. Use ParallelFor when you do not know; use this when you do.
-		//
-		//   FINER SLICING BY DEFAULT. Workers do not get a task per chunk: one task per worker is
-		//   created, and each pulls [lo, lo+grain) off a shared atomic until the range is consumed.
-		//   Because the task count no longer varies with grain, this can afford up to 64 slices per
-		//   worker where ParallelFor's per-chunk paths cap out at 4.
-		//
-		// USE ParallelRange WHEN COST VARIES ACROSS THE RANGE, and ParallelFor otherwise. That is not
-		// a preference, it is what the numbers say -- 4M items, 31 workers, medians of 3 runs:
-		//
-		//     uniform body   ParallelFor 0.09-0.11 ms   ParallelRange 0.18-0.23 ms   (ParallelFor ~2x)
-		//     ragged  body   ParallelFor 0.95-1.07 ms   ParallelRange 0.80-0.89 ms   (this ~1.2x)
-		//
-		// Finer slicing is pure overhead when every item costs the same -- more atomics, nothing to
-		// balance. It pays when it lets a worker that drew a cheap region come back for more instead
-		// of idling while another grinds through the expensive end.
-		//
-		// GRAIN IS A FLOOR, NOT A PROMISE, and it is raised to keep at most 64 slices per worker.
-		// The cursor makes the TASK count independent of grain but not the fetch_add count, which is
-		// range/grain on one contended line. A flat floor of 64 measured 15x SLOWER than ParallelFor
-		// on a 4M range -- 65,536 atomics against ~124. Fine grain is cheaper here than with
-		// per-chunk tasks; it is not free.
-		//
-		// The calling thread PARTICIPATES rather than blocking idle, same as ParallelFor's flat path
-		// keeping chunk 0 for itself -- it is stuck here anyway, so leaving a whole lane idle would
-		// be waste.
-		void ParallelRange(int begin, int end, int grain, std::function<void(int, int)> func);
+		// `ParallelRange` was REMOVED in 1.4, before it ever shipped. It was added earlier in the
+		// same release as the probe-free entry point, and once ParallelFor lost its probe and moved
+		// to the same slice-stealing cursor the two were literally the same function. Two names for
+		// one behaviour is worse than the problem either was solving. Use ParallelFor.
+
 		bool Push(Task* task);
 		void WaitFor(WaitGroup& wg);
 		bool Push(uint8_t cpu_affinity, Task* task);
@@ -316,8 +401,8 @@ namespace JLib {
 		// chunkSize -- at 32 it is ~3 ns/item -- which is the same amortisation a range-based API
 		// gets, without giving up a per-item callable.
 		//
-		// NOT MADE OBSOLETE BY ParallelRange (1.4), and the reason is structural rather than a
-		// performance argument. ParallelFor and ParallelRange BLOCK: their cursor, wait group and
+		// NOT MADE OBSOLETE BY ParallelFor, and the reason is structural rather than a
+		// performance argument. ParallelFor BLOCKS: its cursor, wait group and
 		// callable all live on the caller's stack frame, which is the only thing that makes a
 		// zero-allocation slice-stealing loop possible. PushArray does not block -- it hands you a
 		// WaitGroup and returns, so you can submit range work and go do something else, or never
@@ -517,11 +602,18 @@ namespace JLib {
 		// common case); explicit P/E tasks are only stolen by a matching-class thief -- corePref is the
 		// sole placement authority, including across steals. degenerateTopology (non-hybrid CPU: one
 		// class set empty) disables class checks entirely so nothing is ever unstealable.
-		static bool StealClassCompatible(const Task* t, bool thiefIsP, bool degenerateTopology) {
-			const CorePref p = t->corePref;
+		// Takes the PREFERENCE, not the task. Steal vetting runs before the thief has claimed
+		// anything, so it must not dereference the candidate -- the value arrives in the deque's
+		// pointer tag instead (see TaskDeque's StealBits).
+		static bool StealClassCompatible(CorePref p, bool thiefIsP, bool degenerateTopology) {
 			if (p == CorePref::Default || p == CorePref::Wide) return true;   // Any aliases Wide
 			if (degenerateTopology) return true;
 			return (p == CorePref::P) ? thiefIsP : !thiefIsP;
+		}
+		// Convenience for callers that legitimately HOLD the task (owner-side placement checks),
+		// where dereferencing is fine. Steal paths must use the CorePref overload.
+		static bool StealClassCompatible(const Task* t, bool thiefIsP, bool degenerateTopology) {
+			return StealClassCompatible(t->corePref, thiefIsP, degenerateTopology);
 		}
 
 		Task* CreateTask(void(*fn)(void*), void* data, uint8_t hipri = false, FiberSize size = FiberSize::Standard, uint8_t noFiber = true, CorePref corePref = CorePref::Default);
@@ -571,6 +663,45 @@ namespace JLib {
 		std::atomic<bool> paused{ false };
 		std::vector<std::unique_ptr<TaskDeque>> loPri;
 		std::vector<std::unique_ptr<TaskDeque>> hiPri;
+
+		// ---------- the NON-WORKER LANE ----------
+		// loPri/hiPri carry ONE EXTRA deque pair past the workers, at index `nonWorkerLane`
+		// (== workers.size(), fixed by StartPool). Everything else -- inboxes,
+		// immediateCoresInUse, the P/E sets, PickNextWorker -- stays worker-indexed.
+		//
+		// WHY IT EXISTS. Demand-driven splitting (ParallelFor since 1.4) works by publishing a split onto
+		// the SPLITTER'S OWN deque and taking it straight back if nobody stole it -- measured at
+		// 17.8 ns, versus ~85-105 ns for a real cross-thread dispatch. A worker has a deque to do
+		// that with. Main did not, so a ParallelFor called from the main thread -- which is the
+		// normal case -- had nowhere to publish, and the alternative was to hand the whole range to
+		// one worker and let the tree fan out over log2(N) STEAL HOPS before the pool filled up.
+		// One deque removes that ramp entirely: every worker can steal directly from main's lane,
+		// in parallel, starting from the first split.
+		//
+		// SINGLE OWNER, ENFORCED. A Chase-Lev deque has exactly one pusher/popper by construction,
+		// so two non-worker threads splitting at once would corrupt it. `nonWorkerLaneClaimed` is
+		// the claim; a caller that loses it falls back to the cursor path rather than waiting, so
+		// a second non-worker thread degrades to the 1.4 behaviour instead of blocking.
+		//
+		// Thieves treat it as one more victim and nothing else: it is probed after the topology
+		// phases (it has no cache locality to anybody) and before the global random fallback.
+		size_t nonWorkerLane = 0;
+		std::atomic<bool> nonWorkerLaneClaimed{ false };
+
+		// Everything a lazy split needs that does NOT change as the recursion descends. Held on the
+		// root caller's stack and passed down by pointer, which is sound for exactly the reason
+		// the cursor path is: ParallelFor BLOCKS, so the frame outlives every task
+		// spawned under it. A non-blocking variant would need this refcounted on the heap.
+		struct LazyRangeState {
+			std::function<void(int, int)>* func;
+			WaitGroup* wg;
+			int grain;
+		};
+		// The deque the CALLING thread may publish onto, or nullptr if it has none. Resolved per
+		// invocation and never cached across one: a split that gets stolen resumes on a different
+		// thread, and it must then publish onto THAT thread's deque, not the one it came from.
+		TaskDeque* LaneForCurrentThread();
+		void RunLazyRange(int lo, int hi, LazyRangeState* st);
 		std::vector<std::unique_ptr<TaskMPSCQueue>> loPriInboxes;
 		std::vector<std::unique_ptr<TaskMPSCQueue>> hiPriInboxes;
 		static GlobalFiberPool* globalPool;
@@ -581,7 +712,15 @@ namespace JLib {
 		// steady stream of hiPri work can't starve loPri tasks. (There used to also be age-based
 		// promotion -- boost old loPri tasks to hiPri -- but it's redundant now that stealing is
 		// single-item: a stolen task runs immediately, so the steal itself un-starves it.)
-		int consecutiveHiPriSteals = 0;
+		//
+		// PER THREAD, NOT PER SCHEDULER -- see the definition in TaskScheduler.cpp. This was a plain
+		// `int` member on the singleton, read-modify-written by GetTask() from every thread that
+		// spin-helps, which is a genuine data race and ThreadSanitizer says so (2026-08-17). It is
+		// also the wrong shape for what the counter means: the window is a property of ONE
+		// stealer's recent history, and sharing it made N concurrent helpers trip it N times faster
+		// than intended. Thread.cpp's `consecutiveMisses` backoff counter is thread_local for
+		// exactly these two reasons and this now matches it.
+		static thread_local int consecutiveHiPriSteals;
 		static constexpr int kStealFairnessWindow = 8; // after 8 hiPri steals, force a loPri scan
 		uint64_t GetCurrentTimeMs() const;
 		// ----

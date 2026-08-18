@@ -5,7 +5,178 @@ downstream users (forks/ports) should treat those as must-pull.
 
 ## 1.4.0 - unreleased
 
-**`ParallelFor` now dispatches by slice-stealing, and there is a new `ParallelRange`.**
+**`ParallelFor` NO LONGER PROBES. It is now demand-driven, and the probe is gone rather than
+demoted.** This is the headline change of 1.4 and it is a behaviour change to the primary API.
+
+It used to decide serial-vs-parallel by PREDICTING: run a serial prefix, time it, extrapolate, and
+parallelize if the estimate clears ~75 µs. That works on a uniform body and cannot work on a
+data-dependent one -- a prefix over items 0..311 says nothing about item 50,000 when the early ones
+early-out and the later ones do full mesh collision. The prefix also warms the cache while the
+remainder streams from DRAM, so the estimate is biased low *systematically* rather than noisily, and
+on a hybrid part the probe runs on the caller's core class and the work runs on another.
+
+Now the range is made splittable and STEALS DECIDE. `ParallelFor` publishes the right half onto the
+calling thread's own deque and carries on with the left. Nobody took it → the splitter takes it
+straight back and runs it inline for ~11 ns, no dispatch and no notify. Somebody took it → the pool
+was hungry and the split was right. Idle pool parallelizes, busy pool runs serially at near zero
+cost, ragged body keeps getting stolen from -- which is itself the signal to subdivide where the
+work turned out to be. Nothing to calibrate per machine.
+
+That is affordable because of what the speculative path actually costs, which had never been
+measured: **17.8 ns** at the time, **10.8 ns** after the allocator fix below, for alloc → construct
+→ `push_bottom` → `pop_bottom` → run → destroy → free. An unstolen split needs no notify (nobody has
+to be woken to run something you are about to run yourself) and no epoch retirement (winning the pop
+CAS proves no thief observed it). The "~85-105 ns per task" figure quoted elsewhere is the
+*cross-thread dispatch* path -- MPSC inbox, round-robin, notify -- which this skips entirely.
+
+Medians of 15, 31 workers, default Sleep, speedup over the same body run serially:
+
+| body | 1.3.x `ParallelFor` (probe) | recursive splitter | **1.4 `ParallelFor`** |
+| --- | --- | --- | --- |
+| uniform, 1M | 5.7-6.9x | 7.7-8.1x | **8.4-9.8x** |
+| data-dependent 20x, 200k | 10.3-16.0x | 20.1-21.7x | **15.3-22.1x** |
+| back-loaded (all cost in the last 10%), 100k | 5.8-6.1x | 9.4-15.2x | **11.3-13.5x** |
+
+**There is a new no-grain overload, and it is the one most callers want.** "How do I know what grain
+to pass?" is the fair objection, and for most callers the honest answer is that they cannot know --
+they know their body is "a collision check", not what it costs per element. `ParallelFor(begin, end,
+func)` derives a grain from the two things known exactly, the range and the pool size, and never
+consults the body: `range / (workers * 8)`, the same rule Cilk's `cilk_for` uses.
+
+Eight leaves per worker, not the sixty-four the explicit overload *floors* at, and the gap is
+deliberate -- those are two different decisions. A floor stops an explicit grain being absurdly
+fine, where leaning aggressive costs nothing. A default is picked with no information, and there the
+errors are wildly asymmetric: under-splitting an expensive body costs ~10% (200k ragged: ~19-21x
+against a 21.5-23x plateau) while over-splitting a cheap one costs ~20x (0.4 ns/element: 1.00x with
+a justified grain against 0.05x). Deriving the default from the floor was the first version and it
+measured that 0.05x.
+
+**Explicit grain is floored at 64 leaves per worker.** Grain has a cliff on the low side that a
+caller guessing too fine falls straight off -- measured before the floor, **grain 1 gave 2.61x on a
+ragged body against 21.5x at grain 32-64**, and 1.95x against 18.6x back-loaded, because a split
+costs ~10.8 ns unstolen and a full dispatch when stolen, against a leaf holding one element. The
+floor is a statement about the POOL, whose size is known exactly, not about the BODY -- so it does
+not smuggle the probe back in.
+
+**WHAT YOU GIVE UP, stated plainly.** Nothing probe-free can decline to parallelize a body too cheap
+to be worth it, and the old probe could. Pass a grain smaller than the body justifies -- 32 elements
+of a ~0.4 ns/element loop -- and this faithfully splits that fine and measures ~0.08x against
+serial, where 1.3.x held 1.00x. The no-grain overload bounds the damage (0.24x on the same case, and
+11.8x rather than 4.6x on a large cheap range) but cannot remove it. TBB's `simple_partitioner`,
+Rayon and Cilk all share this property. If you do not know what an iteration costs, use the no-grain
+overload; if you need to know whether a loop should have been parallel at all, `SetParallelForSerial`
+answers it in one run.
+
+**REMOVED: `SetParallelForThresholdUs` / `GetParallelForThresholdUs`**, which tuned the gate that no
+longer exists. Their genuinely useful job was never tuning -- it was answering "is `ParallelFor`
+responsible for this?" without a rebuild, by being set enormous. **`SetParallelForSerial(bool)`**
+replaces that affordance and drops the pretence that the microsecond figure meant anything portable.
+
+**`ParallelForLazy` does not exist.** It was the working name while this was being built as a second
+entry point; shipping two names for one behaviour would have been worse than the probe. It never
+appeared in a release.
+
+name a sensible grain.
+
+**Callable from the main thread**, which is the normal case. `loPri`/`hiPri` gained one extra deque
+past the workers -- the non-worker lane -- claimed by one non-worker thread at a time and probed by
+every worker as an ordinary steal victim. Without it a main-thread caller had nowhere to publish and
+the tree would have had to fan out over a chain of steal hops. A second concurrent non-worker caller
+loses the claim and degrades to the cursor path rather than blocking. The extra unconditional steal
+probe measured no regression on the benchmark suite (throughput, latency and frame DAG all within
+run-to-run variance).
+
+**`TaskAllocator::Alloc`+`Free` is 4.5x cheaper: 9.3 ns → 2.1 ns.**
+
+Profiling the split path turned up something that had nothing to do with splitting. `Alloc` and
+`Free` each did one `fetch_add`/`fetch_sub` on the sharded live-slot counter, and those two atomic
+read-modify-writes were **6.7 ns of the 9.3 ns round trip — 72%** — while the free-list work they
+surrounded was 1.5 ns. `memory_order_relaxed` does not make an RMW cheap: relaxed governs ordering,
+which is the free part, but the `lock xadd` still takes the cache line exclusively, ~3.3 ns each
+even completely uncontended. That was being paid twice per task for a number whose only readers are
+an error message in `TaskNode.h` and a diagnostic print in the benchmark.
+
+A shard is only ever *written* by the thread that owns it, so where ownership is exclusive the
+update can be a plain relaxed load + relaxed store with no lock prefix. **Exactness is not traded
+away.** The exclusivity premise fails above `kLiveSlots` (128) threads — and it fails on *cumulative*
+thread creations, not concurrent ones, since `s_liveNext` never decrements and an exiting thread
+never returns its slot, so a process that spawns transient threads gets there far sooner than its
+peak thread count suggests. Past that point two threads share a shard, and a non-atomic RMW would
+not merely blur the reading, it would lose updates permanently and drift further from the truth
+forever — precisely destroying the counter's one job, telling a real slab leak from normal churn.
+So the fast path is taken only where it is provably exclusive (the first 128 threads, which is every
+realistic case) and everything past it falls back to the original `fetch_add`. Verified exact under
+balanced churn on 16 threads, cross-thread alloc/free, 200 cumulative threads past the shard limit,
+and 24 concurrent threads sharing shards.
+
+Downstream effect: the speculative split path is **17.8 ns → 10.8 ns**, and the allocator drops from
+54% of it to 19% (the deque's last-item CAS is now the largest single item). On the benchmark suite
+the frame DAG went from 21.29-21.39 µs to 20.34-20.81 µs across four runs each — non-overlapping,
+~3.4% — with batch throughput and round-trip latency also improved.
+
+**REMOVED: `ParallelForFJ`. Use `ParallelFor`.**
+
+The fork-join variant -- split in half, spawn the right half, recurse left. `ParallelFor` stopped
+dispatching to it when the slice-stealing cursor path replaced per-chunk tasks, which left it public
+with no caller anywhere in the tree.
+
+**`ParallelFor` is the drop-in**: same shape, same blocking behaviour -- and as of 1.4 it IS a
+recursive splitter, so a caller moving off the fork-join entry point gets the same structure it
+wanted. Use the no-grain overload if the old `grain` argument was a guess.
+
+This is a breaking change to shipped public API, taken in a minor release rather than deprecated
+through one, because the entry point had already been superseded internally for a release and had no
+callers left to warn.
+
+Its measurement table survives in `RunLazyRange`'s comments rather than in git history, because it
+says something about the code that replaced it: the fork-join splitter carried a capitalised
+instruction NOT to spawn a child on the calling worker, backed by an A/B showing self-spawn
+saturating at ~8x where round-robin `Push` climbed past 17x. The new `ParallelFor` self-spawns and
+does not saturate -- the difference is that it wakes a thief per unstolen split. That wake, and the
+per-thread seeding of its round-robin cursor, are load-bearing rather than optimisations: remove
+either and it becomes the 8x row.
+
+**`TaskDeque` now stores TAGGED pointers, so a thief never dereferences a task it has not claimed.**
+
+`steal_if` vets a candidate before claiming it, and it used to do that by passing the predicate the
+`Task*` and letting it read `corePref`/`noFiber`. That was safe in outcome -- CAS success proves
+`top_` never moved, so the vetted read was of the live task, and every other outcome discards it --
+but it was still a read through a pointer whose object lifetime could already have ended. The owner
+may pop that task, run it, free it and get the same slab slot straight back; because the free list
+is thread-local LIFO, that recycle is the **common** case, not a rare one. ThreadSanitizer reported
+it and was right to.
+
+Both vetting fields now ride in the spare low bits of the stored pointer -- `Task` is `alignas(16)`,
+so bits 0-3 are free, and a `static_assert` ties that to `alignof(Task)` so shrinking the alignment
+cannot break it silently. The predicate receives `StealBits` decoded from the tag, reading memory
+the deque owns rather than memory it does not. Sound only because both fields are written
+exclusively by `CreateTask` before the task is ever pushed, so a tag cannot go stale; a future
+mutator of either field must re-tag.
+
+Two things that sound like fixes and are not, recorded so they are not retried: making
+`Task::corePref`/`noFiber` **atomic** does nothing here, because the racing write is the
+*constructor* of the next task in that slot and initialization is not an atomic operation whatever
+the member's type is -- and the real problem is the ended lifetime, which no member type addresses.
+And "those fields never change, so the read is harmless" is a non-argument: by the time of the
+racing write they belong to a different object.
+
+**The protocol is unchanged** -- same indices, same atomics, same fences, same CAS; only the
+payload's spare bits are new. Re-verified with GenMC after the change and all three results
+reproduce exactly: no errors and 174 complete executions on both the `acq_rel` and the paper's
+`seq_cst` steal CAS, and the permanent `-DNO_POP_FENCE` negative control still produces a safety
+violation. The TSan probe went from 4 reports to **0**.
+
+**[CRITICAL] `~TaskMPSCQueue` corrupted the heap.** It ended with `::delete stub_`, but `init()`
+allocates `stub_` from the TaskAllocator slab -- and the `::` forces the *global* deallocation
+function, stepping past `Task`'s own. A slab slot went to the CRT heap: immediate
+`STATUS_HEAP_CORRUPTION` (0xC0000374) for anyone who destroyed one. It stayed hidden because nothing
+in the library destroys one (`Init()` does `instance = new TaskScheduler(...)` with no matching
+delete, so `~TaskScheduler` and the inbox vectors never run) -- but any harness or embedder that
+stack-allocates a `TaskMPSCQueue` hits it on the first run. The destructor now returns the stub to
+the arena it came from, and the default constructor zero-initializes `head_`/`tail_`/`stub_` instead
+of leaving them indeterminate.
+
+**`ParallelFor` now dispatches by slice-stealing.**
 
 `ParallelFor`'s large-range path creates one task PER WORKER instead of one per chunk. Each pulls
 `[lo, lo+grain)` off a shared cursor until the range is consumed. The per-chunk paths it replaces
@@ -26,7 +197,7 @@ The crossover sweep moved with it. Against the same sweep before the change:
 
 **The ~75 µs gate was then measured, and it stays.** The reasonable-sounding prediction was that it
 must be conservative: it was calibrated before fork-join existed, and dispatch has since got cheaper
-twice. Measured directly -- raw serial loop against `ParallelRange` (no probe to contaminate the
+twice. Measured directly -- raw serial loop against the cursor path (no probe to contaminate the
 timing), sweeping element counts so total serial work spans ~0.1 µs to ~9 ms, three body costs,
 medians of 15, stable across three runs:
 
@@ -60,27 +231,21 @@ bench row already records 0.75x on a Ryzen laptop APU and 1.09x on an M1 Air aga
 the crossover genuinely moves with core count and memory bandwidth. That is what
 `SetParallelForThresholdUs` exists for, and why the constant is exposed rather than baked in.
 
-**`ParallelRange(begin, end, grain, fn)`** is new, and exists for the one thing `ParallelFor` cannot
-do: skip the probe. `ParallelFor` runs a serial prefix and times it to decide serial-vs-parallel,
-which is the right default when you do not know the workload and pure serialization on the critical
-path when you do. On a 20,000-item job that prefix is ~312 items, roughly a third of the wall time.
+**`ParallelRange(begin, end, grain, fn)`** was added here as the probe-free entry point, and then
+**REMOVED later in this same release, before it ever shipped.** Once `ParallelFor` lost its probe,
+the reason to have a second probe-free entry point went with it -- and briefly the two were literally
+the same function, while `ParallelFor` was pointed at the same cursor. Use `ParallelFor`; the
+no-grain overload covers the case this was reached for.
 
-It also slices 16x finer -- up to 64 slices per worker against `ParallelFor`'s 4 -- which is only
-possible because the task count no longer varies with grain. **The two are not ranked; pick by the
-shape of your workload**, because each loses to the other on the wrong input:
+What it contributed survives. Its shared cursor is still `RunCursorRange`, used as the fallback when
+a second non-worker thread is already splitting, and its grain floor -- up to 64 slices per worker,
+against the 4 per worker the old per-chunk path capped at -- is what `ParallelFor` floors to now.
 
-| body | `ParallelFor` | `ParallelRange` |
-| --- | --- | --- |
-| uniform cost per item | **0.09-0.11 ms** | 0.18-0.23 ms |
-| cost varies ~20x | 0.95-1.07 ms | **0.80-0.89 ms** |
+`ParallelFor` itself ended on RECURSIVE SPLITTING rather than the cursor. It was switched to the
+cursor for one commit on the strength of three large-N samples that showed a tie, and switched back
+when the crossover sweep -- 32 points over four body costs -- showed the two cross over instead:
+the splitter is 1.4-1.6x ahead from N=1000 to N=10000 and gives up ~1.2x only at very large N.
 
-Finer slicing is **not free**. It buys load balancing with coordination, so it loses by ~2x when
-there is no imbalance to fix. Use `ParallelRange` for irregular work -- early-out branches,
-per-element data sizes, spatial queries whose depth varies -- and `ParallelFor` otherwise.
-
-Against enkiTS on the bulk row, measured with only one scheduler alive per run: **`ParallelRange`
-0.380-0.384 ms against enkiTS 0.375 ms -- a tie**, and enkiTS is far steadier (2% spread against our
-13%). `ParallelFor` on the same row is 0.444-0.468 ms; that gap is the probe.
 
 **A grain floor bug, caught by the new API and worth recording.** The first version floored grain at
 a flat 64, on the theory that a cursor makes grain a load-balancing knob only. It does not: the TASK
@@ -93,8 +258,8 @@ through `ParallelFor`, this would have shipped invisible.
 `ParallelForFJ` is no longer what `ParallelFor` selects, and stays public for callers who want the
 fork-join tree directly -- same reason `ParallelForNB` is public.
 
-**`PushArray` is not obsolete**, and the reason is structural. `ParallelFor` and `ParallelRange`
-BLOCK: their cursor, wait group and callable live on the caller's stack frame, which is the only
+**`PushArray` is not obsolete**, and the reason is structural. `ParallelFor`
+BLOCKS: its cursor, wait group and callable live on the caller's stack frame, which is the only
 thing making a zero-allocation slice-stealing loop possible. `PushArray` does not block -- it hands
 back a WaitGroup so you can submit range work and carry on, or never wait. A non-blocking cursor
 needs heap state and a refcount to outlive the caller's frame, which is a different design. It is

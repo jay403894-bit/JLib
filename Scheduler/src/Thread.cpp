@@ -723,8 +723,10 @@ void Thread::Worker() {
 				const bool iAmP  = scheduler->isPCore[qIndex] != 0;
 				const bool degen = scheduler->pWorkers.empty() || scheduler->eWorkers.empty();
 				bool sawDecline  = false;   // saw a task this sweep that exists but isn't ours (class mismatch)
-				auto classOK = [&](Task* t) {
-					if (TaskScheduler::StealClassCompatible(t, iAmP, degen)) return true;
+				// Takes the deque's tag bits rather than the Task*, so no candidate is
+				// dereferenced before it is claimed (see TaskDeque::StealBits).
+				auto classOK = [&](StealBits sb) {
+					if (TaskScheduler::StealClassCompatible(sb.corePref, iAmP, degen)) return true;
 					sawDecline = true;
 					return false;
 				};
@@ -765,6 +767,18 @@ void Thread::Worker() {
 				}
 
 				probeList(scheduler->matesOtherClass[qIndex]);
+
+				// THE NON-WORKER LANE (see TaskScheduler::nonWorkerLane). Probed HERE -- after both
+				// topology phases, before the global random fallback -- and the position is a
+				// judgement, not an accident. It has no cache locality to any worker, so it does
+				// not belong among the LLC mates; but it is the one victim guaranteed to be a
+				// SINGLE known index rather than a random draw out of a set, so putting it after
+				// the random fallback would make a lazy split's fan-out depend on a dice roll.
+				// Unlike the mate lists this is one deque pair, so the probe is unconditional and
+				// costs two loads when it is empty, which is the overwhelmingly common case.
+				if (!task_to_run) {
+					tryStealFrom((int)scheduler->nonWorkerLane);
+				}
 
 				if (!task_to_run) {
 					// Global fallback: one random probe from the same-class set, then one from the

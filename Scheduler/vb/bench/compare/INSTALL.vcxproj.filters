@@ -1,0 +1,13 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<Project ToolsVersion="18.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup>
+    <CustomBuild Include="C:\JLib\Scheduler\vb\CMakeFiles\7a57d3af5f8ab33f36c419aa04b4489a\INSTALL_force.rule">
+      <Filter>CMake Rules</Filter>
+    </CustomBuild>
+  </ItemGroup>
+  <ItemGroup>
+    <Filter Include="CMake Rules">
+      <UniqueIdentifier>{4B6B4B59-E888-350D-AEFB-D52D4F8257F1}</UniqueIdentifier>
+    </Filter>
+  </ItemGroup>
+</Project>

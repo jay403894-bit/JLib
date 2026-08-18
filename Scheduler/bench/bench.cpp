@@ -15,15 +15,34 @@
 //
 // 1a and 1b exist as a PAIR because measuring only the first one is actively misleading, and this
 // was learned the hard way. Sweeping pool size on 1a shows throughput collapsing from 3.4 M/s at 8
-// workers to 0.8 M/s at 14 and staying there, which reads as the scheduler failing to scale. It is
-// not: 1b, fork-join and the frame DAG are all flat across the same sweep on the same machine.
+// workers to 0.8 M/s at 14 and staying there, which reads as the scheduler failing to scale.
 //
 // What 1a actually measures past that point is a single producer being outrun. One thread creates
 // and pushes roughly 3.4 M tasks/sec; once the pool can drain faster than that, the surplus workers
 // find empty deques and spend their time steal-probing, and that traffic slows the producer down.
 // Hence a CLIFF at the crossover rather than a gradual slope. That is a real and useful number --
 // a main thread submitting a frame's work is a genuine pattern -- but it is a submission-rate
-// measurement, not a capacity one, and the label now says so.
+// measurement, not a capacity one, and the label says so.
+//
+// 1b HAS THE SAME CLIFF. This comment used to say "1b, fork-join and the frame DAG are all flat
+// across the same sweep", and for 1b that is FALSE -- corrected 2026-08-17 after the row was
+// mistaken for a regression and bisected. Measured, 31-worker machine, default Sleep:
+//
+//     pool     4      8     16     18     20  |    22     24     31
+//     mp   11.08  11.39  10.13  10.93  10.50  |  2.37   5.36   3.60
+//
+// Same shape as 1a, just further right: four producers can feed more consumers than one, so the
+// crossover lands at ~21 workers instead of ~14. Past it the consumers drain faster than the
+// producers submit, workers run dry and PARK, and every subsequent Push buys a kernel wake instead
+// of the ~1 ns an awake worker costs -- so the metric is bistable, ~10-11 M/s while the pool stays
+// saturated and ~3 M/s once it starts parking.
+//
+// TWO CONSEQUENCES, both bit us. First, `best-of-N` on a bistable metric publishes whichever regime
+// got lucky: this row was recorded as 8.4 M/s and then 9.8 M/s sixteen minutes later on identical
+// code, and reads ~3 M/s today, which was mistaken for a regression until v1.3.0 was rebuilt and
+// measured the same as HEAD. Second, the cliff means 1b is NOT the capacity control 1a needed --
+// it is a second submission-rate measurement with a higher crossover. fork-join and the frame DAG
+// are still the flat ones; lean on those.
 #define NOMINMAX
 #include <TaskScheduler.h>
 #include <TaskDAG.h>
@@ -57,6 +76,51 @@
 using Clock = std::chrono::steady_clock;
 static double MsBetween(Clock::time_point a, Clock::time_point b) {
     return std::chrono::duration<double, std::milli>(b - a).count();
+}
+
+// A best-of-N result that also remembers what the other N-1 runs said.
+//
+// WHY: best-of-N collapses a distribution to one number, and on a BIMODAL row that number is
+// whichever regime got lucky -- which reads as a confident measurement and is not one. The
+// multi-producer row is exactly that (see the header): it has a pool-size cliff at ~21 workers, and
+// a machine sitting near the edge lands in either the ~11 M/s saturated regime or the ~3 M/s parked
+// one. It was published as 8.4 M/s, then 9.8 M/s sixteen minutes later on identical code, then read
+// ~3 M/s months later -- and that gap was mistaken for a regression and chased through a bisect
+// before anyone noticed the row simply has two answers.
+//
+// Best-of-N is still the headline: it is the right summary for "how fast can this go", and changing
+// it would break comparison with every number already published. The spread is reported ALONGSIDE
+// it so a bimodal row announces itself instead of hiding.
+struct Spread {
+    double best  = 1e300;
+    double worst = 0.0;
+    int    n     = 0;
+    void add(double ms) {
+        if (ms < best)  best  = ms;
+        if (ms > worst) worst = ms;
+        ++n;
+    }
+    // Slowest / fastest. 1.00 is perfectly repeatable.
+    double ratio() const { return (best > 0.0 && best < 1e299) ? worst / best : 1.0; }
+};
+
+// Past this, the run-to-run gap is too wide to be ordinary noise on these benches (which sit around
+// 1.2x) and the reader is told not to trust the headline alone. Deliberately well clear of noise
+// AND well under the ~3x the multi-producer cliff produces, so it catches the real case without
+// crying wolf on a normal one.
+static constexpr double kSuspectSpreadRatio = 1.50;
+
+// `tasks / ms / 1000` is M tasks/sec, so the FASTEST time is the highest rate.
+static void PrintSpread(const char* label, const Spread& s, double tasks) {
+    if (s.n < 2) return;
+    const double fastRate = tasks / s.best  / 1000.0;
+    const double slowRate = tasks / s.worst / 1000.0;
+    printf("               %d runs spanned %.2f .. %.2f M/s (%.2fx)%s\n",
+        s.n, fastRate, slowRate, s.ratio(),
+        s.ratio() >= kSuspectSpreadRatio
+            ? "   <-- BIMODAL: read the range, not the headline"
+            : "");
+    (void)label;
 }
 
 // ---- section watchdog ---------------------------------------------------------------------------
@@ -120,6 +184,7 @@ static void ReportStealStats(const char* label) {
 
 static void BenchThroughputSingleProducer(JLib::TaskScheduler& sched) {
     double best = 1e300, bestPush = 0.0, bestDrain = 0.0;
+    Spread spread;
     // Reset HERE, not at construction: workers steal-probe continuously while idle, so anything
     // accumulated before the measured region is dead time rather than work being done.
     JLib::StealStatsReset();
@@ -139,12 +204,14 @@ static void BenchThroughputSingleProducer(JLib::TaskScheduler& sched) {
         sched.WaitFor(wg);
         auto t2 = Clock::now();
         const double total = MsBetween(t0, t2);
+        spread.add(total);
         if (total < best) { best = total; bestPush = MsBetween(t0, t1); bestDrain = MsBetween(t1, t2); }
     }
     printf("throughput/1p: %d no-op tasks in %.2f ms best-of-%d  ->  %.2f M tasks/sec  (1 producer)\n",
         kThroughputTasks, best, kThroughputRuns, kThroughputTasks / best / 1000.0);
     printf("               submit %.2f ms (%.2f M/s), drain-after-submit %.2f ms\n",
         bestPush, kThroughputTasks / bestPush / 1000.0, bestDrain);
+    PrintSpread(nullptr, spread, kThroughputTasks);
     ReportStealStats("1p");
 }
 
@@ -189,6 +256,7 @@ static void ProducerBody(void* p) {
 static void BenchThroughputBatched(JLib::TaskScheduler& sched) {
     constexpr int kChunk = 64;               // 200,000 divides evenly by this
     double best = 1e300, bestPush = 0.0, bestDrain = 0.0;
+    Spread spread;
     JLib::Task* chunk[kChunk];
     JLib::StealStatsReset();
     for (int run = 0; run < kThroughputRuns; ++run) {
@@ -208,12 +276,14 @@ static void BenchThroughputBatched(JLib::TaskScheduler& sched) {
         sched.WaitFor(wg);
         auto t2 = Clock::now();
         const double total = MsBetween(t0, t2);
+        spread.add(total);
         if (total < best) { best = total; bestPush = MsBetween(t0, t1); bestDrain = MsBetween(t1, t2); }
     }
     printf("throughput/bt: %d no-op tasks in %.2f ms best-of-%d  ->  %.2f M tasks/sec  (1 producer, PushBatch x%d)\n",
         kThroughputTasks, best, kThroughputRuns, kThroughputTasks / best / 1000.0, kChunk);
     printf("               submit %.2f ms (%.2f M/s), drain-after-submit %.2f ms\n",
         bestPush, kThroughputTasks / bestPush / 1000.0, bestDrain);
+    PrintSpread(nullptr, spread, kThroughputTasks);
     ReportStealStats("bt");
 }
 
@@ -276,6 +346,7 @@ static void BenchIdleBurst(JLib::TaskScheduler& sched) {
 
 static void BenchThroughputMultiProducer(JLib::TaskScheduler& sched) {
     double best = 1e300;
+    Spread spread;
     int    totalFailed = 0;
     JLib::StealStatsReset();
     for (int run = 0; run < kThroughputRuns; ++run) {
@@ -293,13 +364,18 @@ static void BenchThroughputMultiProducer(JLib::TaskScheduler& sched) {
             sched.Push(t);
         }
         sched.WaitFor(wg);
-        best = std::min(best, MsBetween(t0, Clock::now()));
+        const double total = MsBetween(t0, Clock::now());
+        spread.add(total);
+        best = std::min(best, total);
         for (int p = 0; p < kProducers; ++p) totalFailed += g_producerArgs[p].failed;
     }
     if (totalFailed)
         printf("throughput/mp: ERROR -- %d task allocations failed\n", totalFailed);
     printf("throughput/mp: %d no-op tasks in %.2f ms best-of-%d  ->  %.2f M tasks/sec  (%d producers)\n",
         kThroughputTasks, best, kThroughputRuns, kThroughputTasks / best / 1000.0, kProducers);
+    // This row is the reason Spread exists -- it is bimodal near the pool-size cliff. See the file
+    // header, and do not quote the headline from a run whose spread flagged.
+    PrintSpread("mp", spread, kThroughputTasks);
     ReportStealStats("mp");
 }
 
@@ -442,8 +518,10 @@ static void BenchRecursiveForkJoin(JLib::TaskScheduler& sched);
 // between callers. So this sweeps both axes -- N and per-element cost -- and reports where parallel
 // starts winning for each. One number cannot be right for all four rows; that is the finding.
 //
-// Calls ParallelForFJ DIRECTLY, deliberately: going through ParallelFor would hit the very 10k gate
-// being measured and silently report serial-vs-serial below it.
+// (This used to call the removed ParallelForFJ DIRECTLY, to dodge the fixed 10k gate it was
+// measuring -- going through ParallelFor would have reported serial-vs-serial below it. The gate
+// became probe-based, so the sweep calls ParallelFor normally now.)
+
 
 // Per-element bodies of increasing cost. volatile-ish accumulation so the optimizer can't delete them;
 // the results are summed into a global that gets printed.
@@ -510,7 +588,7 @@ static void SweepOne(JLib::TaskScheduler& sched, const char* label, const std::v
             std::vector<double> partials((size_t)workers * 8, 0.0);   // padded, but correctness only
             auto t1 = Clock::now();
             std::atomic<double> pacc{ 0.0 };
-            // ParallelFor, not ParallelForFJ: now that the gate is probe-based rather than a fixed
+            // ParallelFor, not the removed fork-join entry point: now that the gate is probe-based
             // element count, this measures the DECISION as well as the dispatch. Every cell should
             // read >= ~1.00x -- anything well below means the probe chose parallel when it shouldn't.
             sched.ParallelFor(0, n, grain, [&](int a, int b) {
