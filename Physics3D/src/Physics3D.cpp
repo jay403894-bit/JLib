@@ -163,13 +163,13 @@ protected:
     virtual void QueueJob(Job* inJob) override {
         // Hold a reference across the hop to the pool; the task releases it after running the job.
         inJob->AddRef();
-        // fastJob = true: a Jolt job is PURE COMPUTE and never suspends (it never calls the scheduler's
+        // TaskType::Native: a Jolt job is PURE COMPUTE and never suspends (it never calls the scheduler's
         // WaitOnEvent), so it needs no fiber of its own -- run it inline on the worker's stack. That skips
         // the per-job fiber allocation + context switch, which matters because one physics step spawns many
         // small jobs. (It's the CreateTask default too, but pinned explicitly so intent is clear.)
         auto& sched = JLib::TaskScheduler::Instance();
         auto* task = sched.CreateTask([inJob]() { inJob->Execute(); inJob->Release(); },
-                                      /*hipri*/ false, JLib::FiberSize::Standard, /*fastJob*/ true);
+                                      /*hipri*/ false, JLib::FiberSize::Standard, JLib::TaskType::Native);
         if (task)
             sched.Push(task);
         else
