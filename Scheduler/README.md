@@ -389,7 +389,7 @@ int main() {
     JLib::TaskScheduler::Init();               // auto pool size (hw-1)
     auto& sched = JLib::TaskScheduler::Instance();
 
-    // Fire and forget. noFiber is the default: runs inline on a worker, no fiber, no switch.
+    // Fire and forget. TaskType::Native is the default: runs inline on a worker, no fiber, no switch.
     sched.Push([] { HeavyMath(); });
 
     // Scatter-gather: N independent tasks against one WaitGroup, then wait for all of them.
@@ -454,8 +454,8 @@ that if adding workers stops helping, the loop is the thing to look at. Two ways
 
 ### Rules worth knowing
 
-A task that will call `WaitFor` must be created with **`noFiber = false`**. It defaults to true, and
-a task with no fiber under it cannot suspend -- it fail-fasts with no message.
+A task that will call `WaitFor` must be created with **`TaskType::Fiber`**. It defaults to
+`TaskType::Native`, and a task with no fiber under it cannot suspend -- it fail-fasts with no message.
 
 Tasks live in 256-byte slab slots, so a lambda capturing more than about **192 bytes** fails a
 `static_assert`. Capture pointers, not payloads.
@@ -641,7 +641,7 @@ decisions that were tried and removed.
 
 ## Versioning
 
-1.6.0. The supported API is `TaskScheduler.h`, `Task.h` and `TaskDAG.h`; those follow semver and do
+2.0.0. The supported API is `TaskScheduler.h`, `Task.h` and `TaskDAG.h`; those follow semver and do
 not break without a 2.0. Every header is installed because the supported ones need them to compile,
 but the rest are implementation detail and may change in any release. If you need something only
 reachable through one of those, that is a missing feature -- open an issue rather than depend on it.
