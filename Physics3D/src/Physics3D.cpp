@@ -4,7 +4,7 @@
 // JLib::Physics3D implementation -- the Jolt-backed physics library (see Physics3D.h for the interface
 // contract). Boilerplate (layer interfaces, allocator/factory/type registration, the step call) adapted
 // from Jolt's public-domain HelloWorld.cpp. All Jolt/JPH types stay inside THIS file (PIMPL). Jolt's jobs
-// run on JLib::Scheduler via SchedulerJobSystem below (fastJob=true, loPri -> E-cores under P/E routing).
+// run on JLib::Scheduler via SchedulerJobSystem below (TaskType::Native, loPri -> E-cores under P/E routing).
 
 // Jolt.h MUST be included before any other Jolt header.
 #include <Jolt/Jolt.h>

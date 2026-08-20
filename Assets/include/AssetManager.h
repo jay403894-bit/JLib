@@ -84,9 +84,9 @@ public:
         AssetHandle<T> handle = AllocateSlotLocked(key);
         lock.unlock();
 
-        // fastJob (the CreateTask default) is correct here: loaderFn is expected to be
+        // TaskType::Native (the CreateTask default) is correct here: loaderFn is expected to be
         // synchronous, blocking work (file I/O/decode) that never calls WaitOnEvent*/suspends --
-        // exactly the fastJob contract, so it runs inline on whichever worker claims it with no
+        // exactly the Native contract, so it runs inline on whichever worker claims it with no
         // fiber overhead.
         JLib::TaskScheduler::Instance().Push([this, handle, key, loaderFn]() {
             Slot& slot = m_Slots[handle.index]; // stable address -- see AllocateSlotLocked's comment

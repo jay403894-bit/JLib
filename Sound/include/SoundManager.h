@@ -39,7 +39,7 @@ namespace JLib {
     //      thread audio contributes -- event-driven, ~100 wakes/s, so it needs no reserved core).
     //      Its data callback does the absolute minimum: drain the ring buffer into the WASAPI buffer,
     //      then, if the ring has >= one chunk of space and no refill is already in flight
-    //      (m_RefillInFlight exchange-guard), push ONE hiPri fastJob that runs RefillRing(). Pushing
+    //      (m_RefillInFlight exchange-guard), push ONE hiPri Native task that runs RefillRing(). Pushing
     //      from a foreign thread is fine -- CreateTask/Push are any-thread-safe (MPSC inboxes), and
     //      the same-address-space cost is a slab alloc + queue push, microseconds.
     //
@@ -103,9 +103,9 @@ namespace JLib {
         // Caller must hold m_VoicesMutex.
         bool IsValidLocked(SoundHandle handle) const;
 
-        // The mixing work: tops the ring buffer up to full, then returns. Runs as a hiPri fastJob on
-        // whatever pool worker picks it up (also called synchronously once in Initialize to prefill).
-        // Never suspends (fastJob contract). Clears m_RefillInFlight on exit.
+        // The mixing work: tops the ring buffer up to full, then returns. Runs as a hiPri Native task
+        // on whatever pool worker picks it up (also called synchronously once in Initialize to prefill).
+        // Never suspends (the Native contract). Clears m_RefillInFlight on exit.
         void RefillRing();
 
         // miniaudio's device data callback -- runs on miniaudio's OWN thread, not the JLib pool.
