@@ -1,0 +1,425 @@
+# Build and smoke-test JLib::Scheduler on every supported target.
+#
+# The point is not the benchmark numbers -- CI runners are shared VMs and their timings are noise.
+# The point is that the thing BUILDS and RUNS on each ABI from a CLEAN CHECKOUT. That last part
+# matters more than it sounds: the worst bug of the AArch64 port was a stale file that a local
+# incremental build happily kept using and a fresh clone could never have produced.
+#
+# Free on GitHub-hosted runners for public repositories, including the ARM64 Linux ones.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:      # adds a "Run workflow" button on the Actions tab
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false    # one target failing should not hide the others' results
+      matrix:
+        include:
+          - name: Windows x64 (MSVC)
+            os: windows-latest
+            bench: build/bin/Release/SchedulerBench.exe
+            smoke: build/bin/Release/SchedulerEventSmoke.exe
+            topo: build/bin/Release/SchedulerTopologyTest.exe
+            prims: build/bin/Release/SchedulerPrimitivesTest.exe
+            fiberbudget: build/bin/Release/SchedulerFiberBudgetTest.exe
+            slabsize: build/bin/Release/SchedulerTaskSlabSizeTest.exe
+            immediatedrain: build/bin/Release/SchedulerImmediateDrainTest.exe
+          - name: Linux x86-64 (GCC)
+            os: ubuntu-latest
+            bench: build/bin/SchedulerBench
+            smoke: build/bin/SchedulerEventSmoke
+            topo: build/bin/SchedulerTopologyTest
+            prims: build/bin/SchedulerPrimitivesTest
+            fiberbudget: build/bin/SchedulerFiberBudgetTest
+            slabsize: build/bin/SchedulerTaskSlabSizeTest
+            immediatedrain: build/bin/SchedulerImmediateDrainTest
+          - name: Linux AArch64 (GCC)
+            os: ubuntu-24.04-arm
+            bench: build/bin/SchedulerBench
+            smoke: build/bin/SchedulerEventSmoke
+            topo: build/bin/SchedulerTopologyTest
+            prims: build/bin/SchedulerPrimitivesTest
+            fiberbudget: build/bin/SchedulerFiberBudgetTest
+            slabsize: build/bin/SchedulerTaskSlabSizeTest
+            immediatedrain: build/bin/SchedulerImmediateDrainTest
+          - name: macOS arm64 (AppleClang)
+            os: macos-14
+            bench: build/bin/SchedulerBench
+            smoke: build/bin/SchedulerEventSmoke
+            topo: build/bin/SchedulerTopologyTest
+            prims: build/bin/SchedulerPrimitivesTest
+            fiberbudget: build/bin/SchedulerFiberBudgetTest
+            slabsize: build/bin/SchedulerTaskSlabSizeTest
+            immediatedrain: build/bin/SchedulerImmediateDrainTest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Report the target
+        run: cmake --version
+        shell: bash
+
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+        shell: bash
+
+      # --config matters on Windows (the VS generator is multi-config and ignores
+      # CMAKE_BUILD_TYPE); it is harmlessly ignored by single-config generators.
+      - name: Build
+        run: cmake --build build --config Release -j 2
+        shell: bash
+
+      # AffinityPolicy::None, not the default Hard: CI containers run under a restricted cpuset, so
+      # pinning to a CPU index the cgroup does not own just fails. The scheduler ignores that
+      # failure by design, but None keeps the run honest about what is being tested -- correctness,
+      # not placement.
+      - name: Run benchmark (smoke test)
+        run: ./${{ matrix.bench }} none
+        shell: bash
+
+      # The named-event path: a lock-free waiter stack the benchmark never touches. Worth running on
+      # every target rather than just one, because the thing at risk in new atomic code is memory
+      # ORDERING, and x86 is TSO -- it hands you acquire/release semantics on ordinary loads and
+      # stores whether you asked for them or not. A missing barrier is invisible there. Two of these
+      # four runners are weakly ordered ARM64, which is the only reason this test is worth much.
+      - name: Run event test (lock-free waiter stack)
+        run: ./${{ matrix.smoke }}
+        shell: bash
+
+      # The >64-CPU path, which none of these runners is wide enough to exercise for real. These are
+      # the parts of it that are pure logic: mask math, the flat CpuId split, the sysfs list parser,
+      # and a hand-built uneven-processor-group topology checking that every worker gets a CPU that
+      # actually exists. It carries a negative control asserting the old dense scheme WOULD have
+      # failed that case, so a pass means something rather than just "this runner is dense".
+      - name: Run topology test (wide-CPU logic)
+        run: ./${{ matrix.topo }}
+        shell: bash
+
+      # The fiber-aware locks: mutex, semaphore, condition variable, ScopedPermit. Carries the
+      # regression test for the 1.2.3 self-deadlock, which is verified to FAIL with the guard removed
+      # rather than merely passing with it present. Every blocking case runs under a watchdog, so a
+      # regression exits nonzero in 30 seconds instead of hanging this job for its full timeout --
+      # which is exactly what the 1.2.0 macOS bug did, for thirty minutes a run.
+      - name: Run primitives test (locks, and the deadlock regression)
+        run: ./${{ matrix.prims }}
+        shell: bash
+
+      # Same suite again under IdlePolicy::NoSleep. That policy changes the worker's park path --
+      # the exact code the 1.2.0 lost wakeup lived in -- so running the existing blocking cases
+      # under it is worth far more than a bespoke test would be. Cheap: the suite is seconds, and
+      # it carries its own watchdog, so a regression here fails fast instead of hanging the job.
+      - name: Run primitives test under NoSleep
+        run: ./${{ matrix.prims }} nosleep
+        shell: bash
+
+      # Third mode: worker self-triggered reclamation OFF -- how an application that ticks
+      # EpochManager from its own idle path runs. Exercises the branch where RetirePtr skips its
+      # atomic entirely, and the guarded decrement in TryReclaim that would otherwise wrap size_t
+      # on the first manual Tick(). Neither has any other coverage.
+      - name: Run primitives test with self-reclaim disabled
+        run: ./${{ matrix.prims }} noreclaim
+        shell: bash
+
+      # SetFiberBudget: does StartPool actually consume the configured per-worker fiber counts, not
+      # just the setter storing them. Verified as a real check before this was added -- reverting
+      # the StartPool wiring back to the old hardcoded 64/8 makes this fail with the wrong pool size
+      # rather than passing regardless.
+      - name: Run fiber budget test (SetFiberBudget wiring)
+        run: ./${{ matrix.fiberbudget }}
+        shell: bash
+
+      # SetTaskSlabSize: same shape of check as the fiber budget one -- does construction actually
+      # consume the configured slot count, and does the allocator genuinely exhaust at it. Verified
+      # as real before this was added: reverting the wiring back to the hardcoded 1024*1024 made
+      # both checks fail (reported capacity 1048576 instead of the configured value, and none of
+      # 137 allocation attempts against a slab meant to hold 37 ever returned nullptr).
+      - name: Run task slab size test (SetTaskSlabSize wiring)
+        run: ./${{ matrix.slabsize }}
+        shell: bash
+
+      # PushImmediate's inbox drain: does draining a >BATCH_SIZE backlog via the 2.2.0 PushBatch
+      # swap still get every task out and running, and does the pinned immediate task still run
+      # afterward. Needs an exact 2-worker pool to make the drain deterministic (worker 0 pins,
+      # worker 1 is the only place the drained backlog can land), which is why this is standalone
+      # rather than folded into primitives_test.cpp.
+      - name: Run immediate-task drain test (PushBatch-based inbox drain)
+        run: ./${{ matrix.immediatedrain }}
+        shell: bash
+
+      # macOS arm64 ONLY, and a deliberate reproducer rather than a test.
+      #
+      # The fiber-contention case at 2000 iterations (~4000 contended fiber suspend/resume round
+      # trips) blew the 30s watchdog here on 2026-08-16 -- but the SAME test at the SAME count had
+      # passed one commit earlier, so the failure is INTERMITTENT. Lowering the default to 200 may
+      # therefore have cut the odds of hitting a race by ~10x rather than fixing anything, and this
+      # project has already shipped exactly this shape once: the 1.2.0 sleep-predicate lost wakeup
+      # hung macOS arm64 about one run in three and never reproduced on x86, because TSO hides it.
+      #
+      # Ten runs at the high count with a RAISED watchdog is what separates the two explanations:
+      #   all ten complete (even if slowly) -> suspend/resume here is just slow; nothing to fix
+      #   any run hangs to the 120s watchdog -> a race, and the iteration count is irrelevant
+      # continue-on-error: this is diagnostic, so a hit must not turn main red until it is
+      # understood -- read the step's log, do not trust the job's colour for this one.
+      - name: macOS arm64 race hunt (high-iteration reproducer, diagnostic)
+        if: matrix.os == 'macos-14'
+        continue-on-error: true
+        env:
+          JLIB_TEST_CONTENTION_ITERS: 2000
+          JLIB_TEST_WATCHDOG_SECS: 120
+        run: |
+          for i in $(seq 1 10); do
+            echo "=== run $i ==="
+            ./${{ matrix.prims }} || echo "RUN $i FAILED (exit $?)"
+          done
+        shell: bash
+
+      # The steal counters compile out entirely in a normal build, which is the point but also the
+      # hazard: code that is never compiled rots silently, and the first person to need it would
+      # discover that months later while chasing something else. This is the one place it gets built,
+      # so a typo in it cannot reach a release unnoticed. One target is enough, since the code is
+      # platform-independent, and it goes on the cheapest runner.
+      - name: Build with steal instrumentation (one target)
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          cmake -S . -B build-stats -DCMAKE_BUILD_TYPE=Release -DJLIBSCHED_STEAL_STATS=ON
+          cmake --build build-stats -j 2
+          ./build-stats/bin/SchedulerBench none 4 nosweep
+        shell: bash
+
+      # Same rot hazard and same fix as the steal counters above, for the latency breakdown added
+      # in 2.3.0 (JLIBSCHED_LATENCY_STATS -- see Thread.h).
+      - name: Build with latency instrumentation (one target)
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          cmake -S . -B build-latency-stats -DCMAKE_BUILD_TYPE=Release -DJLIBSCHED_LATENCY_STATS=ON
+          cmake --build build-latency-stats -j 2
+          ./build-latency-stats/bin/SchedulerBench none 4 nosweep
+        shell: bash
+
+      # tests/verify/fiberresume_model.tla, added 2.4.0 -- see the README's "Model checked" section
+      # for what this does and does not prove. Java is preinstalled on GitHub-hosted Ubuntu runners;
+      # tla2tools.jar needs no build step at all, unlike GenMC below. Translating BEFORE checking
+      # catches a stale/hand-edited PlusCal->TLA+ translation as a real CI failure, not just a local
+      # "trust the committed output" assumption. Same bounds already verified by hand and recorded
+      # in the .tla file's own header (828 distinct states, MaxFibers=3) -- a CI pass means the same
+      # thing that verification already meant, just re-run automatically instead of by memory.
+      - name: Model-check fiberresume_model.tla (TLA+/TLC)
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          curl -sL -o /tmp/tla2tools.jar https://github.com/tlaplus/tlaplus/releases/download/v1.7.4/tla2tools.jar
+          java -cp /tmp/tla2tools.jar pcal.trans tests/verify/fiberresume_model.tla
+          java -cp /tmp/tla2tools.jar tlc2.TLC -workers auto tests/verify/fiberresume_model.tla
+        shell: bash
+
+      # GenMC models: tests/verify/*.c, checking the four primitives this scheduler's history
+      # actually broke (1.2.0's lost wakeup, 1.3.4's mutex deadlock) exhaustively rather than
+      # hoping a normal test run happens to hit the bad interleaving. Runs via the genmc/genmc
+      # Docker Hub image (verified to exist and carry a v0.17.0 tag before relying on it -- an
+      # earlier guess at a ghcr.io package for this did NOT exist, confirmed by a direct anonymous
+      # registry pull attempt, so this one was checked rather than assumed by analogy) pinned to
+      # that exact tag, the same version every model's own RESULTS section was recorded against.
+      # No from-source LLVM build, no cache management -- just a docker pull.
+      #
+      # -unroll=8 on every invocation, even though none of these four harnesses actually contain
+      # an unbounded loop (traced by hand: deque/event are NITEMS- or thread-count-bounded,
+      # sleepwake has no loop at all, fiberwait's for(;;) provably exits within 2 iterations) --
+      # defense in depth per GenMC's own manual ("for infinite loops with side effects, use
+      # -unroll=N"), so a future model that DOES add an unbounded loop fails fast/deterministically
+      # in seconds instead of a CI job silently running to the full job timeout.
+      #
+      # Every model runs twice: as shipped (must report no errors) and under its documented
+      # negative control (must report an error). The second half is the part that makes the first
+      # half mean anything -- a model whose negative control silently stopped failing has quietly
+      # become a vacuous check, exactly the trap the primitives test suite was bitten by once
+      # already (passed 1-in-3 runs with the mutex physically removed).
+      - name: Run GenMC models (exhaustive, not lucky)
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          docker pull genmc/genmc:v0.17.0
+
+          # NOT plain `genmc` -- checked the image directly (registry API, no local Docker
+          # available at the time): the installed binary sits at /usr/local/bin/genmc/genmc, a
+          # directory named genmc containing the executable one level deeper, not a file directly
+          # on PATH. Plain `genmc` resolves to nothing and fails with "executable file not found".
+          # `genmc [OPTIONS] -- [COMPILER_FLAGS] <file>` -- -unroll is a GenMC OPTION (cli.md lists
+          # it alongside -sc/-rc11/etc), so it belongs BEFORE the --, not after. The -D defines and
+          # the source file are COMPILER_FLAGS and belong after it. Getting this backwards either
+          # silently no-ops the bound or hard-errors depending on how clang treats the unknown flag
+          # -- checked the docs directly rather than guess after the PATH fix above already needed
+          # one correction.
+          run_genmc() {
+            docker run --rm -v "$PWD":/workspace -w /workspace genmc/genmc:v0.17.0 \
+              /usr/local/bin/genmc/genmc -unroll=8 -- "$@"
+          }
+          run_positive() {
+            echo "=== genmc -unroll=8 -- $* (expect: no errors) ==="
+            run_genmc "$@"
+          }
+          run_negative() {
+            echo "=== genmc -unroll=8 -- $* (expect: FAILS -- this is the negative control) ==="
+            if run_genmc "$@"; then
+              echo "NEGATIVE CONTROL DID NOT FAIL: $* -- the check has gone vacuous"
+              exit 1
+            fi
+            echo "  (correctly failed)"
+          }
+
+          run_positive tests/verify/deque_model.c
+          run_negative -DNO_POP_FENCE tests/verify/deque_model.c
+
+          run_positive tests/verify/event_model.c
+          run_negative -DNO_RELEASE tests/verify/event_model.c
+
+          run_positive tests/verify/sleepwake_model.c
+          run_negative -DIMMEDIATE_ONLY -DWEAK_IMMEDIATE tests/verify/sleepwake_model.c
+
+          run_positive tests/verify/fiberwait_model.c
+          run_negative -DOLD_ORDERING tests/verify/fiberwait_model.c
+        shell: bash
+
+  # ---------------------------------------------------------------------------------------------
+  # Windows on ARM64 -- REQUIRED as of 1.3.6.
+  #
+  # Landed 2026-08-17 as continue-on-error, because src/win32/aarch64/ContextSwitch.asm is a
+  # hand-written switch for an ABI nobody here has hardware for and one green run on fresh assembly
+  # is not evidence. Promoted after FIVE consecutive green runs, four of which included the isolated
+  # ABI harness below. Windows/ARM64 is a supported platform from that point, and this leg is what
+  # backs the claim -- if it goes red, the claim is wrong, not the CI.
+  #
+  # Kept as its own job rather than folded into the `build` matrix on purpose: it runs a test no
+  # other platform has (SchedulerFiberAbiTest), and the matrix shares one step list, so folding it
+  # in would mean conditioning that step on the matrix entry. A separate job is the honest shape --
+  # same reasoning as context-switch-abi below.
+  #
+  # THE TEST THAT MATTERS IS THE PRIMITIVES SUITE, not the build. A context switch that is wrong
+  # about the callee-saved set, or that clobbers x18 (the TEB pointer -- and fibers MIGRATE between
+  # worker threads here, so a stale TEB lands on an innocent thread), compiles and links perfectly
+  # and then corrupts thread-local state nondeterministically. The primitives suite is thousands of
+  # real fiber suspend/resume round trips under contention, which is what actually exercises that.
+  # A green build here proves almost nothing on its own.
+  #
+  # The isolated ABI harness IS covered, by SchedulerFiberAbiTest -- a Windows port of
+  # tests/fibertest_aarch64.cpp. It runs FIRST below, because it localises a bad switch to the
+  # specific register that moved instead of leaving it to be inferred from a scheduler crash.
+  windows-arm64:
+    name: Windows ARM64 (MSVC)
+    runs-on: windows-11-arm
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Report the target
+        run: |
+          cmake --version
+          echo "PROCESSOR_ARCHITECTURE=$PROCESSOR_ARCHITECTURE"
+        shell: bash
+
+      # Expect "Windows / aarch64 (os layer: win32)". If it says x86_64, the arch detection in
+      # CMakeLists.txt did not fire and everything below is testing the wrong switch.
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+        shell: bash
+
+      - name: Build
+        run: cmake --build build --config Release -j 2
+        shell: bash
+
+      # FIRST, because it is the only test whose failure needs no interpretation: it links against
+      # the context switch with no scheduler attached, drives one round trip, and reports a bitmask
+      # naming the exact registers that did not survive. Everything after this can only tell you
+      # that SOMETHING is wrong.
+      - name: Run ABI harness (context switch in isolation)
+        run: ./build/bin/Release/SchedulerFiberAbiTest.exe
+        shell: bash
+
+      # Ordered cheapest-signal-first. The event smoke test is the shortest thing that drives real
+      # fibers, so a switch that cannot complete one round trip dies here with a clear symptom
+      # rather than as a hang thirty seconds into the primitives suite.
+      - name: Run event test (lock-free waiter stack)
+        run: ./build/bin/Release/SchedulerEventSmoke.exe
+        shell: bash
+
+      # Not fiber-related, but it is the one test that reads the Windows topology API, and the
+      # ARM64 machines are big.LITTLE -- so P/E classification is genuinely untested territory here.
+      - name: Run topology test (wide-CPU logic)
+        run: ./build/bin/Release/SchedulerTopologyTest.exe
+        shell: bash
+
+      - name: Run primitives test (the real check -- fiber suspend/resume under contention)
+        run: ./build/bin/Release/SchedulerPrimitivesTest.exe
+        shell: bash
+
+      - name: Run primitives test under NoSleep
+        run: ./build/bin/Release/SchedulerPrimitivesTest.exe nosleep
+        shell: bash
+
+      - name: Run primitives test with self-reclaim disabled
+        run: ./build/bin/Release/SchedulerPrimitivesTest.exe noreclaim
+        shell: bash
+
+      - name: Run fiber budget test (SetFiberBudget wiring)
+        run: ./build/bin/Release/SchedulerFiberBudgetTest.exe
+        shell: bash
+
+      - name: Run task slab size test (SetTaskSlabSize wiring)
+        run: ./build/bin/Release/SchedulerTaskSlabSizeTest.exe
+        shell: bash
+
+      - name: Run immediate-task drain test (PushBatch-based inbox drain)
+        run: ./build/bin/Release/SchedulerImmediateDrainTest.exe
+        shell: bash
+
+      - name: Run benchmark (smoke test)
+        run: ./build/bin/Release/SchedulerBench.exe none
+        shell: bash
+
+  # The ABI harness: links against ONE object (the context switch) with no scheduler attached, so a
+  # failure here is unambiguously the assembly's fault. Run at BOTH -O0 and -O2 -- register
+  # allocation around the pinned callee-saved sentinels differs enough between them that a broken
+  # switch can pass at one level and fail at the other.
+  # Runs on BOTH AArch64 OSes, because the ABI is shared but the toolchain and object format are
+  # not: Linux is GCC/ELF, macOS is AppleClang/Mach-O and takes the #if defined(__APPLE__) half of
+  # the file -- the half that can only ever be exercised on a Mac. `c++` resolves correctly on each.
+  # Note `uname -m` disagrees between them: Linux says aarch64, Darwin says arm64. Same ISA.
+  context-switch-abi:
+    name: ABI harness -- ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux AArch64 (GCC/ELF)
+            os: ubuntu-24.04-arm
+          - name: macOS arm64 (AppleClang/Mach-O)
+            os: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      # Block scalar, not an inline one: an unquoted YAML value containing ": " parses as a nested
+      # mapping and breaks the whole file.
+      - name: Verify we are actually on AArch64
+        run: |
+          uname -m | grep -Eq '^(aarch64|arm64)$'
+          echo "arch is $(uname -m)"
+      - name: Build and run at -O0 and -O2
+        run: |
+          for O in 0 2; do
+            echo "===== -O$O ====="
+            c++ -std=c++17 -O$O -g -o ft$O \
+              tests/fibertest_aarch64.cpp src/posix/aarch64/ContextSwitch.S
+            ./ft$O
+          done
+
+# macOS note: macos-14 and later are Apple Silicon; macos-13 is Intel. If an Intel macOS target is
+# ever wanted, it needs no new code -- src/darwin/ is the OS layer and src/posix/x86_64/ already has
+# the System V switch -- but hw.logicalcpu != hw.physicalcpu there (hyper-threading), and
+# src/darwin/Topology.cpp deliberately reports no SMT pairing in that case rather than guess it.

@@ -11,15 +11,40 @@ bench/*.ilk
 # committing: the generated tree is machine- and generator-specific, so a clone that inherited one
 # would fail to configure rather than save anyone a step.
 build/
-# -DJLIBSCHED_STEAL_STATS=ON gets its own tree so the normal build stays clean
+# -DJLIBSCHED_STEAL_STATS=ON / -DJLIBSCHED_LATENCY_STATS=ON get their own trees so the normal
+# build stays clean
 build-stats/
+build-latency/
+build-latency-stats/
 build-compare/
+# -DJLIBSCHED_TUNABLE_FAST_SPIN=ON (the lock bench) -- same reason: it is a diagnostic
+# configuration and must not be mistaken for, or overwrite, the normal build tree.
+build-lockbench/
+# -DJLIBSCHED_CORO_STATS / -DJLIBSCHED_CORO_POOL (the coroutine bench).
+build-corobench/
+# Catch-all for the same shape. The entries above are kept for documentation -- each names what its
+# tree is for -- but this is what actually protects against the next one: 2.11.0 committed 6.3 MB of
+# .obj/.lib/.exe from build-corobench/ because a new diagnostic tree was created and the matching
+# ignore line was not. Narrow-by-default is right for x64/ folders some JLib repos commit on
+# purpose; it is not worth re-learning for CMake trees, which are never worth committing.
+build-*/
 cmake-build*/
 out/
 CMakeCache.txt
 CMakeFiles/
 CMakeUserPresets.json
 cmake_install.cmake
+
+# Measurement harnesses and one-off experiments. Real source, and worth keeping ON DISK -- several
+# of these are the only record of how a number was arrived at (scratchpad/taskcost.cpp is where the
+# 17.8 ns speculative-split figure comes from, scratchpad/lazytest.cpp holds the negative control
+# for the lazy splitter). They are ignored rather than committed because they are machine- and
+# question-specific: each one was written to settle one argument, they reference absolute paths and
+# a locally-built lib, and a public repo should not carry a graveyard of them.
+#
+# If a harness turns into something worth re-running on every change, it belongs in tests/ or
+# bench/ with a CMake target, not here.
+scratchpad/
 
 # MSBuild scratch. $(SolutionDir) resolves differently depending on whether this repo is built
 # standalone or as part of the JLib umbrella, so intermediates can land in either place.
