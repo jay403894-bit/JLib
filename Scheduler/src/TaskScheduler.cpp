@@ -178,6 +178,13 @@ GlobalFiberPool* TaskScheduler::globalPool = nullptr;
 TaskScheduler::TaskScheduler(size_t poolSize) {
 	StartPool(poolSize);
 }
+// Init-only, and a plain bool for the same reason as EpochManager's selfReclaim: written once before
+// any thread exists, read while sizing the pool. Nothing races it.
+static bool g_reserveTimerCore = false;
+
+void TaskScheduler::SetReserveTimerCore(bool reserve) noexcept { g_reserveTimerCore = reserve; }
+bool TaskScheduler::ReserveTimerCore() noexcept { return g_reserveTimerCore; }
+
 size_t TaskScheduler::GetSafeTC() {
 	// The AUTO pool size (Init/StartPool with poolSize == 0): hw-1 -- main pins CPU 0, workers pin
 	// CPUs 1..hw-1. HISTORY (don't relive it): this was briefly hw-2 (2026-07-31) because GameInput's
@@ -190,9 +197,19 @@ size_t TaskScheduler::GetSafeTC() {
 	// low-duty-cycle wakers that time-slice fine -- measured, not assumed. Apps whose profile disagrees
 	// (or that DON'T use manual-dispatch input) pass an EXPLICIT poolSize to Init (e.g. hw-2) -- that's
 	// the config surface, deliberately no env var; explicit sizes may claim up to full hw (StartPool).
+	//
+	// AND ONE MORE when the app has declared it will use deadlines. TimerQueue runs a thread of its
+	// own -- it has to, because it is the only place in the library a TIMED wait is allowed, and a
+	// worker that can return unsignalled is how a lost wakeup turns into "occasionally slow" instead
+	// of "hung". A thread is the cheap half of that trade: it sleeps untimed whenever nothing is
+	// armed, so it costs a slot in the census and almost no CPU. See SetReserveTimerCore.
 	unsigned int cores = std::thread::hardware_concurrency();
 	if (cores <= 1) return 1;
-	return static_cast<size_t>(cores - 1);
+
+	unsigned int reserved = 1;                       // main
+	if (g_reserveTimerCore) reserved += 1;           // the timer thread
+	if (cores <= reserved) return 1;
+	return static_cast<size_t>(cores - reserved);
 }
 void TaskScheduler::Init(size_t poolSize) {
 	if (instance != nullptr)
@@ -217,11 +234,28 @@ bool TaskScheduler::PushMain(Task* task) {
 	mainQ.push(task);
 	return true;
 }
+// Disposal must match what the completion paths do, minus the payload: release the WaitGroup FIRST
+// so nothing waiting on this work blocks forever on something abandoned, then clean up and free.
+bool TaskScheduler::DiscardIfCancelled(Task* task) {
+	if (!task || task->started || !IsTaskCancelled(task)) return false;
+
+	if (task->waitGroup) {
+		const int old = task->waitGroup->n.fetch_sub(1, std::memory_order_acq_rel);
+		if ((old & WaitGroup::COUNT_MASK) == 1 && (old & WaitGroup::WAITER_BIT))
+			task->waitGroup->WakeAll();
+	}
+	CleanupTaskMetadata(task);
+	DestroyTask(task);
+	taskAllocator.Free(task);
+	return true;
+}
+
 void TaskScheduler::ProcessMainThread() {
 	if (!poolActive) return;
 	Task* t;
 	while (mainQ.pop(t)) {
 		if (!t) continue;
+		if (DiscardIfCancelled(t)) continue;
 		t->Execute();
 		if (t->waitGroup) {
 			if (t->waitGroup) {
@@ -767,6 +801,10 @@ void TaskScheduler::ParallelFor(int begin, int end, int grain, std::function<voi
 		if (myLane) {
 			if (auto opt = myLane->pop_bottom()) {
 				Task* t = *opt;
+				// A HELPER IS A TASK PICKUP AND OWES THE SAME CHECK. This drain races the workers
+				// for the very queue they are discarding cancelled tasks from, so without this a
+				// cancelled task caught here runs its payload.
+				if (DiscardIfCancelled(t)) continue;
 				// The same completion bookkeeping Worker()'s Native fast path does, in the same
 				// order. Not factored out into a shared helper only because that path also handles
 				// immediate-core release and epoch ticking, neither of which applies here.
@@ -1626,6 +1664,11 @@ bool TaskScheduler::TryRunStolenNativeTask() {
 	// inside resume(), and completing frees both its frame and this Task -- so `task` may be dangling
 	// the moment Execute() returns, and reading ->type then to decide what to do about it is itself
 	// a use-after-free.
+	// Same pickup check the worker makes -- this is a task about to START, just on a helping thread
+	// rather than a worker. Returning true because a task WAS consumed: the caller's contract is
+	// "did I make progress", and removing a cancelled task from the queue is progress.
+	if (DiscardIfCancelled(task)) return true;
+
 	const bool isCoroutine = (task->type == TaskType::Coroutine);
 
 	task->Execute();

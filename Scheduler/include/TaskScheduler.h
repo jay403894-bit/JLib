@@ -128,6 +128,22 @@ namespace JLib {
 		void UnboostTaskPriority(Task* task);
 		void CleanupTaskMetadata(Task* task);
 
+		// Cancellation, observed wherever a task is about to RUN. True means the task was cancelled
+		// and has already been disposed of -- released its WaitGroup, destroyed, slot returned --
+		// so the caller must not touch it again and must not execute it.
+		//
+		// THIS EXISTS BECAUSE THE CHECK WAS IN ONE PLACE AND A TASK CAN START IN FOUR. Worker() had
+		// it; ProcessMainThread, WaitFor's own drain and TryRunStolenNativeTask did not, so a
+		// cancelled task picked up by a HELPER ran its payload -- reproducibly, a handful out of 500
+		// in about 7% of runs, because the helper is a race for the same queue the workers are
+		// discarding from. Same shape as the 3.2.1 bug where the waiter queues bypassed
+		// IsTaskCancelled: "one place cancellation is decided" only holds if every site calls it.
+		//
+		// ONLY AN UNSTARTED TASK IS DISCARDED, for the reason Worker() documents at length: a queued
+		// entry may be a RESUME, and discarding one of those abandons a live stack or coroutine
+		// frame instead of cancelling it.
+		bool DiscardIfCancelled(Task* task);
+
 		static TaskScheduler& Instance() {
 			if (!instance)
 				throw std::runtime_error("Call TaskScheduler::Init() before Instance()!");
@@ -714,6 +730,31 @@ namespace JLib {
 		// how many you actually spawn, not by anything the library controls.
 		static void SetSlabSizes(const SlabSizes& sizes);
 		static SlabSizes CurrentSlabSizes();
+
+		// Give the timer thread a core of its own, so an app that uses deadlines does not run one
+		// thread over the machine.
+		//
+		// WHY THIS IS NOT AUTOMATIC. The auto pool size is hw-1, and GetSafeTC's census calls that an
+		// EXACT FIT: workers + main, nothing spare. TimerQueue adds a thread, so an app using
+		// deadlines is oversubscribed by exactly one -- the deficit that cost a measured 3-4% the
+		// last time it happened (see GetSafeTC's history note on GameInput). But the timer thread
+		// only exists once something arms a deadline, and that is long after Init has sized the pool,
+		// so the scheduler cannot detect it -- and reserving unconditionally would take a worker away
+		// from every app that never arms one.
+		//
+		// So it is the app's declaration, like an explicit poolSize. Call it before Init:
+		//
+		//     TaskScheduler::SetReserveTimerCore(true);
+		//     TaskScheduler::Init(0);          // hw-2 workers; main and the timer take the rest
+		//
+		// Ignored when an EXPLICIT poolSize is given -- an explicit size is the app's own arithmetic
+		// and this must not silently second-guess it.
+		//
+		// A Development build complains the first time a deadline is armed without this set, because
+		// the alternative is the failure mode that is hardest to notice: everything works, slightly
+		// worse, forever.
+		static void SetReserveTimerCore(bool reserve) noexcept;
+		static bool ReserveTimerCore() noexcept;
 
 		// Fibers PER WORKER available to be held by a SUSPENDED task at once -- not a cap on tasks
 		// in flight, since only a task that actually suspends holds one. Defaults to 64 standard +
