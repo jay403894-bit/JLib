@@ -95,3 +95,14 @@ desktop.ini
 # If you ever add a `*.lib` or `Release/` rule, run this first and expect two paths back:
 #   git check-ignore -v ThirdParty/DirectXTex/lib/release/DirectXTex.lib
 # Silence means it is about to be dropped from the repo.
+
+# Scheduler/vb/ -- CMake build output that was committed by accident and carried a Scheduler 1.4.0
+# Scheduler.lib alongside 4.0.0 sources for months. A stale .lib next to current headers is exactly
+# what the ABI guard fastfails on, so this is not just clutter.
+#
+# ANCHORED, and the anchor is load-bearing twice over. A bare `vb/` would match any directory of
+# that name anywhere in the umbrella -- the same unanchored-pattern mistake that once swallowed
+# src/win32/ and cost a sync. And it lives HERE rather than in Scheduler/.gitignore because that
+# file is overwritten by every sync from the standalone repo, so a rule placed there would
+# disappear the next time the scheduler is updated.
+/Scheduler/vb/
