@@ -31,13 +31,14 @@ cmake_minimum_required(VERSION 3.21)
 # than waiting for release day. The number's job is to tell two trees apart, and it cannot do that
 # while a modified tree still reports the last tag. CMake's project() rejects a "-dev" suffix, so
 # there is no pre-release form to hide behind: a tree ahead of a tag simply carries the next number.
-set(JLIBSCHED_VERSION "3.5.0")
+set(JLIBSCHED_VERSION "4.0.0")
 
 # Steal-path instrumentation. OFF by design: the counters live in the steal loop, which is precisely
 # where contention is being investigated, so leaving them in a shipping build would tax the thing
 # they exist to measure. Turn on only for an experiment, and do not compare its numbers against a
 # normal build's.
 option(JLIBSCHED_STEAL_STATS "Count steal probes and hits (diagnostic; perturbs the steal path)" OFF)
+option(JLIBSCHED_HOT_OCCUPANCY_STATS "Witness whether an idle hot worker has a backlogged sibling (diagnostic; scans hot deques)" OFF)
 
 # Latency breakdown: where a push->run->wait round trip actually spends its time -- OS wake vs
 # Worker()'s own loop order (local deque + steal scan run before the inbox a cold wake was FOR).
@@ -347,7 +348,13 @@ add_library(JLib::Scheduler ALIAS Scheduler)
 # would give two different Thread.h and a silently wrong answer.
 if(JLIBSCHED_STEAL_STATS)
     target_compile_definitions(Scheduler PUBLIC JLIBSCHED_STEAL_STATS=1)
+endif()
+if(JLIBSCHED_STEAL_STATS)
     message(STATUS "JLib::Scheduler: steal-path instrumentation ON (diagnostic build, not for perf numbers)")
+endif()
+if(JLIBSCHED_HOT_OCCUPANCY_STATS)
+    target_compile_definitions(Scheduler PUBLIC JLIBSCHED_HOT_OCCUPANCY_STATS=1)
+    message(STATUS "JLib::Scheduler: hot-occupancy witness ON (diagnostic build, not for perf numbers)")
 endif()
 
 if(JLIBSCHED_LATENCY_STATS)
@@ -412,6 +419,12 @@ target_link_libraries(SchedulerBench PRIVATE Scheduler)
 target_compile_features(SchedulerBench PRIVATE cxx_std_17)
 # Stamped into the header line so a pasted result identifies the build that produced it.
 target_compile_definitions(SchedulerBench PRIVATE JLIBSCHED_VERSION="${JLIBSCHED_VERSION}")
+
+# Measures what an IDLE NoSleep pool costs the main thread, and how much of that the steal hint
+# removes. Both arms run inside one process against one pool -- see the file header.
+add_executable(SchedulerNoSleepTax "${CMAKE_CURRENT_SOURCE_DIR}/bench/nosleep_tax.cpp")
+target_link_libraries(SchedulerNoSleepTax PRIVATE Scheduler)
+target_compile_features(SchedulerNoSleepTax PRIVATE cxx_std_17)
 
 # The lock primitives had no benchmark at all until 2.7.0 -- bench.cpp covers push/steal/ParallelFor
 # and never takes a SchedulerMutex. This one measures them, and it is what established that the
@@ -492,6 +505,13 @@ add_subdirectory("${CMAKE_CURRENT_SOURCE_DIR}/bench/compare")
 add_executable(SchedulerDagCancelTest "${CMAKE_CURRENT_SOURCE_DIR}/tests/dag_cancel_test.cpp")
 target_link_libraries(SchedulerDagCancelTest PRIVATE Scheduler)
 target_compile_features(SchedulerDagCancelTest PRIVATE cxx_std_17)
+
+# WaitFor(wg, token): cancelling a WAIT, not the work. Mostly a test of what must NOT change --
+# the count is untouched, the abandoned tasks still finish, and an uncancellable waiter on the
+# same group is not collateral.
+add_executable(SchedulerWaitGroupCancelTest "${CMAKE_CURRENT_SOURCE_DIR}/tests/waitgroup_cancel_test.cpp")
+target_link_libraries(SchedulerWaitGroupCancelTest PRIVATE Scheduler)
+target_compile_features(SchedulerWaitGroupCancelTest PRIVATE cxx_std_17)
 
 add_executable(SchedulerTimerTest "${CMAKE_CURRENT_SOURCE_DIR}/tests/timer_test.cpp")
 target_link_libraries(SchedulerTimerTest PRIVATE Scheduler)
@@ -665,4 +685,39 @@ if(WIN32)
         target_link_libraries(SchedulerIoAsyncTest PRIVATE Scheduler)
         target_compile_features(SchedulerIoAsyncTest PRIVATE cxx_std_20)
     endif()
+endif()
+
+# Sockets need the co_await surface, so this one is C++20-only like the async test.
+if(WIN32 AND JLIBSCHED_COROUTINES)
+    add_executable(SchedulerIoSocketTest "${CMAKE_CURRENT_SOURCE_DIR}/tests/io_socket_test.cpp")
+    target_link_libraries(SchedulerIoSocketTest PRIVATE Scheduler ws2_32)
+    target_compile_features(SchedulerIoSocketTest PRIVATE cxx_std_20)
+endif()
+
+# The service layers are opt-in. This process enables nothing and checks that the pool keeps every
+# core and that both layers refuse to run -- the check that a job-system-only app pays for neither.
+add_executable(SchedulerIoOptInTest "${CMAKE_CURRENT_SOURCE_DIR}/tests/io_optin_test.cpp")
+target_link_libraries(SchedulerIoOptInTest PRIVATE Scheduler)
+target_compile_features(SchedulerIoOptInTest PRIVATE cxx_std_17)
+
+# Does the reactor's per-operation mutex matter? Answers it with a number. The counters are OFF
+# unless JLIBSCHED_IO_LOCK_STATS is set, because counting means a try_lock before every real lock --
+# exactly the tax that perturbs what is being measured. Same rule as the steal and latency counters.
+option(JLIBSCHED_IO_LOCK_STATS "Count reactor mutex contention (diagnostic; perturbs the I/O path)" OFF)
+if(WIN32 AND JLIBSCHED_COROUTINES)
+    add_executable(SchedulerIoLockBench "${CMAKE_CURRENT_SOURCE_DIR}/bench/io_lock_contention.cpp")
+    target_link_libraries(SchedulerIoLockBench PRIVATE Scheduler ws2_32)
+    target_compile_features(SchedulerIoLockBench PRIVATE cxx_std_20)
+endif()
+if(JLIBSCHED_IO_LOCK_STATS)
+    target_compile_definitions(Scheduler PRIVATE JLIBSCHED_IO_LOCK_STATS)
+    message(STATUS "JLib::Scheduler: reactor lock stats ENABLED (perturbs the I/O path)")
+endif()
+
+# The dispatch seam: reactor-done to coroutine-running. Needs JLIBSCHED_IO_LOCK_STATS for the
+# completion timestamp; without it the bench says so rather than printing a flattering zero.
+if(WIN32 AND JLIBSCHED_COROUTINES)
+    add_executable(SchedulerIoLatencyBench "${CMAKE_CURRENT_SOURCE_DIR}/bench/io_dispatch_latency.cpp")
+    target_link_libraries(SchedulerIoLatencyBench PRIVATE Scheduler ws2_32)
+    target_compile_features(SchedulerIoLatencyBench PRIVATE cxx_std_20)
 endif()

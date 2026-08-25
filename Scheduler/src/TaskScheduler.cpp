@@ -4,6 +4,9 @@
 #include "../include/Thread.h"
 #include "../include/TaskScheduler.h"
 #include "../include/Event.h"
+#include "../include/TaskDAG.h"   // OnTaskDiscarded: a discarded DAG task still owes its dependents
+#include "../include/IoReactor.h" // Join() stops the completion threads before clearing the pool
+#include "../include/Timer.h"     // ...and the timer thread, for the same reason
 #include "../include/platform.h"
 #include "../include/Topology.h"
 #include <stdexcept>
@@ -184,10 +187,32 @@ static bool g_reserveTimerCore = false;
 
 static bool g_reserveIoCore = false;
 
-void TaskScheduler::SetReserveTimerCore(bool reserve) noexcept { g_reserveTimerCore = reserve; }
-bool TaskScheduler::ReserveTimerCore() noexcept { return g_reserveTimerCore; }
-void TaskScheduler::SetReserveIoCore(bool reserve) noexcept { g_reserveIoCore = reserve; }
-bool TaskScheduler::ReserveIoCore() noexcept { return g_reserveIoCore; }
+// EnableIoReactor implies EnableTimers, and the implication is applied HERE rather than checked at
+// the point of use -- so there is one moment where the two are made consistent, and no path that can
+// observe I/O on with timers off.
+//
+// Turning I/O back OFF deliberately leaves timers on: it cannot know whether they were enabled on
+// their own account, and silently disabling a service the app asked for is worse than leaving one
+// enabled that it no longer needs.
+void TaskScheduler::EnableTimers(bool on) noexcept { g_reserveTimerCore = on; }
+bool TaskScheduler::TimersEnabled() noexcept { return g_reserveTimerCore; }
+
+static unsigned g_ioCompletionThreads = 1;
+
+void TaskScheduler::EnableIoReactor(bool on, unsigned completionThreads) noexcept {
+	g_reserveIoCore = on;
+	// Clamped rather than trusted: zero threads would mean nothing ever drains the port and every
+	// operation would hang, which is a worse failure than being told a number was ignored.
+	g_ioCompletionThreads = (completionThreads == 0) ? 1 : completionThreads;
+	if (on) g_reserveTimerCore = true;
+}
+bool TaskScheduler::IoReactorEnabled() noexcept { return g_reserveIoCore; }
+unsigned TaskScheduler::IoCompletionThreads() noexcept { return g_ioCompletionThreads; }
+
+void TaskScheduler::SetReserveTimerCore(bool reserve) noexcept { EnableTimers(reserve); }
+bool TaskScheduler::ReserveTimerCore() noexcept { return TimersEnabled(); }
+void TaskScheduler::SetReserveIoCore(bool reserve) noexcept { EnableIoReactor(reserve); }
+bool TaskScheduler::ReserveIoCore() noexcept { return IoReactorEnabled(); }
 
 size_t TaskScheduler::GetSafeTC() {
 	// The AUTO pool size (Init/StartPool with poolSize == 0): hw-1 -- main pins CPU 0, workers pin
@@ -212,7 +237,10 @@ size_t TaskScheduler::GetSafeTC() {
 
 	unsigned int reserved = 1;                       // main
 	if (g_reserveTimerCore) reserved += 1;           // the timer thread
-	if (g_reserveIoCore)    reserved += 1;           // IoReactor.s completion thread
+	// ONE CORE PER COMPLETION THREAD. Set together by EnableIoReactor precisely so these two
+	// numbers cannot drift apart -- a pool sized for one thread while four drain the port is the
+	// silent oversubscription the opt-in exists to prevent.
+	if (g_reserveIoCore)    reserved += g_ioCompletionThreads;
 	if (cores <= reserved) return 1;
 	return static_cast<size_t>(cores - reserved);
 }
@@ -243,6 +271,14 @@ bool TaskScheduler::PushMain(Task* task) {
 // so nothing waiting on this work blocks forever on something abandoned, then clean up and free.
 bool TaskScheduler::DiscardIfCancelled(Task* task) {
 	if (!task || task->started || !IsTaskCancelled(task)) return false;
+
+	// WHAT THIS TASK STILL OWES, before it is thrown away. A subsystem that wrapped fn/data gets its
+	// completion hook run BY fn, and fn is exactly what discarding skips -- so without this a
+	// cancelled TaskDAG node never fires its dependents and the graph, plus anyone in WaitFor on it,
+	// stops forever. Runs BEFORE the waitGroup decrement, matching the order the executed path uses
+	// (fn -> completion -> waitGroup), so nothing observes this task as finished ahead of the work it
+	// releases.
+	TaskDAG::OnTaskDiscarded(task);
 
 	if (task->waitGroup) {
 		const int old = task->waitGroup->n.fetch_sub(1, std::memory_order_acq_rel);
@@ -285,8 +321,29 @@ void TaskScheduler::WaitForMain(WaitGroup& wg) {
 }
 void TaskScheduler::Join() {
 	if (!poolActive) return;
-	
+
 	stopFlag.store(true, std::memory_order_release);
+
+	// STOP THE SERVICE THREADS FIRST, BEFORE THE WORKERS THEY PUSH INTO.
+	//
+	// Join() used to take down `workers` and nothing else, so a reactor completion thread and the
+	// timer thread outlived it. That is not merely untidy: both PUSH TASKS, and the block below
+	// clears `workers`, `mainQ` and `immediateCoresInUse`. A completion landing in that window
+	// indexes vectors that are being emptied. The window is small, which is the worst kind -- it
+	// makes the failure rare enough to look like something else.
+	//
+	// ORDER IS THE WHOLE POINT. Producers stop, then consumers: stopping the workers first would
+	// leave a completion thread pushing into a pool that can no longer drain, which is a hang rather
+	// than a crash. Both stops are idempotent and both layers are opt-in, so this is a no-op for a
+	// job-system-only user.
+	//
+	// Init() BRINGS THEM BACK -- StartPool calls the matching Start() on each, so a Join-then-Init
+	// cycle works. Neither Stop destroys state: the completion port survives (closed only by the
+	// reactor destructor) and the timer wheel is intact, so restarting is just clearing the latch.
+	if (IoReactorEnabled() && IoReactor::IsAvailable())
+		IoReactor::Instance().Stop();
+	if (TimersEnabled())
+		TimerQueue::Instance().Stop();
 
 	{
 		registryMtx.lock();
@@ -429,6 +486,84 @@ static std::atomic<TaskScheduler::IdlePolicy> g_idlePolicy{ TaskScheduler::IdleP
 void TaskScheduler::SetIdlePolicy(IdlePolicy p) { g_idlePolicy.store(p, std::memory_order_relaxed); }
 TaskScheduler::IdlePolicy TaskScheduler::GetIdlePolicy() { return g_idlePolicy.load(std::memory_order_relaxed); }
 
+// K-HOT. DEFAULT IS ZERO, and that is not timidity -- it is the same rule the I/O layer follows:
+// a job-system-only user must not pay for something they never asked for. A spinning core is a real
+// cost to every other thread in the process, so it is opt-in like the reactor is.
+static std::atomic<size_t> g_hotWorkers{ 0 };
+// CLAMPED SO AT LEAST ONE ORDINARY WORKER ALWAYS EXISTS. K >= pool size makes every worker hot,
+// and ordinary work then has no legal destination at all: PickNextWorker skips every index, falls
+// through to its fallback, and hands the task to a hot worker that will not serve it. That is a
+// guaranteed hang, and it is reachable by a plausible configuration -- Init(2) with K=2, or any
+// K chosen from a core count larger than the pool the app actually asked for.
+//
+// Clamped at BOTH ends because the setter is legal before and after Init: before, workers.size() is
+// 0 and there is nothing to clamp against, so StartPool re-applies it once the pool exists.
+static std::atomic<size_t> g_hotWorkersRequested{ 0 };
+
+void TaskScheduler::SetHotWorkers(size_t k) {
+	g_hotWorkersRequested.store(k, std::memory_order_relaxed);
+	size_t eff = k;
+	if (instance) {
+		const size_t n = instance->workers.size();
+		if (n && eff >= n) eff = n - 1;
+	}
+	g_hotWorkers.store(eff, std::memory_order_relaxed);
+}
+size_t TaskScheduler::GetHotWorkers() { return g_hotWorkers.load(std::memory_order_relaxed); }
+
+// Re-apply the clamp once the pool size is known -- see SetHotWorkers.
+void TaskScheduler::ClampHotWorkersToPool() {
+	const size_t k = g_hotWorkersRequested.load(std::memory_order_relaxed);
+	const size_t n = workers.size();
+	g_hotWorkers.store((n && k >= n) ? n - 1 : k, std::memory_order_relaxed);
+}
+
+// Read by the hot workers themselves and by the reactor's completion threads, each of which raises
+// its OWN priority. Off by default -- see the header.
+static std::atomic<TaskScheduler::HotThreadPolicy> g_hotPolicy{ TaskScheduler::HotThreadPolicy::Normal };
+void TaskScheduler::SetHotThreadPolicy(HotThreadPolicy p) { g_hotPolicy.store(p, std::memory_order_relaxed); }
+TaskScheduler::HotThreadPolicy TaskScheduler::GetHotThreadPolicy() { return g_hotPolicy.load(std::memory_order_relaxed); }
+
+// Hard-pin the hot workers only. Read in StartWorker, so it must be set BEFORE Init.
+static std::atomic<bool> g_hotPin{ false };
+void TaskScheduler::SetHotWorkerPin(bool on) { g_hotPin.store(on, std::memory_order_relaxed); }
+bool TaskScheduler::GetHotWorkerPin() { return g_hotPin.load(std::memory_order_relaxed); }
+
+// EXCLUSIVE AFFINITY. Pinning alone measured WORSE than doing nothing, because it CONFINES the hot
+// worker without EXCLUDING anyone else from its core -- so whenever another thread lands there, the
+// hot worker cannot migrate away and just waits. Exclusive mode is the other half: the hot workers
+// own cores 0..K-1, and every other thread in the process masks those bits off.
+//
+// This is the userspace approximation of isolcpus. It cannot exclude OTHER PROCESSES, which is
+// exactly where it stops being equivalent.
+static std::atomic<bool> g_hotExclusive{ false };
+static std::atomic<unsigned long long> g_hotCpuMask{ 0 };
+void TaskScheduler::SetHotWorkerExclusive(bool on) { g_hotExclusive.store(on, std::memory_order_relaxed); }
+bool TaskScheduler::GetHotWorkerExclusive() { return g_hotExclusive.load(std::memory_order_relaxed); }
+void TaskScheduler::SetHotCpuMask(unsigned long long m) { g_hotCpuMask.store(m, std::memory_order_relaxed); }
+unsigned long long TaskScheduler::GetHotCpuMask() { return g_hotCpuMask.load(std::memory_order_relaxed); }
+
+// Called BY a thread ON ITSELF -- ordinary workers at loop entry, the reactor's completion threads
+// at Run() entry, and the application's own thread if it wants to stay off the hot cores. Each
+// thread masking itself avoids plumbing native handles around, and means a thread the scheduler does
+// not own can opt in with one call.
+//
+// Takes the PROCESS mask as the starting point rather than "all CPUs", so it composes with an
+// application that has already restricted the process. No-op unless exclusive mode is on and a hot
+// mask has been published, and never masks a thread down to nothing.
+void TaskScheduler::ExcludeCurrentThreadFromHotCpus() {
+#if JLIB_PLATFORM_WINDOWS
+	if (!g_hotExclusive.load(std::memory_order_relaxed)) return;
+	const unsigned long long hot = g_hotCpuMask.load(std::memory_order_relaxed);
+	if (!hot) return;
+
+	DWORD_PTR procMask = 0, sysMask = 0;
+	if (!::GetProcessAffinityMask(::GetCurrentProcess(), &procMask, &sysMask)) return;
+	const DWORD_PTR keep = (DWORD_PTR)(procMask & ~(DWORD_PTR)hot);
+	if (keep) ::SetThreadAffinityMask(::GetCurrentThread(), keep);
+#endif
+}
+
 // The stale-library guard's other half. Compiled INTO the library, so it reports the signature as
 // the library's own build saw these headers. The inline check in TaskScheduler.h compares it against
 // the including translation unit's view; a mismatch means somebody rebuilt one and not the other.
@@ -469,7 +604,10 @@ void TaskScheduler::RunCursorRange(int start, int end, int grain, std::function<
 	if (end <= start) return;
 	if (workers.empty()) { func(start, end); return; }   // no pool: just run it
 
-	const int W = (int)workers.size();
+	// EXCLUDES THE HOT WORKERS. W drives the grain floor and the split count, and a hot worker will
+	// never run a slice -- it does not steal. Counting them over-splits the range into pieces that
+	// have fewer runners than the arithmetic assumed. Clamped so this is at least 1.
+	const int W = (int)(workers.size() - GetHotWorkers());
 
 	// GRAIN FLOOR, and it must scale with the range -- a flat floor is a trap.
 	//
@@ -601,6 +739,20 @@ TaskDeque* TaskScheduler::LaneForCurrentThread() {
 	return nullptr;
 }
 
+// Which lane index LaneForCurrentThread just returned. Mirrors it exactly; SIZE_MAX when there is
+// none. Split for one reason: the PARALLELISM hint is per-lane and needs the index, and duplicating
+// the resolution at the call site is how the two would drift.
+size_t TaskScheduler::LaneIndexForCurrentThread() {
+	Thread* self = Thread::GetCurrent();
+	if (self) {
+		const int q = self->qIndex;
+		if (q >= 0 && (size_t)q < loPri.size()) return (size_t)q;
+		return SIZE_MAX;
+	}
+	if (t_ownsNonWorkerLane && nonWorkerLane < loPri.size()) return nonWorkerLane;
+	return SIZE_MAX;
+}
+
 // Publish-right, recurse-left, down to grain.
 //
 // THIS SELF-SPAWNS, AND THE OLD FORK-JOIN SPLITTER MEASURED THAT AS A DISASTER. Worth stating up
@@ -647,6 +799,7 @@ TaskDeque* TaskScheduler::LaneForCurrentThread() {
 // 10.9x and ParallelFor's 6.3x.
 void TaskScheduler::RunLazyRange(int lo, int hi, LazyRangeState* st) {
 	TaskDeque* myLane = LaneForCurrentThread();
+	const size_t myLaneIndex = LaneIndexForCurrentThread();
 
 	while (myLane && (hi - lo) > st->grain) {
 		// The wake decision below needs to know whether our previous split is still sitting here.
@@ -665,6 +818,11 @@ void TaskScheduler::RunLazyRange(int lo, int hi, LazyRangeState* st) {
 		// count to zero prematurely, because every task increments for its own children before its
 		// own decrement happens (which is after its body returns).
 		st->wg->n.fetch_add(1, std::memory_order_relaxed);
+
+		// PARALLELISM hint, set BEFORE the push is visible, for the same reason the count is
+		// incremented before it: a thief that can see the task must also see the advertisement, or
+		// the first split of a range is stealable by nobody and the whole range runs serially.
+		if (myLaneIndex != SIZE_MAX) SetParallelHint(myLaneIndex);
 
 		if (!myLane->push_bottom(t)) {
 			// Deque full. Unwind the count and the task, then fall through to running the whole
@@ -713,7 +871,13 @@ void TaskScheduler::RunLazyRange(int lo, int hi, LazyRangeState* st) {
 			// together diverge immediately.
 			static std::atomic<size_t> s_wakeSeed{ 0 };
 			static thread_local size_t wakeCursor = s_wakeSeed.fetch_add(7919, std::memory_order_relaxed);
-			const size_t w = wakeCursor++ % workers.size();
+			// SKIP THE HOT WORKERS. They do not steal, so they can never take a lazy split -- a
+			// wake aimed at one is not merely wasted, it dirties the state of the very threads the
+			// lane exists to leave undisturbed. Hot workers are 0..K-1, and SetHotWorkers is clamped
+			// so at least one ordinary worker always exists, which is what makes this modulus safe.
+			const size_t hotN = GetHotWorkers();
+			const size_t eligible = workers.size() - hotN;
+			const size_t w = hotN + (wakeCursor++ % eligible);
 			workers[w]->MarkQueuedWork();
 			workers[w]->NotifyWorker();
 		}
@@ -802,6 +966,9 @@ void TaskScheduler::ParallelFor(int begin, int end, int grain, std::function<voi
 	}
 
 	TaskDeque* myLane = LaneForCurrentThread();
+	// The non-worker lane has no worker looping over it, so the per-pass maintenance in Worker()
+	// never runs for it. This drain is the only consumer that reliably passes, so it clears here.
+	const size_t myLaneIndex = LaneIndexForCurrentThread();
 	while ((wg.n.load(std::memory_order_acquire) & WaitGroup::COUNT_MASK) > 0) {
 		if (myLane) {
 			if (auto opt = myLane->pop_bottom()) {
@@ -823,6 +990,7 @@ void TaskScheduler::ParallelFor(int begin, int end, int grain, std::function<voi
 				taskAllocator.Free(t);
 				continue;
 			}
+			if (myLaneIndex != SIZE_MAX) ClearParallelHintIfEmpty(myLaneIndex, 0);
 		}
 		// Our lane is empty: everything we published is out with thieves. Help the pool generally
 		// rather than spinning -- this is the same policy WaitFor's bare path takes.
@@ -1086,6 +1254,7 @@ void TaskScheduler::StartPool(size_t poolSize) {
 	immediateCoresInUse.clear();
 	loPriInboxes.clear();
 	hiPri.clear();
+	stealHintLane.store(0, std::memory_order_relaxed);
 	hiPriInboxes.clear();
 	workers.reserve(num_workers);
 	// +1 for the NON-WORKER LANE (see nonWorkerLane's declaration). Only the deques get it --
@@ -1123,6 +1292,7 @@ void TaskScheduler::StartPool(size_t poolSize) {
 	loPri.push_back(std::make_unique<TaskDeque>());
 	hiPri.push_back(std::make_unique<TaskDeque>());
 	nonWorkerLaneClaimed.store(false, std::memory_order_relaxed);
+	stealHintLane.store(0, std::memory_order_relaxed);
 
 	// TWO PASSES, and the split is load-bearing. Creating a worker and STARTING it in the same
 	// iteration meant worker 0 was running -- and reading `workers` in its own startup path
@@ -1158,6 +1328,42 @@ void TaskScheduler::StartPool(size_t poolSize) {
 	// floors at 2 below, so this only has to be sane, not exact.
 	const size_t fairShare = standardFiberCount / (num_workers ? num_workers : 1);
 	const size_t fiberCacheCapacity = (fairShare / 2 < 16) ? 16 : fairShare / 2;
+
+	// K is clamped against the ACTUAL pool size here -- it may have been set before Init, when there
+	// was nothing to clamp against. Must precede the hot-CPU publish below, which reads it.
+	ClampHotWorkersToPool();
+
+	// UNDO Join()'s service-layer shutdown, so Init works a second time. Join stops the reactor and
+	// timer threads (it must -- they push into the pool it is about to clear), and both latch
+	// `stopping`. Without this, a Join-then-Init cycle leaves EnableIoReactor/EnableTimers reporting
+	// true with nothing behind them, and every submit into them fails or waits.
+	//
+	// Cheap because neither Stop destroys its state: the completion port survives (closed only by
+	// the reactor's destructor, so registered handles stay associated) and the timer wheel is
+	// untouched. Both thread sets respawn lazily -- the reactor's on the next Register/Submit, the
+	// timer's on the next Arm -- so clearing the latch is the entire restart.
+	if (IoReactorEnabled() && IoReactor::IsAvailable())
+		IoReactor::Instance().Start();
+	if (TimersEnabled())
+		TimerQueue::Instance().Start();
+
+	// PUBLISH THE HOT CPU SET BEFORE ANY WORKER STARTS. Every other thread masks these bits off as
+	// it comes up, so the set has to be complete first -- a non-hot worker that started earlier
+	// would otherwise exclude an incomplete set and land on a hot core anyway. Same CPU-selection
+	// formula as the loop below, deliberately duplicated rather than reordered, because the loop's
+	// order is load-bearing for the Ready() handshake underneath it.
+	if (GetHotWorkerExclusive()) {
+		const size_t hotN = GetHotWorkers();
+		unsigned long long mask = 0;
+		for (size_t i = 0; i < hotN && i < num_workers; ++i) {
+			size_t cpu;
+			if (!physicalCpus.empty())                   cpu = (size_t)physicalCpus[i + 1];
+			else if (logicalCpus.size() > (size_t)i + 1) cpu = (size_t)logicalCpus[i + 1];
+			else                                         cpu = i + 1;
+			if (cpu < 64) mask |= (1ULL << cpu);
+		}
+		SetHotCpuMask(mask);
+	}
 
 	for (unsigned int i = 0; i < num_workers; ++i) {
 		// Default scheme: worker i takes the (i+1)'th logical CPU that EXISTS, main keeps the first.
@@ -1222,6 +1428,17 @@ void TaskScheduler::WaitOnEvent(Event& event) {
 
 	myFiber->status.store(FiberStatus::WANTS_SUSPEND, std::memory_order_release);
 	event.AddWaiter(myTask);
+
+	// PARK-PUBLISH RE-CHECK. A cancel that landed between the caller's check and the AddWaiter above
+	// scanned a table this waiter was not in yet, so nothing holds it and nothing would ever wake it.
+	// Re-reading here and claiming our own slot closes that window; SelfRemove's return value decides
+	// which side owns the resume -- see the long note on it in Event.h.
+	if (IsTaskCancelled(myTask) && event.SelfRemove(myTask)) {
+		// We are the exclusive owner of this waiter, so no wake is coming and none is needed.
+		// Cancellation is delivered at the wake as always -- here the wake is simply not suspending.
+		myFiber->status.store(FiberStatus::RUNNING, std::memory_order_release);
+		return;
+	}
 
 	JLIB_EPOCH_CHECK_NO_GUARD("TaskScheduler::WaitOnEvent");
 	// Return via the fiber's homeCtx (the worker stamps it before each switch-in),
@@ -1289,6 +1506,58 @@ void TaskScheduler::WaitFor(WaitGroup& wg) {
 		}
 	}
 }
+// WaitFor that a cancel can end early. Returns Cancelled when `tok` fires while still waiting.
+//
+// WHAT IT DOES NOT DO: touch n. Cancelling a wait is "I stopped waiting", not "the group finished".
+// Every task still outstanding stays outstanding and still decrements when it completes, so a second
+// waiter -- or a later WaitFor on the same group -- still sees the truth. This is why Cancel() must
+// never smash the count to zero: that would strand every task still in flight with nothing left to
+// release, and lie to everyone else looking at the same group.
+//
+// COMPLETION WINS OVER CANCELLATION when both are true. A group that genuinely finished reports Ok,
+// because it did; reporting Cancelled there would tell the caller to discard results that exist.
+WaitResult TaskScheduler::WaitFor(WaitGroup& wg, CancelToken tok) {
+	auto thread = Thread::GetCurrent();
+	Fiber* current = (thread != nullptr) ? thread->currentFiber : nullptr;
+
+	if (current != nullptr) {
+		WaitOnEventDirectArmed([&wg, tok](DirectEvent* ev) {
+			std::lock_guard<std::mutex> lock(wg.mtx);
+			wg.cancellable.push_back(WaitGroup::CancelWaiter{ ev, tok.Raw() });
+			const int old = wg.n.fetch_or(WaitGroup::WAITER_BIT, std::memory_order_acq_rel);
+
+			// Two reasons to wake ourselves instead of parking, checked under the SAME lock that
+			// published us -- which is what makes the second one sound. A cancel landing between the
+			// caller's check and this push would otherwise walk a list we are not on yet, and we
+			// would park with nobody holding us: the park-publish race, exactly as on the semaphore
+			// and Event paths.
+			if ((old & WaitGroup::COUNT_MASK) == 0 || tok.Cancelled()) {
+				wg.cancellable.pop_back();   // we are last: we pushed under this same lock
+				ev->Signal();
+			}
+			});
+
+		if ((wg.n.load(std::memory_order_acquire) & WaitGroup::COUNT_MASK) == 0)
+			return WaitResult::Ok;
+		return tok.Cancelled() ? WaitResult::Cancelled : WaitResult::Ok;
+	}
+
+	// BARE THREAD: nothing to park, so cancellation is observed between helping passes rather than
+	// delivered. Same helping policy and the same two reentrancy guards as the uncancellable path.
+	while ((wg.n.load(std::memory_order_acquire) & WaitGroup::COUNT_MASK) > 0) {
+		if (tok.Cancelled()) return WaitResult::Cancelled;
+		bool ranSomething = false;
+		if (t_heldMutexes == 0) {
+			++t_spinHelpDepth;
+			ranSomething = TryRunStolenNativeTask();
+			--t_spinHelpDepth;
+		}
+		if (!ranSomething)
+			std::this_thread::yield();
+	}
+	return WaitResult::Ok;
+}
+
 void JLib::TaskScheduler::PushBatch(Task* tasks[], size_t count, uint8_t cpuaffinity, size_t minPerSegment,
 	bool hiPri, CorePref pref)
 {
@@ -1309,7 +1578,10 @@ void JLib::TaskScheduler::PushBatch(Task* tasks[], size_t count, uint8_t cpuaffi
 		// Priority is a PARAMETER, not read from the tasks: a batch is documented as homogeneous, and
 		// silently routing a hiPri run into the loPri inbox is a priority inversion no caller could
 		// see. Before this existed, every batch went to loPri unconditionally.
-		(hiPri ? hiPriInboxes : loPriInboxes)[chosen]->push_batch(tasks[first], tasks[first + len - 1]);
+		// COLLAPSE WHEN THE LANE IS INACTIVE: at K=0 nobody probes hiPri, so a batch routed there
+		// would never run. Same rule as PushLocal and Requeue, asked of the same predicate.
+		const bool useHi = hiPri && HiPriLaneActive();
+		(useHi ? hiPriInboxes : loPriInboxes)[chosen]->push_batch(tasks[first], tasks[first + len - 1]);
 		// Without this the batch sits undiscovered if `chosen` is genuinely asleep: a worker's cv
 		// is private and nothing wakes it without a notify targeting it specifically.
 		workers[chosen]->MarkQueuedWork();
@@ -1349,9 +1621,19 @@ void JLib::TaskScheduler::PushBatch(Task* tasks[], size_t count, uint8_t cpuaffi
 	// spread is worth the wake-up it costs, and let small batches behave as they always did.
 	if (minPerSegment == 0) minPerSegment = 1;
 	const size_t nw = workers.size();
+
+	// CAP AT THE WORKERS THIS BATCH CAN ACTUALLY REACH, not at the pool. A hiPri batch goes to the
+	// hot set; everything else goes to the ordinary set. Capping at the whole pool cuts the batch
+	// into more pieces than there are destinations for them, so segments pile up on the same
+	// workers -- paying the per-segment notify without buying the spread it is meant to buy.
+	// SetHotWorkers is clamped so both sets are non-empty.
+	const size_t hotN = GetHotWorkers();
+	const size_t reachable = (hiPri && hotN) ? hotN
+	                       : (nw > hotN ? nw - hotN : nw);
+
 	size_t segments = (nw == 0) ? 1 : (count / minPerSegment);
-	if (segments < 1)  segments = 1;
-	if (segments > nw) segments = nw;
+	if (segments < 1)         segments = 1;
+	if (segments > reachable) segments = reachable;
 	const size_t per = count / segments;
 	const size_t rem = count % segments;
 
@@ -1359,10 +1641,14 @@ void JLib::TaskScheduler::PushBatch(Task* tasks[], size_t count, uint8_t cpuaffi
 	for (size_t s = 0; s < segments; ++s) {
 		const size_t len = per + (s < rem ? 1 : 0);
 		if (len == 0) continue;
-		int chosen = PickNextWorker(pref);
-		while (immediateCoresInUse[chosen]->load(std::memory_order_acquire)) {
+		// Same lane branch as the single-task path -- a hiPri BATCH rotates the hot set. The retry
+		// applies to ordinary placement only; PickNextWorker settles a fully-claimed hot set itself,
+		// and yielding in a loop here on K = 1 would never terminate.
+		const bool useHiSeg = hiPri && HiPriLaneActive();
+		int chosen = PickNextWorker(pref, useHiSeg);
+		while (!useHiSeg && immediateCoresInUse[chosen]->load(std::memory_order_acquire)) {
 			std::this_thread::yield();
-			chosen = PickNextWorker(pref);
+			chosen = PickNextWorker(pref, false);
 		}
 		submitRun(first, len, chosen);
 		first += len;
@@ -1401,6 +1687,14 @@ void TaskScheduler::WaitOnEventArmed(Event& event, const std::function<void()>& 
 	// before this fiber is a discoverable, resumable waiter.
 	myFiber->status.store(FiberStatus::WANTS_SUSPEND, std::memory_order_release);
 	event.AddWaiter(myTask);
+
+	// Same park-publish re-check as WaitOnEvent, and it goes BEFORE arm() on purpose: arm hooks an
+	// external wakeup, and there is no reason to hook one for a fiber that is not going to park. A
+	// cancel arriving after arm() is the ordinary case -- the external signal wakes us normally.
+	if (IsTaskCancelled(myTask) && event.SelfRemove(myTask)) {
+		myFiber->status.store(FiberStatus::RUNNING, std::memory_order_release);
+		return;
+	}
 
 	if (arm) arm();
 
@@ -1601,7 +1895,16 @@ Task* TaskScheduler::GetTask() {
 		return sb.type != TaskType::Fiber && StealClassCompatible(sb.corePref, thiefIsP, degen);
 	};
 
-	if (!forceLoPri) {
+	// A BARE THREAD IS NOT A HOT WORKER, so it does not reach into the lane. This is the same
+	// reservation the worker steal path enforces, and it was a hole: a caller sitting in WaitFor
+	// helps through here, and without this it would pull a completion out of a hot worker's deque
+	// onto a thread that is not spinning, is not elevated, and may be about to block again. Every
+	// reason ordinary workers are kept out applies harder to main.
+	//
+	// K = 0 leaves this exactly as it was -- no lane exists, and skipping hiPri there would strand
+	// whatever is in it.
+	const size_t hotN_ = GetHotWorkers();
+	if (!forceLoPri && hotN_ == 0) {
 		size_t numThreads = hiPri.size();
 		size_t start = rand() % numThreads;
 		for (size_t i = 0; i < numThreads; ++i) {
@@ -1636,6 +1939,25 @@ bool TaskScheduler::TryRunStolenNativeTask() {
 	// TaskType::Coroutine, because resuming a coroutine is a function call on the current stack and
 	// needs no fiber. Only Fiber-backed tasks are off limits. The name is kept rather than churned
 	// because it is public API; read it as "a task that does not require a fiber".
+	// A HOT WORKER LANDS HERE TOO, and that is a hole worth naming. OnBareThread() is true for a
+	// worker running a NATIVE task (no fiber), so a hot worker whose lane task calls WaitFor,
+	// SchedulerMutex or a condition variable helps through this function -- and GetTask() steals
+	// BULK work, which is exactly what "hot workers never steal" exists to prevent.
+	//
+	// It is NOT fixed by refusing. The fallback below drains this worker's own inboxes, and that
+	// drain is load-bearing: a Native task blocking on a worker makes its own inbox unreachable by
+	// the whole pool, which is a documented deterministic deadlock. Refusing to help would trade a
+	// policy violation for a hang.
+	//
+	// So: drain the LANE FIRST. A hot worker checks its own inbox before touching anyone else's
+	// deque, which means lane work always wins over stolen bulk, and bulk is taken only when the
+	// lane is genuinely empty. The residual violation -- a hot worker running one bulk task while a
+	// lane task of its own is blocked -- is reachable only by breaking the lane contract (lane work
+	// must be short and non-blocking), and a bounded violation beats a deadlock.
+	Thread* selfHot = Thread::GetCurrent();
+	if (selfHot && GetHotWorkers() > (size_t)selfHot->qIndex)
+		selfHot->DrainOwnInboxesToDeques();
+
 	Task* task = GetTask();
 	if (!task) {
 		// Nothing stealable anywhere -- but "anywhere" only covers DEQUES, and if this caller is a
@@ -1839,14 +2161,17 @@ bool TaskScheduler::PushLocal(Task* task, uint8_t cpuaffinity) {
 			return false;
 	}
 	else {
-		uint8_t chosen = PickNextWorker(task->corePref);
-		while (immediateCoresInUse[chosen]->load(std::memory_order_acquire)) {
-			chosen = PickNextWorker(task->corePref);
+		const size_t hotN = GetHotWorkers();
+		const bool useHi = task->hiPri && hotN;
+		uint8_t chosen = (uint8_t)PickNextWorker(task->corePref, useHi);
+		// The claimed-core retry applies to ORDINARY placement only. PickNextWorker already handles
+		// a fully-claimed hot set internally, and re-rolling there could spin forever on K = 1.
+		while (!useHi && immediateCoresInUse[chosen]->load(std::memory_order_acquire)) {
+			chosen = (uint8_t)PickNextWorker(task->corePref, false);
 		}
-		if(task->hiPri)
-			hiPriInboxes[chosen]->push(task);
+		if (useHi) hiPriInboxes[chosen]->push(task);
 		else
-			loPriInboxes[chosen]->push(task);
+			loPriInboxes[chosen]->push(task);   // collapsed: no lane, no server
 		workers[chosen]->MarkQueuedWork();
 		workers[chosen]->NotifyWorker();
 
@@ -1859,14 +2184,17 @@ bool TaskScheduler::Requeue(Task* task) {
 	// re-count the task -- it was already accounted for at its original submission and
 	// is only resuming, not newly created. (The yield path does the same, via the
 	// worker's push_bottom.) Otherwise every suspend->resume cycle leaks +1.
-	uint8_t chosen = PickNextWorker(task->corePref);
-	while (immediateCoresInUse[chosen]->load(std::memory_order_acquire)) {
-		chosen = PickNextWorker(task->corePref);
+	// Same routing as PushLocal -- a RESUMED hiPri task is still on the lane, and sending it back to
+	// an ordinary worker would strand it just as surely as a fresh one.
+	const size_t hotN = GetHotWorkers();
+	const bool useHi = task->hiPri && hotN;
+	uint8_t chosen = (uint8_t)PickNextWorker(task->corePref, useHi);
+	while (!useHi && immediateCoresInUse[chosen]->load(std::memory_order_acquire)) {
+		chosen = (uint8_t)PickNextWorker(task->corePref, false);
 	}
-	if(task->hiPri)
-		hiPriInboxes[chosen]->push(task);
+	if (useHi) hiPriInboxes[chosen]->push(task);
 	else
-		loPriInboxes[chosen]->push(task);
+		loPriInboxes[chosen]->push(task);   // collapsed: no lane, no server
 	workers[chosen]->MarkQueuedWork();
 	workers[chosen]->NotifyWorker();
 	return true;
@@ -1877,6 +2205,15 @@ bool TaskScheduler::PushToCore(size_t core_id, Task* task) {
 	if (!task) return false;
 
 	size_t idx = (core_id - 1) % workers.size();
+
+	// A HOT WORKER IS NOT AVAILABLE FOR PINNING. PushImmediate/fork hands a worker a task and marks
+	// its core in-use until that task returns -- which for a long-lived pinned subsystem is
+	// FOREVER. Doing that to a lane server silently deletes it: every completion steered there
+	// queues behind work that may never finish, and nobody may steal from a hot worker to rescue
+	// them. Refusing is the honest answer; the caller already handles false (the core was busy), and
+	// a silent redirect would violate the "run on THIS core" contract PushImmediate exists for.
+	if (idx < GetHotWorkers()) return false;
+
 	if (immediateCoresInUse[idx]->load(std::memory_order_acquire)) return false;
 
 	// Marks this core busy-with-a-fork until Thread::Worker() clears it on completion (see
@@ -1896,7 +2233,30 @@ bool TaskScheduler::PushToCore(size_t core_id, Task* task) {
 	workers[idx]->NotifyWorker();
 	return true;
 }
-int TaskScheduler::PickNextWorker(CorePref pref) {
+int TaskScheduler::PickNextWorker(CorePref pref, bool hiPri) {
+	// THE LANE INVARIANT, ENFORCED AT THE ONE PLACE PLACEMENT IS DECIDED. A hiPri task rotates the
+	// HOT workers only. Nothing downstream then has to rescue a lane task from a queue nobody
+	// drains, because none can ever be put there -- and a rescue would be bailing a sinking ship:
+	// it costs a second push, and multiple hiPri producers can outrun one bailing worker.
+	//
+	// Ordinary work takes the branch below and skips 0..K-1, so the two sets are disjoint. At K = 0
+	// there are no hot workers, `hiPri` cannot be true here (the push sites collapse it), and this
+	// is the original function unchanged.
+	const size_t hotN = GetHotWorkers();
+	if (hiPri && hotN) {
+		const size_t n = workers.size();
+		const size_t m = (hotN < n) ? hotN : n;
+		for (size_t i = 0; i < m; ++i) {
+			const size_t j = (nextHotWorker.fetch_add(1, std::memory_order_relaxed)) % m;
+			if (!immediateCoresInUse[j]->load(std::memory_order_acquire))
+				return (int)j;
+		}
+		// Every hot worker is claimed by a PushImmediate. Return one anyway rather than spilling to
+		// an ordinary worker: spilling would strand the task, which is strictly worse than queueing
+		// behind a claim that is by definition temporary.
+		return (int)(nextHotWorker.fetch_add(1, std::memory_order_relaxed) % m);
+	}
+
 	// Placement is governed SOLELY by CorePref (see Task.h) -- queue priority (hiPri) is never consulted
 	// here; the two axes are fully orthogonal by design. Default/Any/Wide all mean "no class preference"
 	// and fall through to the original full-pool round-robin below.
@@ -1904,12 +2264,22 @@ int TaskScheduler::PickNextWorker(CorePref pref) {
 	// Round-robin a worker subset, returning the first NON-pinned worker (immediateCoresInUse = a
 	// persistent PushImmediate claim), or -1 if the set is empty or every worker in it is pinned
 	// -- which tells the caller to SPILL to the other class rather than block on an unavailable core.
-	auto pickFrom = [this](std::vector<int>& set, std::atomic<size_t>& cur) -> int {
+	// DEDICATED HOT WORKERS: ordinary work must never be ROUTED to one. A hot worker exists to have
+	// nothing else to do -- that is the entire latency guarantee. Letting a bulk task land there
+	// costs a completion the whole duration of that task, because a running task cannot be
+	// preempted and no bounded "short work" class exists to steal from instead.
+	//
+	// Hot workers are indices 0..K-1 by construction, so skipping them is an index test. Zero when
+	// K = 0, which is the untouched original behaviour. P/E routing is preserved for the rest.
+	// (hotN is read once at the top of this function, above the lane branch.)
+
+	auto pickFrom = [this, hotN](std::vector<int>& set, std::atomic<size_t>& cur) -> int {
 		size_t m = set.size();
 		if (m == 0) return -1;
 		size_t start = cur.load(std::memory_order_relaxed);
 		for (size_t i = 0; i < m; ++i) {
 			int idx = set[(start + i) % m];
+			if ((size_t)idx < hotN) continue;          // reserved for the low-latency lane
 			if (!immediateCoresInUse[idx]->load(std::memory_order_acquire)) {
 				cur.store((start + i + 1) % m, std::memory_order_relaxed);
 				return idx;
@@ -1953,13 +2323,22 @@ int TaskScheduler::PickNextWorker(CorePref pref) {
 	size_t n = workers.size();
 	for (size_t i = 0; i < n; ++i) {
 		size_t j = (nextWorker.load(std::memory_order_seq_cst) + i) % n;
+		if (j < hotN) continue;                        // reserved; see the note on pickFrom
 		if (!immediateCoresInUse[j]->load(std::memory_order_acquire)) {
 			nextWorker.store((int)((j + 1) % n), std::memory_order_seq_cst);
 			return static_cast<int>(j);
 		}
 	}
+	// Every eligible worker is pinned. Rotate among the NON-hot ones -- returning a hot worker here
+	// would put bulk work on the lane precisely when the pool is most loaded, which is the worst
+	// moment for it. Falls back to 0 only when every worker is hot, which K < workers.size() makes
+	// impossible for any sane K but is not worth crashing over.
 	int fallback = nextWorker.load(std::memory_order_seq_cst);
-	nextWorker.store((int)((fallback + 1) % n), std::memory_order_seq_cst);
+	if (hotN < n) {
+		const size_t m = n - hotN;
+		fallback = (int)(hotN + ((size_t)fallback % m));
+	}
+	nextWorker.store((int)(((size_t)fallback + 1) % n), std::memory_order_seq_cst);
 	return fallback;
 }
 
@@ -1981,30 +2360,24 @@ Task* TaskScheduler::GetCurrentTask() const {
 	return nullptr; // Not on a worker thread, or no task currently running
 }
 
-void TaskScheduler::BoostTaskPriority(Task* task) {
-	if (!task) return;
-
-	// Only boost if not already boosted (no lock needed: only one thread modifies this task)
-	if (task->priorityBoost == 0) {
-		task->priorityBoost = task->hiPri;
-		task->hiPri = 1; // boost to high priority
-	}
-}
-
-void TaskScheduler::UnboostTaskPriority(Task* task) {
-	if (!task) return;
-	// Restore original priority if boosted (no lock needed: only one thread modifies this task)
-	if (task->priorityBoost != 0) {
-		task->hiPri = task->priorityBoost; // restore original priority
-		task->priorityBoost = 0;
-	}
-}
+// BoostTaskPriority/UnboostTaskPriority REMOVED. They were the lock-priority half of the old
+// spinlock mutex, and Boost had had no callers since 21719ac -- which made Unboost a permanent
+// no-op, since priorityBoost could only ever be zero.
+//
+// Deleting them matters now rather than being tidiness: hiPri is THE LOW-LATENCY LANE, so a
+// mechanism that promotes an AGED ORDINARY TASK to hiPri would push bulk work onto the hot
+// workers -- exactly the long-running work the lane is defined to exclude, and unstealable once
+// there. A dead function that would be actively wrong if revived is worse than no function.
+//
+// Task::priorityBoost is deliberately LEFT IN PLACE: the flag block is static_asserted and
+// fingerprinted by the stale-library guard, so removing a bit is a separate, deliberate change.
+// The bit is now free for a future user.
 
 void TaskScheduler::CleanupTaskMetadata(Task* task) {
 	if (!task) return;
-	// Metadata is stored directly on task, no cleanup needed (task is about to be freed anyway)
-	// Just restore priority if it was boosted
-	UnboostTaskPriority(task);
+	// Metadata is stored directly on task, no cleanup needed (task is about to be freed anyway).
+	// The priority-restore that used to be here went with BoostTaskPriority -- see above.
+	(void)task;
 }
 
 
@@ -2141,11 +2514,6 @@ void SchedulerMutex::Unlock()
 
 		if (next.result) *next.result = WaitResult::Ok;
 		break;   // this one gets the lock; released below, outside the spinlock
-	}
-
-	// Only unboos if scheduler is initialized AND it's not a recursive/shutdown path
-	if (wasHolder && TaskScheduler::IsInitialized()) {
-		TaskScheduler::Instance().UnboostTaskPriority(wasHolder);
 	}
 
 	// Release whichever kind of waiter was queued. This is the only place the two kinds diverge, and
@@ -2360,6 +2728,22 @@ WaitResult SchedulerSemaphore::WaitCancellable() {
 				spinLock.clear(std::memory_order_release);
 				return WaitResult::Ok;
 			}
+			// THE PARK-PUBLISH RACE. The check at the top of this function is not enough on its own:
+			// a cancel can land between it and the push below, and CancelWaiters would then walk a
+			// list this waiter is not on yet -- after which the waiter parks and nothing ever wakes
+			// it. Windows hid this because SwitchToFiber usually finished inside the test's sleep;
+			// on POSIX the ContextSwitch path made the window wide enough to hang 5 runs out of 5.
+			//
+			// Re-reading the flag HERE, under the same acquisition that publishes, closes it: the
+			// spin lock orders this against CancelWaiters' walk, so either we observe the cancel and
+			// never publish, or our push happens-before any later walk and the walk finds us. This is
+			// the same rule Thread.cpp already applies to SUSPEND_SIGNALED -- a cancel arriving during
+			// "about to park" must not depend on a later walk to be seen.
+			if (IsTaskCancelled(callerTask)) {
+				spinLock.clear(std::memory_order_release);
+				return WaitResult::Cancelled;
+			}
+
 			// Parkable BEFORE discoverable, exactly as Wait() does -- see the long note there; the
 			// reverse order is the 1.3.5 lost wakeup.
 			current->status.store(FiberStatus::WANTS_SUSPEND, std::memory_order_release);
@@ -2412,6 +2796,15 @@ bool SchedulerSemaphore::WaitAsyncEnqueue(Task* coroTask, WaitResult* result) {
 		if (result) *result = WaitResult::Ok;   // acquired outright; nothing will resume us
 		return true;    // got a permit -- caller must not suspend
 	}
+	// Same park-publish re-check as WaitCancellable -- see the long note there. A coroutine suspends
+	// after this returns false, so a cancel landing between the caller's check and this push would
+	// leave it suspended with nothing on any list to find it.
+	if (IsTaskCancelled(coroTask)) {
+		spinLock.clear(std::memory_order_release);
+		if (result) *result = WaitResult::Cancelled;
+		return true;    // answer is settled -- caller must NOT suspend
+	}
+
 	// Queued. Reachable by Signal() the instant spinLock clears; touch nothing after.
 	// result AND token, or the waiter is by definition not cancellable -- a null result slot means
 	// "never skipped" and Signal() will hand it the permit no matter what its scope says.
@@ -2651,6 +3044,13 @@ WaitResult SchedulerConditionVariable::WaitCancellable(SchedulerMutex& mutex) {
 		SchedulerSemaphore localWaitSemaphore(0, 1);
 
 		LockQueue();
+		// Park-publish re-check, under the queue lock that orders this against CancelWaiters' walk --
+		// the same rule as SchedulerSemaphore::WaitCancellable. Returning here still holds the mutex,
+		// which is what the cancelled-return contract requires.
+		if (IsTaskCancelled(callerTask)) {
+			UnlockQueue();
+			return WaitResult::Cancelled;
+		}
 		waitingQueue.push(CvWaiter{ &localWaitSemaphore, tok });
 		UnlockQueue();
 
@@ -2659,6 +3059,23 @@ WaitResult SchedulerConditionVariable::WaitCancellable(SchedulerMutex& mutex) {
 		// Cancellable, so a Notify that skips this waiter at release reports Cancelled rather than
 		// handing it a permit -- and CancelWaiters can eject it outright.
 		const WaitResult r = localWaitSemaphore.WaitCancellable();
+
+		// THE ENTRY MAY STILL BE QUEUED. A cancel landing between the push above and the semaphore's
+		// own re-check makes that re-check return Cancelled WITHOUT this waiter ever parking -- so
+		// CancelWaiters never ejected it and the entry survives, pointing at a stack local that dies
+		// the moment this frame returns. Remove it here. Only on the cancelled path, and the queue is
+		// short by construction.
+		if (r == WaitResult::Cancelled) {
+			LockQueue();
+			std::queue<CvWaiter> keep;
+			while (!waitingQueue.empty()) {
+				const CvWaiter w = waitingQueue.front();
+				waitingQueue.pop();
+				if (w.sem != &localWaitSemaphore) keep.push(w);
+			}
+			waitingQueue.swap(keep);
+			UnlockQueue();
+		}
 
 		// UNCONDITIONAL. See the invariant above.
 		mutex.Lock();

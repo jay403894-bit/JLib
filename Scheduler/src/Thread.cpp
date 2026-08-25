@@ -87,6 +87,30 @@ void Thread::StartWorker(size_t cpu_affinity, size_t fiberCacheCapacity)
 	// running tasks. Only its PLACEMENT is dropped, which is exactly AffinityPolicy::None, and its
 	// locality becomes approximate. Raising the cap is CpuMask::kWords in Topology.h.
 	auto affinityPolicy = scheduler->GetAffinityPolicy();
+
+	// PIN THE HOT WORKERS ONLY. Hard-pinning the WHOLE pool was measured harmful -- ~45% worse wake
+	// latency, ~2x on a frame DAG -- which is why the default is Ideal. That finding is about the
+	// pool: a pinned worker cannot escape a core someone else is occupying, and with N workers the
+	// chance that SOME core is occupied approaches certainty.
+	//
+	// A hot worker looked like the opposite case -- it never parks, so it has no wake latency to
+	// lose, and there are one or two rather than N. IT MEASURED WORSE ANYWAY, and badly: burst p99
+	// 27ms against a 150us baseline, HOT p99 up to 10ms, and pin+RT worse than RT alone.
+	//
+	// Because this is taskset-style pinning: the worker is confined to a core, but NOTHING ELSE IS
+	// EXCLUDED FROM IT. When the completion thread or an OS thread lands on that CPU the hot worker
+	// cannot migrate away and simply waits; unpinned it moves to whichever core is free, which with
+	// 29 workers plus service threads on ~32 logical CPUs it constantly needs to.
+	//
+	// isolcpus-style isolation -- the core RESERVED so nothing else is scheduled there -- is the
+	// opposite arrangement and is NOT refuted by this. It also cannot be tested without booting for
+	// it. Kept as a knob for exactly that case, off by default, and do not enable it expecting a win
+	// on an ordinary machine.
+	//
+	// Requires SetHotWorkers BEFORE Init -- qIndex is set by SetQueueIndex before StartWorker, but
+	// the hot COUNT has to already be known here.
+	if (TaskScheduler::GetHotWorkerPin() && TaskScheduler::GetHotWorkers() > (size_t)qIndex)
+		affinityPolicy = TaskScheduler::AffinityPolicy::Hard;
 	if (cpu_affinity >= topology::CpuMask::kMaxCpus &&
 	    affinityPolicy != TaskScheduler::AffinityPolicy::None) {
 		affinityPolicy = TaskScheduler::AffinityPolicy::None;
@@ -419,7 +443,57 @@ void Thread::Worker() {
 	// the fall-through to park -- otherwise a worker that spun most of its budget and then got a
 	// task would carry that count into its next idle episode and park early ever after.
 	unsigned idleSpins = 0;
+	// Raised once, the first time this worker notices it is hot. Not reset: a worker that stops
+	// being hot keeps the priority until the pool shuts down, which is acceptable for a knob that
+	// is off by default and set once at startup, and avoids thrashing the OS call in the idle loop.
+	bool hotPriorityRaised = false;
+	// Tracks what this thread's priority actually IS, so the per-task adjust below is a syscall only
+	// on a genuine change. Meaningless unless hotPriorityRaised.
+	bool atCriticalPriority = false;
+
+	// EXCLUSIVE MODE: an ORDINARY worker gets off the hot cores. The hot workers themselves are
+	// already pinned to them by StartWorker. Done here, at loop entry, because by now every worker's
+	// CPU is assigned and the hot mask was published before any of them started.
+	if (!(TaskScheduler::GetHotWorkers() > (size_t)qIndex))
+		TaskScheduler::ExcludeCurrentThreadFromHotCpus();
 	while (running.load(std::memory_order_acquire)) {
+		// TWO DIFFERENT QUESTIONS, and conflating them deadlocks the pool.
+		//
+		//   servesHiPri  do I DRAIN the lane? Hot workers only. FALSE FOR EVERYONE AT K=0, where
+		//                nothing can enter a hiPri lane and scanning one is dead work.
+		//   isHotWorker  am I a DEDICATED lane server -- never steal, never park? False for everyone
+		//                at K=0. These are NOT the same question, and an earlier version keyed the
+		//                "does not steal" rule off the wrong one.
+		//
+		// Read once per pass; both are relaxed loads and re-read every pass, so SetHotWorkers stays
+		// safe to call on a running pool.
+		const bool servesHiPri = TaskScheduler::WorkerServesHiPri((size_t)qIndex);
+		// INSURANCE, not a scan: one load of a line this worker already owns. Covers the only way a
+		// task can sit in a lane nobody serves -- SetHotWorkers being LOWERED while work is queued.
+		// Costs nothing in the normal case because the queue is empty and the check short-circuits.
+		// BOTH structures, because the inbox drains INTO the deque -- work can sit in the deque with
+		// the inbox already empty, and checking only the inbox would strand exactly that case.
+		const bool hiPriStray = !servesHiPri &&
+			(!scheduler->hiPriInboxes[qIndex]->empty() || scheduler->hiPri[qIndex]->size() != 0);
+		const bool isHotWorker = TaskScheduler::GetHotWorkers() > (size_t)qIndex;
+
+		// Steal hints, maintained here and nowhere else: this is the one place the owner of this
+		// deque reliably passes, and size() reads a line it already owns. Both writes are
+		// conditional on a state CHANGE, so a queue that stays deep, or stays empty, never writes at
+		// all. The hint goes stale while a long task runs -- the worker is not looping then -- which
+		// can only cost a wasted probe, never hide work: the PARALLELISM bit is set by the splitter
+		// at push time, before the task it split off can be picked up by anyone.
+		{
+			const size_t depth = scheduler->loPri[qIndex]->size();
+			scheduler->UpdateBacklogHint((size_t)qIndex, depth);
+			scheduler->ClearParallelHintIfEmpty((size_t)qIndex, depth);
+			// The lane's own retirement path, for the case no thief covers: a hot worker that
+			// drained its own backlog by popping. ONCE PER PASS, not per pickup -- that frequency
+			// difference is the entire cost argument, and a pass is exactly when this worker has
+			// nothing better to do anyway.
+			if (isHotWorker)
+				scheduler->UpdateLaneHint((size_t)qIndex, scheduler->hiPri[qIndex]->size());
+		}
 
 		ready.store(true, std::memory_order_release);
 		// Cleared once per iteration, unconditionally, BEFORE this iteration's own-queue/steal/
@@ -457,23 +531,49 @@ void Thread::Worker() {
 			// abandons a live stack or frame rather than cancelling it -- see Task::started. A
 			// started task is let through to run, and observes the cancellation at its own next
 			// suspend point or poll, where it can unwind properly.
-			if (!task_to_run->started && IsTaskCancelled(task_to_run)) {
-				// Same disposal the DAG uses for a node that never runs: release the WaitGroup first
-				// so nothing waiting on this work blocks forever on something abandoned.
-				if (task_to_run->waitGroup) {
-					const int old = task_to_run->waitGroup->n.fetch_sub(1, std::memory_order_acq_rel);
-					if ((old & WaitGroup::COUNT_MASK) == 1 && (old & WaitGroup::WAITER_BIT))
-						task_to_run->waitGroup->WakeAll();
-				}
-				scheduler->CleanupTaskMetadata(task_to_run);
-				DestroyTask(task_to_run);
-				scheduler->GetAllocator()->FreeSized(task_to_run);
+			// THROUGH DiscardIfCancelled, NOT AN INLINE COPY. This site used to open-code the
+			// disposal -- waitGroup down, cleanup, destroy, free -- which made it a FOURTH discard
+			// path that the shared one knew nothing about. The copy was missing the step added when
+			// the DAG stopped being notified by fn alone: a discarded graph node still has to tell
+			// its dependents, or an AND countdown can never reach zero and the graph, plus anyone
+			// in WaitFor on it, stops forever.
+			//
+			// That is exactly what hung dag_cancel_test on POSIX: the worker discarded a cancelled
+			// node here, released only its own WaitGroup slot, and the sink was never fired.
+			// Windows almost always ran the body before the cancel landed and never reached this
+			// branch at all. "One place cancellation is decided" is a property of the CALL SITES,
+			// and this is the third time a copy of it has drifted.
+			if (scheduler->DiscardIfCancelled(task_to_run)) {
 				task_to_run = nullptr;
 				if (EpochManager::Instance().ShouldSelfReclaim()) EpochManager::Instance().Tick();
 				ready.store(true, std::memory_order_release);
 				continue;
 			}
 			task_to_run->started = 1;
+
+#if defined(_WIN32)
+			// DEMOTE BEFORE RUNNING ORDINARY WORK. A hot worker sits at TIME_CRITICAL so it can
+			// take a completion the instant one lands -- but it also steals general work when its
+			// inbox is empty, and running a long ordinary task at priority 15 is exactly the
+			// starvation the elevated priority was supposed to be worth the risk of.
+			//
+			// hiPri IS the discriminator, and it needs no new state: the queue already exists, the
+			// app already sets the flag at Spawn, and "this task is worth pre-empting others for"
+			// is precisely what it means. So the worker runs hiPri work elevated and everything
+			// else at Normal, per task.
+			//
+			// Cached, because SetThreadPriority is a syscall and this is the per-task path -- it
+			// fires only when the level actually changes, which for a steady stream of one kind of
+			// work is never.
+			if (hotPriorityRaised) {
+				const bool wantCritical = (task_to_run->hiPri != 0);
+				if (wantCritical != atCriticalPriority) {
+					::SetThreadPriority(::GetCurrentThread(),
+						wantCritical ? THREAD_PRIORITY_TIME_CRITICAL : THREAD_PRIORITY_NORMAL);
+					atCriticalPriority = wantCritical;
+				}
+			}
+#endif
 
 			// Fast path: run directly on THIS worker's own OS-thread stack, no fiber acquired
 			// or ContextSwitch paid at all. Only safe because Native tasks are a CONTRACT --
@@ -764,7 +864,10 @@ void Thread::Worker() {
 								/*minPerSegment*/8, inboxIsHiPri, CorePref::E);
 					}
 				};
-				drainInbox(scheduler->hiPriInboxes[qIndex].get(), /*inboxIsHiPri*/true);
+				// HALF THE LOOP FOR N-K WORKERS: an ordinary worker never touches the lane, so it
+				// skips this inbox entirely. At K=0 nobody serves the lane and nothing is routed to
+				// it, so every worker takes the cheap path -- cheaper than before the lane existed.
+				if (servesHiPri || hiPriStray) drainInbox(scheduler->hiPriInboxes[qIndex].get(), /*inboxIsHiPri*/true);
 				drainInbox(scheduler->loPriInboxes[qIndex].get(), /*inboxIsHiPri*/false);
 
 				if (EpochManager::Instance().ShouldSelfReclaim()) {
@@ -780,7 +883,7 @@ void Thread::Worker() {
 		}
 		{
 			// --- 3. Local  queues ---
-			if (!task_to_run) {
+			if (!task_to_run && (servesHiPri || hiPriStray)) {
 				auto opt = scheduler->hiPri[qIndex]->pop_bottom();
 				if (opt) {
 					Task* task = *opt;
@@ -788,6 +891,11 @@ void Thread::Worker() {
 						std::cerr << "[worker " << qIndex << "] Null task from pop_bottom!" << std::endl;
 					}
 					else {
+						// Arm 2 only: the per-pickup maintenance whose cost is under test. size() reads
+						// the deque`s top, which thieves write -- a contended line touched once per lane
+						// task rather than once per idle pass.
+						if (TaskScheduler::GetLaneHintMode() == 2)
+							scheduler->UpdateLaneHint((size_t)qIndex, scheduler->hiPri[qIndex]->size());
 						task_to_run = task;
 						continue;
 					}
@@ -855,9 +963,165 @@ void Thread::Worker() {
 					return false;
 				};
 				auto tryStealFrom = [&](int target) -> bool {
+					// TWO DISJOINT STEAL WORLDS once hot workers exist: hot steals from hot, ordinary
+					// steals from ordinary. Neither ever probes the other's lane.
+					//
+					//   HOT -> HOT, hiPri only. Stealing between hot workers is what makes K > 1
+					//   mean anything: without it, one hot worker can be backed up while another
+					//   sits idle and nothing rebalances the lane. It does NOT take loPri -- bulk
+					//   work is unbounded and a running task cannot be preempted, so one stolen
+					//   bulk task costs every completion behind it that task's whole duration.
+					//   Dedicated is what the latency guarantee means, and an idle hot worker
+					//   spinning is the price the caller opted into by setting K.
+					//
+					//   ORDINARY -> ORDINARY, loPri only. ONE probe per victim instead of two, and
+					//   that halving is the point: under NoSleep every idle worker runs this search
+					//   continuously, so the probe count IS the contention. Letting ordinary workers
+					//   take hiPri "under pressure" would put the probe back and give the saving
+					//   away -- and would land a lane task on a cold or contended core, which is the
+					//   thing the arrangement exists to prevent. A hot worker that cannot keep up is
+					//   a capacity question: raise K.
+					//
+					// AT K = 0 neither world exists, so this is the original both-lanes steal
+					// against every victim, unchanged.
+					const std::size_t hotN = TaskScheduler::GetHotWorkers();
+					const bool victimIsHot = hotN > (std::size_t)target;
+
+					// A HOT WORKER NEVER STEALS -- not bulk work, and not from another hot worker.
+					//
+					// Hot->hot stealing was added to give K>1 a rebalancing path, and MEASURED AS
+					// PURE COST: a hot worker never parks, so it runs this search continuously, and
+					// each pass touched the sibling's deque endpoint. Probe counts for an identical
+					// workload:
+					//
+					//     K=1        0 probes      p50 2.4us  p90 3.0us
+					//     K=2   20,592,209         p50 2.3us  p90 3.2us
+					//     K=4  232,627,776         p50 2.3us  p90 3.4us
+					//
+					// Quadratic in K, flat in latency. Twenty million cache-line invalidations
+					// bought nothing, because there is nothing to rebalance: steering round-robins
+					// pushes across the hot set, so the lane is already balanced at PUSH time, and
+					// lane work is short by contract. K>1 is for availability, not load sharing.
+					// A HOT WORKER STEALS ONLY FROM A HOT SIBLING, ONLY LANE WORK, AND ONLY WHEN
+					// THAT SIBLING IS ADVERTISING A BACKLOG.
+					//
+					// This was removed once, correctly, on a measurement of 20.6M probes at K=2 and
+					// 232M at K=4 for flat latency. What made that true was the workload: uniform
+					// completions, round-robin steering, so the lane was balanced at push time and
+					// there was nothing to rebalance. Skewing the handler sizes changes the answer.
+					// Sampled idle passes where a SIBLING held a backlog, medians of 3:
+					//
+					//     handler    uniform   5us    20us   200us
+					//       K = 2      3.0%    8.6%   3.5%   62.4%
+					//       K = 4      8.8%   11.5%  22.8%   65.1%
+					//
+					// and at 200us capacity stops working -- K=1 to K=4 moves p99 only 1142us to
+					// 906us -- because the tail is not saturation, it is one worker buried behind a
+					// long handler while siblings spin. That is what this steals.
+					//
+					// It is gated, not restored: the probe happens only when the victim has
+					// advertised a real backlog, so the 232M-probe outcome cannot recur -- an idle
+					// hot pool reads one shared word and stops.
+					//
+					// WHAT IT COSTS, isolated. Four arms interleaved inside one process (three
+					// separately-built binaries measured in three sessions moved the K=1 rows -- a
+					// configuration with no sibling, where this cannot act -- by 2x, which was
+					// machine drift being read as a result). Arm `hnt` maintains the hint and never
+					// steals, which is what separates accounting from mechanism. Medians of 3:
+					//
+					//     20us handler, K=4       p50     p90     p99    idle%
+					//       off                  17.8    84.8   167.2     13.2
+					//       hint, never steal    17.3    77.6   159.8     12.6
+					//       hint + steal         24.7    55.3    88.6      2.6
+					//
+					// hnt is off, on every metric. THE HINT MACHINERY IS FREE -- the bitmap write,
+					// the drain-side update and the predicate cost nothing measurable, and two
+					// earlier suspects were wrong: it is not the atomic RMW (a publisher-side exact
+					// counter measured the same) and it is not the contended cache line (maintaining
+					// from a local `count` instead of size() measured the same).
+					//
+					// The whole difference is the STEAL, and it is a genuine trade, not overhead:
+					// ~35-40% worse p50 for ~30-50% better p90/p99, consistently, at every K and
+					// every handler size. Moving a completion moves it to a core where its coroutine
+					// frame and its buffer are cold. That is the price of not queueing behind a busy
+					// worker, and for a lane whose entire reason to exist is the tail, it is the
+					// right side of the trade.
+					//
+					// IT IS ALSO SELF-GATING, which is why it is on by default. The threshold is
+					// only crossed when a worker is actually behind, so an unloaded lane -- the
+					// case K-hot was built for, where dispatch is ~1-2us -- never steals and never
+					// pays. The p50 appears under load, which is exactly when the tail is worth
+					// buying.
+					if (isHotWorker) {
+						if (!victimIsHot) return false;                 // never bulk work
+						// Mode 3 maintains the hint but never acts on it: the isolator above.
+						{ const int m = TaskScheduler::GetLaneHintMode(); if (m == 0 || m == 3) return false; }
+						if (!scheduler->LaneStealable((std::size_t)target)) return false;
+						JLIBSCHED_STEAL_STAT(qIndex, probes);
+						auto h = scheduler->hiPri[target]->steal_if(classOK);
+						// THE THIEF RETIRES THE ADVERTISEMENT, because the owner no longer can. The
+						// owner sets the bit at its drain and then stops touching it -- deliberately,
+						// since clearing it per pop costs the contended read this design just removed.
+						// So the party that empties the deque is whoever is looking at it, and on a
+						// failed steal that is this thread, which has already paid for the line.
+						// Clearing on a merely-lost race is conservative in the safe direction: the
+						// next drain re-advertises, and until then thieves stay off a deque that has
+						// nothing for them.
+						if (!h) { scheduler->UpdateLaneHint((std::size_t)target, 0); return false; }
+						scheduler->UpdateLaneHint((std::size_t)target, scheduler->hiPri[target]->size());
+						JLIBSCHED_STEAL_STAT(qIndex, hits);
+						task_to_run = *h;
+						return true;
+					}
+					// ORDINARY -> LANE, mode 4 only. The open question: once a backlog is advertised,
+					// is an ordinary worker a useful place to put lane work, or only a cold one?
+					//
+					// It is not the same question as hot->hot, and the difference is not the probe.
+					// A hot sibling is awake by construction, at raised priority, and running only
+					// short lane work. An ordinary worker is none of those: under the default Sleep
+					// policy it is PARKED precisely when the lane backs up -- it has no bulk work to
+					// keep it awake -- so this arm can do nothing unless something wakes it, and
+					// waking it costs an OS round trip of the same order as the tail being bought.
+					// That is why this is measured under both idle policies: NoSleep answers "is an
+					// ordinary worker a good landing site", Sleep answers "can one even be reached".
+					if (hotN && victimIsHot) {
+						if (TaskScheduler::GetLaneHintMode() != 4) return false;
+						if (!scheduler->LaneStealable((std::size_t)target)) return false;
+						JLIBSCHED_STEAL_STAT(qIndex, probes);
+						auto h = scheduler->hiPri[target]->steal_if(classOK);
+						if (!h) { scheduler->UpdateLaneHint((std::size_t)target, 0); return false; }
+						scheduler->UpdateLaneHint((std::size_t)target, scheduler->hiPri[target]->size());
+						JLIBSCHED_STEAL_STAT(qIndex, hits);
+						task_to_run = *h;
+						return true;
+					}
+
+					// THE HINT. Two bits, ORed, and the OR is the whole design -- see the comment on
+					// stealHintBacklog. One shared pair of words read here in place of a remote
+					// deque endpoint; the words are written only on state changes, so under a steady
+					// workload they sit shared-clean in every thief's cache and this test is free.
+					if (!scheduler->MaybeStealable((std::size_t)target)) return false;
+
+					// COUNTED HERE, AFTER the early-out, on purpose: a probe is a TOUCH of another
+					// core's deque endpoint, and the cross-divide rejection above touches nothing.
+					// Counting attempts instead would report the same number for every K and hide
+					// the exact quantity this design set out to reduce -- remote line traffic.
 					JLIBSCHED_STEAL_STAT(qIndex, probes);
-					auto s = scheduler->hiPri[target]->steal_if(classOK);
-					if (!s) s = scheduler->loPri[target]->steal_if(classOK);
+
+					// ONE REMOTE LANE. loPri, always -- everything else was filtered above, so this
+					// is the only reachable case rather than a branch.
+					//
+					// The hiPri probe that used to be here was dead work in EVERY configuration.
+					// At K=0 push routing collapses the lane, so hiPri deques are empty by
+					// construction and the probe was a guaranteed-useless touch of another core's
+					// line, on every victim, on every pass, by every idle worker -- at the DEFAULT
+					// setting. At K>0 the lane belongs to workers nobody may steal from. Two-lane
+					// stealing cost remote traffic and never bought a task.
+					//
+					// OWN queues are a different question and stay unconditional: a worker's own
+					// inbox and deque are ITS cache lines, so checking them is free and is what
+					// keeps a stray lane task from stranding. Remote is where the ping-pong is.
+					auto s = scheduler->loPri[target]->steal_if(classOK);
 					if (!s) return false;
 					JLIBSCHED_STEAL_STAT(qIndex, hits);
 					task_to_run = *s;
@@ -936,8 +1200,26 @@ void Thread::Worker() {
 		
 
 		// 5. --- Pull from inboxes before sleep (drain them so nothing gets stuck) ---
+		// NO RESCUE HERE, deliberately. A lane task cannot reach an ordinary worker's inbox at all:
+		// PickNextWorker rotates the hot set for hiPri and the ordinary set for everything else, so
+		// the two are disjoint at the one place placement is decided. Bailing a mis-placed task out
+		// afterwards would cost a second push per task and could be outrun by multiple producers --
+		// enforcing the invariant is cheaper than repairing violations of it.
+		// THE GATE COVERS THE hiPri DRAIN ONLY -- NOT THE WHOLE BLOCK.
+		//
+		// This is where the K=0 deadlock lived. The loPri drain further down is NESTED inside this
+		// block, so gating the block on `servesHiPri` swallowed it too: at K=0, where nothing serves
+		// the lane, a worker stopped draining its OWN loPri INBOX. The pool dump made it obvious and
+		// two rounds of reading had not -- worker 1 AWAKE, loPri inbox non-empty, 150 tasks never
+		// run, and every hiPri structure empty. I had been hunting stranded LANE work while the
+		// stranded work was ordinary.
+		//
+		// The lesson is narrower than "check your braces": a condition added to an EXISTING `if` is
+		// silently inherited by everything already inside it. The gate belongs on the hiPri pop, not
+		// on the section.
 		if (!task_to_run) {
 			size_t count = 0;
+			if (servesHiPri || hiPriStray) {
 			while (count < BATCH_SIZE && scheduler->hiPriInboxes[qIndex]->pop(batch[count])) {
 				count++;
 			}
@@ -945,6 +1227,16 @@ void Thread::Worker() {
 				if (scheduler->hiPri[qIndex]->push_bottom_batch(batch, count)) {
 					auto opt = scheduler->hiPri[qIndex]->pop_bottom();
 					if (opt) {
+						// THE DRAIN, and the ONLY place the owner touches the hint. Depth is `count - 1`
+						// -- what this drain just landed, less the one being taken -- and that is a LOCAL
+						// number. Calling size() here instead would read the deque`s top, which thieves
+						// write, adding a contended-line read to every lane pickup: measured as a ~30%
+						// p50 regression in EVERY configuration including the uniform control, which is
+						// how it was caught. The drain is reached only when the deque was already empty,
+						// so `count - 1` is the depth, not an increment to it.
+						const int _lhm = TaskScheduler::GetLaneHintMode();
+						if (_lhm == 1 || _lhm == 3 || _lhm == 4) scheduler->UpdateLaneHint((size_t)qIndex, count - 1);
+						else if (_lhm == 2) scheduler->UpdateLaneHint((size_t)qIndex, scheduler->hiPri[qIndex]->size());
 						task_to_run = *opt;
 						JLIBSCHED_LATENCY_MARK(Found);
 						continue;
@@ -964,6 +1256,7 @@ void Thread::Worker() {
 						if (batch[i]) scheduler->Requeue(batch[i]);
 				}
 			}
+			}   // end of the hiPri-only gate -- the loPri drain below is NOT part of it
 
 			if (!task_to_run) {
 				count = 0;
@@ -1007,7 +1300,69 @@ void Thread::Worker() {
 			{
 				// Shutdown and Pause both override the policy. Pausing means "stop using the CPU",
 				// and a policy that spun through it would defeat the only thing Pause exists for.
-				const bool mayspin = TaskScheduler::GetIdlePolicy() == TaskScheduler::IdlePolicy::NoSleep
+				// K-HOT: the same decision, taken per worker instead of pool-wide. Workers below
+				// the hot count never park; everyone else obeys the global policy. It is the
+				// bounded-cost version of NoSleep -- whose penalty lands in p90 and scales with how
+				// many cores spin, so 2-of-31 is a different question from 31-of-31.
+				//
+				// The spin ALSO removes the producer's notify, because a spinning worker never
+				// advertises WS_GOING_TO_SLEEP (see the note above). So a hot worker is a landing
+				// spot that costs a pusher nothing, which is the actual hypothesis being tested.
+				const bool hot = TaskScheduler::GetHotWorkers() > (size_t)qIndex;
+
+#if defined(_WIN32)
+				// TARGETED priority, and the targeting is the point. Raising the WHOLE PROCESS was
+				// measured 5x WORSE with K-hot: it elevates all N workers, so 29 spinning threads
+				// preempt the completion thread that feeds them. Raising only the hot workers (and,
+				// separately, the reactor's completion threads) elevates exactly the critical path
+				// and leaves everyone else at Normal.
+				//
+				// TIME_CRITICAL inside a NORMAL_PRIORITY_CLASS process is priority 15 -- the top of
+				// the non-realtime range. True realtime (16-31) needs REALTIME_PRIORITY_CLASS and a
+				// privilege, and would let a spin loop starve the OS, so it is deliberately not
+				// asked for here.
+				// Elevated and Realtime map to the SAME Windows call: TIME_CRITICAL is already the
+				// top of the non-realtime range, and the only step above it is a process-wide class
+				// this deliberately refuses to touch. See HotThreadPolicy.
+				if (hot && !hotPriorityRaised &&
+				    TaskScheduler::GetHotThreadPolicy() != TaskScheduler::HotThreadPolicy::Normal) {
+					::SetThreadPriority(::GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
+					hotPriorityRaised = true;
+					atCriticalPriority = true;
+				}
+				// Back up on the way into the idle search. A worker that was demoted to run an
+				// ordinary task must be elevated again BEFORE it starts waiting, or the very next
+				// completion is taken at Normal and the whole point is lost. Idle is also the only
+				// safe place to be at 15 unconditionally -- it is spinning, not holding a core off
+				// anyone doing real work.
+				else if (hotPriorityRaised && !atCriticalPriority) {
+					::SetThreadPriority(::GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
+					atCriticalPriority = true;
+				}
+#endif
+#ifdef JLIBSCHED_HOT_OCCUPANCY_STATS
+				// THE WITNESS. Reaching here means this worker's whole search came up empty, so for
+				// a hot worker this is by definition an idle pass. Sampled 1-in-64 rather than every
+				// pass: the scan reads deque endpoints the sibling OWNER is writing, so at spin rate
+				// it would steal exclusive state from the very worker it is trying to catch being
+				// late. Both populations are sampled by the same counter, so the ratio is unaffected.
+				if (hot && ((idleSpins & 0x3F) == 0)) {
+					const std::size_t hotN = TaskScheduler::GetHotWorkers();
+					long long deepest = 0;
+					for (std::size_t v = 0; v < hotN && v < scheduler->hiPri.size(); ++v) {
+						if (v == (std::size_t)qIndex) continue;
+						const long long d = (long long)scheduler->hiPri[v]->size();
+						if (d > deepest) deepest = d;
+					}
+					auto& slot = g_hotOcc[(std::size_t)qIndex < kHotOccSlots ? (std::size_t)qIndex : 0];
+					slot.idlePasses.fetch_add(1, std::memory_order_relaxed);
+					if (deepest > 0) {
+						slot.idleWithSib.fetch_add(1, std::memory_order_relaxed);
+						slot.sibDepthSum.fetch_add(deepest, std::memory_order_relaxed);
+					}
+				}
+#endif
+				const bool mayspin = (hot || TaskScheduler::GetIdlePolicy() == TaskScheduler::IdlePolicy::NoSleep)
 					&& running.load(std::memory_order_acquire)
 					&& !scheduler->paused.load(std::memory_order_seq_cst);
 

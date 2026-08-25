@@ -124,8 +124,6 @@ namespace JLib {
 	public:
 		// Priority inheritance methods (public for SchedulerMutex access)
 		Task* GetCurrentTask() const;
-		void BoostTaskPriority(Task* task);
-		void UnboostTaskPriority(Task* task);
 		void CleanupTaskMetadata(Task* task);
 
 		// Cancellation, observed wherever a task is about to RUN. True means the task was cancelled
@@ -309,7 +307,150 @@ namespace JLib {
 		// permanent cost, intermittent benefit, and the cost is proportional to the hot count while
 		// the benefit is sub-proportional (the other workers still wake cold).
 		static void       SetIdlePolicy(IdlePolicy p);
+		// Runtime kill switch for the bulk steal hint, so its value can be measured against an A/A
+		// control inside ONE process. Diagnostic: shipping code should leave it on.
+		static inline std::atomic<bool> stealHintOn{ true };
+		static void SetStealHint(bool on) noexcept { stealHintOn.store(on, std::memory_order_relaxed); }
 		static IdlePolicy GetIdlePolicy();
+
+		// K-HOT: keep the first K workers from ever parking, while the rest obey IdlePolicy.
+		//
+		// The bounded-cost middle between Sleep and NoSleep. NoSleep's penalty lands in p90 and
+		// scales with how many cores spin, so a handful of hot workers is a different trade from
+		// spinning the whole pool. A hot worker also costs a PUSHER nothing: it never advertises
+		// WS_GOING_TO_SLEEP, so pushes to it take the awake-preference skip instead of a notify.
+		//
+		// DEFAULT 0 -- off. A spinning core taxes every other thread in the process, so this is
+		// opt-in exactly like the I/O layer is; a job-system-only user must not pay for it.
+		//
+		// WHETHER IT HELPS DEPENDS ON WHERE WORK LANDS. If pushes are spread round-robin, K hot
+		// workers only catch K/N of them, and the answer is to STEER work at them rather than to
+		// raise K. Measure before choosing a number.
+		static void   SetHotWorkers(size_t k);
+		// Re-applies the K clamp once workers exist; called by StartPool. See SetHotWorkers.
+		void ClampHotWorkersToPool();
+		static size_t GetHotWorkers();
+		// WHO MAY DRAIN A BACKLOGGED LANE.
+		//
+		//   0  nobody -- the lane is strictly private to its hot worker
+		//   1  hot workers only, from a backlogged hot sibling
+		//   4  (default) hot workers, plus any ORDINARY worker that is already awake and searching
+		//   2, 3  diagnostic arms the dispatch bench interleaves; see Thread.cpp`s steal predicate
+		//
+		// Mode 4 NEVER WAKES ANYONE. It is purely opportunistic: it spends capacity that happens to
+		// be spinning already. That is exactly why it is safe to default on -- under the default Sleep
+		// policy an ordinary worker is PARKED when the lane backs up (it has no bulk work keeping it
+		// awake), so the arm is inert and measured identical to mode 1 in every row. Under NoSleep it
+		// is a capacity valve, and the valve matters most where K is smallest:
+		//
+		//     NoSleep, p99            off    hot-only   + ordinary
+		//       K=1  200us uniform    229       173          53
+		//       K=1  200us skewed    1190      1165         554
+		//       K=2  200us skewed    1196       806         464
+		//       K=4   20us            162       108          92
+		//
+		// At K=4 the hot set already absorbs the backlog and mode 4 is a wash. It is a safety valve
+		// for an under-provisioned lane, NOT a substitute for setting K: under Sleep it cannot help
+		// at all, and that is the default.
+		static inline std::atomic<int> laneHintMode{ 4 };
+		static void SetLaneHintMode(int m) noexcept { laneHintMode.store(m, std::memory_order_relaxed); }
+		static int  GetLaneHintMode() noexcept { return laneHintMode.load(std::memory_order_relaxed); }
+
+		// THE TWO PREDICATES THAT DEFINE THE LOW-LATENCY LANE. Everything -- push routing, inbox
+		// draining, deque popping, steal probes, the sleep predicate -- asks one of these rather than
+		// open-coding the condition. Nine sites read the hiPri lane; a copy of the rule at each is
+		// how the pickup-discard invariant drifted three times, so there are no copies.
+		//
+		// THE LANE ONLY EXISTS WHEN SOMEONE SERVES IT. At K=0 a hiPri task routes to the ordinary
+		// lane and NOBODY probes hiPri -- which makes the default pool's worker loop CHEAPER than it
+		// was before any of this: one inbox, one deque, one steal probe per victim.
+		//
+		// hiPri was never a real priority queue -- per-worker queues plus stealing gave no global
+		// ordering, so "picked up first" cost every worker a second inbox, a second deque and a
+		// second probe per victim to buy something close to a coin flip. It has a job now, and only
+		// where it has one.
+		static bool HiPriLaneActive() { return GetHotWorkers() > 0; }
+
+		// Does THIS worker serve the lane?
+		//
+		// K > 0: only the hot ones, so N-K workers halve their search -- half the inbox checks, half
+		// the deque checks, half the steal probes. That is the structural win, and it is why
+		// ordinary workers must NOT steal hiPri: letting them means they have to probe it.
+		//
+		// K == 0: EVERY worker serves it, exactly as before any of this existed. Without that clause
+		// nobody drains a hiPri lane at the default setting, and anything that reaches one -- a task
+		// queued before K changed, the shutdown drain, any push site the collapse missed -- strands
+		// forever while the pool spins looking for work it refuses to take. Making correctness
+		// depend on catching every push site was the fragile half of this design; this makes the
+		// safe case the DEFAULT case and leaves the optimisation to the configuration that asked
+		// for it.
+		// K == 0 RETURNS FALSE FOR EVERYONE, and that is the dead-lane elimination: PickNextWorker
+		// routes hiPri to the hot set only, so at K=0 nothing can enter a hiPri lane and scanning
+		// one is provably wasted work at the DEFAULT setting.
+		//
+		// It is not the whole safety story, though -- lowering K while lane work is already queued
+		// would strand it. The worker sites pair this with a cheap non-empty check on their OWN
+		// queues (a local cache line, one load) so anything stranded is still drained. Remote probes
+		// get no such fallback: those are the ping-pong, and there is nothing to rescue there.
+		static bool WorkerServesHiPri(size_t qIndex) { return GetHotWorkers() > qIndex; }
+
+		// HOW HARD the I/O critical path preempts. Applies to the K hot workers AND the reactor's
+		// completion threads -- NEVER to the process, and never to the other workers.
+		//
+		// THE SCOPE IS IN THE CALL, NOT THE ENUM, and that is deliberate. Process-wide elevation
+		// measured 5x WORSE alongside K-hot: it raises all N workers, and N spinning threads then
+		// preempt the completion thread feeding them. An enum offering a process-wide tier as a peer
+		// of a per-thread one would invite exactly that mistake, so it does not offer one.
+		//
+		//   Normal    leave scheduling alone. The default.
+		//   Elevated  no privilege required. Windows: THREAD_PRIORITY_TIME_CRITICAL, the top of the
+		//             non-realtime range (15) inside a normal-priority process -- this is the
+		//             configuration measured best (HOT p99 4.5-10us against a 144-2416us baseline).
+		//             Linux/BSD would be SCHED_RR per thread; macOS QOS_CLASS_USER_INTERACTIVE.
+		//   Realtime  the privileged tier: Linux/BSD SCHED_FIFO (needs CAP_SYS_NICE), macOS
+		//             THREAD_TIME_CONSTRAINT_POLICY (what CoreAudio uses).
+		//
+		// ON WINDOWS, Realtime BEHAVES AS Elevated, on purpose. The only step above TIME_CRITICAL is
+		// REALTIME_PRIORITY_CLASS, which is PROCESS-wide, needs a privilege, and would let a spin
+		// loop starve the OS itself. Refusing to escalate is the honest mapping; silently giving the
+		// caller a process-wide change they did not ask for is not.
+		//
+		// POSIX IS NOT IMPLEMENTED -- there is no backend yet, so both tiers are a no-op there
+		// rather than a lie. Note that affinity is NOT a substitute: exclusive pinning was measured
+		// and is worse than doing nothing (see SetHotWorkerExclusive). A POSIX port genuinely needs
+		// the privileged call or real core isolation.
+		enum class HotThreadPolicy : uint8_t { Normal = 0, Elevated, Realtime };
+		static void            SetHotThreadPolicy(HotThreadPolicy p);
+		static HotThreadPolicy GetHotThreadPolicy();
+
+		// Hard-pin ONLY the hot workers to their cores, leaving the rest on the global policy.
+		// MUST be set before Init -- placement happens as each worker starts. OFF BY DEFAULT.
+		//
+		// Hard-pinning the whole pool measured ~45%% worse wake latency and ~2x on a frame DAG,
+		// which is why the default policy is Ideal. A hot worker is the opposite case: it never
+		// parks, so it has no wake latency to lose, and there are one or two rather than N. This is
+		// also the PORTABLE half of the priority story -- it reduces preemption without needing
+		// TIME_CRITICAL or CAP_SYS_NICE.
+		static void SetHotWorkerPin(bool on);
+		static bool GetHotWorkerPin();
+
+		// EXCLUSIVE AFFINITY: the hot workers own their cores and EVERY OTHER THREAD masks those
+		// bits off. Pinning ALONE measured worse than doing nothing, because it confines the hot
+		// worker without excluding anyone else from its core -- so when another thread lands there
+		// the hot worker cannot migrate away and waits. This is the other half. Set before Init,
+		// implies pinning for the hot workers, OFF BY DEFAULT.
+		//
+		// The userspace approximation of isolcpus -- and it cannot exclude OTHER PROCESSES, which is
+		// exactly where it stops being equivalent to the real thing.
+		static void SetHotWorkerExclusive(bool on);
+		static bool GetHotWorkerExclusive();
+		static void SetHotCpuMask(unsigned long long m);
+		static unsigned long long GetHotCpuMask();
+
+		// Called BY a thread ON ITSELF to stay off the hot cores. Ordinary workers and the reactor's
+		// completion threads do this automatically; an application thread that wants the same can
+		// call it directly. No-op unless exclusive mode is on.
+		static void ExcludeCurrentThreadFromHotCpus();
 
 		// How much estimated SERIAL WORK (microseconds) a loop must represent before ParallelFor splits
 		// it. Defaults to 75us in Release and 750us in Debug -- the constant is the fork-join
@@ -476,6 +617,12 @@ namespace JLib {
 
 		bool Push(Task* task);
 		void WaitFor(WaitGroup& wg);
+
+		// Cancellable WaitFor: returns Cancelled if `tok` fires while still waiting, Ok if the group
+		// completed. Cancelling ends THIS WAIT ONLY -- the count is untouched, the outstanding tasks
+		// still run and still decrement, and any other waiter on the same group is unaffected. Use
+		// WaitGroup::CancelWaiters(tok) to release such waiters eagerly. See the definition.
+		WaitResult WaitFor(WaitGroup& wg, CancelToken tok);
 		bool Push(uint8_t cpu_affinity, Task* task);
 		bool Requeue(Task* task);
 		// minPerSegment: the smallest run this is willing to hand to a single worker. The default of
@@ -731,6 +878,49 @@ namespace JLib {
 		static void SetSlabSizes(const SlabSizes& sizes);
 		static SlabSizes CurrentSlabSizes();
 
+		// ---- OPTIONAL SERVICE LAYERS ------------------------------------------------------------
+		//
+		// This library is a JOB SYSTEM first. Deadlines and asynchronous I/O are layers on top, and
+		// an app that wants neither should pay for neither -- not a thread, not a core, not a
+		// surprise. So they are OFF until asked for, and asking has to happen before Init because
+		// the pool is sized once and each enabled service takes a core.
+		//
+		//     TaskScheduler::EnableIoReactor(true);   // implies timers
+		//     TaskScheduler::Init(0);                 // hw-3 workers: main, timer, completion
+		//
+		// ENFORCED, NOT ADVISED. Using a disabled layer fails at the first call, loudly and
+		// deterministically, rather than working while quietly running the machine one thread over.
+		// A warning was the first design and it was wrong: the failure it guards against is a few
+		// percent of throughput, forever, which nobody notices and nobody attributes correctly. A
+		// hard stop at the first Arm or the first Register is a two-minute fix.
+		//
+		// Enforcement only applies once a POOL EXISTS. Using the timer or the reactor without ever
+		// calling Init is legitimate -- there are no workers to oversubscribe.
+		//
+		// Ignored when an EXPLICIT poolSize is given: that is the app's own arithmetic and this must
+		// not silently second-guess it. The layers still have to be enabled to be used.
+		static void EnableTimers(bool on) noexcept;
+		static bool TimersEnabled() noexcept;
+
+		// Implies EnableTimers: an I/O timeout is a deadline, and every non-trivial reactor user
+		// wants one. Enabling I/O and then discovering timers are off would be a papercut with no
+		// upside.
+		//
+		// `completionThreads` is HOW MANY THREADS DRAIN THE COMPLETION PORT, and it is a parameter of
+		// this call rather than a knob on IoReactor for one reason: the pool reserves one core PER
+		// completion thread, so the two numbers must agree. As separate settings they would drift,
+		// and drifting means silent oversubscription -- the exact failure this opt-in exists to stop.
+		//
+		//     EnableIoReactor(true, 4);  Init(0);   // hw-6: main, timer, 4 completion threads
+		//
+		// DEFAULT 1, AND NOT MEASURED. IOCP is built for many threads on one port and a busy server
+		// will want more than one -- but the crossover has not been benchmarked here, and the honest
+		// default is the one whose cost is known. Raise it against a profile, not a hunch; the port's
+		// concurrency limit is set to match, so the kernel runs at most this many at once regardless.
+		static void EnableIoReactor(bool on, unsigned completionThreads = 1) noexcept;
+		static bool IoReactorEnabled() noexcept;
+		static unsigned IoCompletionThreads() noexcept;
+
 		// Give the timer thread a core of its own, so an app that uses deadlines does not run one
 		// thread over the machine.
 		//
@@ -975,6 +1165,7 @@ namespace JLib {
 		// invocation and never cached across one: a split that gets stolen resumes on a different
 		// thread, and it must then publish onto THAT thread's deque, not the one it came from.
 		TaskDeque* LaneForCurrentThread();
+		size_t LaneIndexForCurrentThread();
 		void RunLazyRange(int lo, int hi, LazyRangeState* st);
 		std::vector<std::unique_ptr<TaskMPSCQueue>> loPriInboxes;
 		std::vector<std::unique_ptr<TaskMPSCQueue>> hiPriInboxes;
@@ -1011,7 +1202,11 @@ namespace JLib {
 		Task* GetTask();
 		void StartPool(size_t poolSize);
 		bool PushLocal(Task* task, uint8_t cpuaffinity = 0);
-		int PickNextWorker(CorePref pref = CorePref::Default);
+		// `hiPri` selects WHICH SET is rotated, and that is what makes the lane invariant structural
+		// rather than a convention every call site has to remember. A hiPri task rotates the hot
+		// workers only; everything else rotates the ordinary ones only. One branch, one place, and
+		// no caller can route a lane task somewhere nothing serves it.
+		int PickNextWorker(CorePref pref = CorePref::Default, bool hiPri = false);
 		bool PushToCore(size_t core_id, Task* task);
 		// Picks a worker from the requested class set (P/E), SPILLING to the other class if unavailable;
 		// Default/Any/Wide (and non-hybrid / all-pinned) use the original full-pool round-robin. Placement
@@ -1116,7 +1311,133 @@ namespace JLib {
 		std::mutex registryMtx;
 		EventPool eventPool{ 1024 };   // pooled DirectEvents for WaitOnEventDirectArmed
 		std::atomic<bool> poolActive{ false };
+		// TWO STEAL HINTS, because the pool holds two kinds of queue content with OPPOSITE
+		// requirements, and one bit cannot mean both.
+		//
+		//   BACKLOG      "this worker has substantial excess work." Stealing it is an OPTIMISATION
+		//                and only pays when the owner is demonstrably behind, since migration costs
+		//                a cache miss on the task's working set. Threshold-maintained by the owner,
+		//                so it is written only on crossings -- almost never for a queue that stays
+		//                deep or stays shallow.
+		//   PARALLELISM  "this work was deliberately produced for parallel execution." Stealing it
+		//                is the LOAD-BALANCING MECHANISM, not an optimisation -- ParallelFor has no
+		//                cost model and steals are what divide the range. A single split must be
+		//                visible the instant it exists.
+		//
+		//   stealable = backlog || parallelism
+		//
+		// WHY BOTH ARE NEEDED, measured: a backlog-only hint cut remote probes 46x (9,164 -> 200,
+		// every probe productive) and simultaneously took ParallelFor from 7.49x to 0.93x -- SLOWER
+		// THAN SERIAL -- because shallow splits never reach any threshold. Thresholds of 2, 4, 8 and
+		// 16 all did it. Threshold 1 is not a fix either: that is "any non-empty queue", which
+		// summons every idle thief onto one deque for ONE task and measured 22,000 probes against a
+		// 9,164 baseline, with the owner losing races for work it was about to run warm.
+		//
+		// The herd is correct exactly when there is work for a herd. PARALLELISM says so; BACKLOG
+		// says so; a bare non-empty queue does not.
+		static constexpr size_t kStealHintDepth = 8;
+
+		std::atomic<unsigned long long> stealHintBacklog{ 0 };
+		std::atomic<unsigned long long> stealHintParallel{ 0 };
+
+		// Owner-maintained, on push and pop. Writes only on a threshold crossing.
+		void UpdateBacklogHint(size_t q, size_t depth) noexcept {
+			if (q >= 64) return;
+			const unsigned long long bit = 1ull << q;
+			const bool want = depth >= kStealHintDepth;
+			if (want == ((stealHintBacklog.load(std::memory_order_relaxed) & bit) != 0)) return;
+			if (want) stealHintBacklog.fetch_or(bit, std::memory_order_release);
+			else      stealHintBacklog.fetch_and(~bit, std::memory_order_relaxed);
+		}
+		// Set by the splitter when it publishes; cleared by the owner when its lane drains. Held
+		// conservatively -- while ANY work remains the lane stays advertised, which costs a probe
+		// and can never hide a split.
+		void SetParallelHint(size_t q) noexcept {
+			if (q < 64) stealHintParallel.fetch_or(1ull << q, std::memory_order_release);
+		}
+		void ClearParallelHintIfEmpty(size_t q, size_t depth) noexcept {
+			if (q >= 64 || depth != 0) return;
+			stealHintParallel.fetch_and(~(1ull << q), std::memory_order_relaxed);
+		}
+
+		// Runtime kill switch, so the hint`s value can be measured against an A/A control inside one
+		// process. Three separately-built binaries measured in three sessions is how a 2x machine
+		// drift once got read as a result.
+		bool MaybeStealable(size_t q) const noexcept {
+			if (q >= 64 || loPri.size() > 64) return true;
+			if (!stealHintOn.load(std::memory_order_relaxed)) return true;
+			const unsigned long long bit = 1ull << q;
+			return ((stealHintBacklog.load(std::memory_order_acquire)
+			       | stealHintParallel.load(std::memory_order_acquire)) & bit) != 0;
+		}
+
+		// ---- THE LANE'S OWN BACKLOG SIGNAL, and why it is not the one above -------------------
+		//
+		// The two hints above are OWNER-maintained: the worker updates them once per pass through
+		// its loop. That works for bulk work and fails for the lane, in exactly the case the lane
+		// cares about. MEASURED: with one in eight completions running a 200us handler, a hot worker
+		// spends 62-65% of its idle passes next to a SIBLING sitting on a mean depth of 8-13 -- and
+		// during those 200us the buried worker is not looping, so an owner-maintained bit would stay
+		// unset precisely when it is needed. Whoever advertises the backlog must be running, and the
+		// only party guaranteed to be running is the one doing the pushing.
+		//
+		// So: an EXACT count of lane tasks outstanding at each worker, incremented by the publisher
+		// and decremented by whoever removes one (the owner popping, or a thief stealing). The
+		// counter is per-worker and on its own line; the BIT derived from it is what thieves read,
+		// so a spinning hot worker touches one shared word rather than K contended counters.
+		//
+		// THRESHOLD, not "non-empty". Steering placed that task on that worker deliberately, and a
+		// hot worker about to run its own warm task must not lose it to a sibling -- that is the
+		// v1 steal-hint failure (owner loses the race, 22,000 probes against a 9,164 baseline) with
+		// higher stakes, because here it also defeats the placement. Four is above the depth a
+		// keeping-up worker reaches and well below the 8-13 measured when one is buried.
+		static constexpr int kLaneStealDepth = 4;
+
+		std::atomic<unsigned long long> stealHintLane{ 0 };
+
+		// MAINTAINED BY THE OWNER AT ITS DRAIN, and the distinction from "owner maintained per pass"
+		// is the whole reason this works. The buried worker is not looping during its 200us handler
+		// -- but it drained its inbox into its deque IMMEDIATELY BEFORE starting that handler, and
+		// at that moment it knew the depth. So the backlog is advertised before the worker goes
+		// dark, and stays advertised for exactly as long as it is buried.
+		//
+		// The publisher-side exact counter this replaces worked too, and cost p50 ~30% ACROSS THE
+		// BOARD -- including the uniform control where stealing almost never fires, which is what
+		// identified it as accounting rather than mechanism. One atomic RMW per lane push, on a line
+		// shared between the completion thread and the worker it steers to, on the hot path. Same
+		// shape as the unsharded coroutine counter that once cost 62%. This version writes only on
+		// threshold crossings, and only from a thread that already owns the line.
+		//
+		// The gap it accepts: tasks arriving DURING the handler sit in the inbox unadvertised. Those
+		// are the ones a publisher-side counter would have caught, and giving them up is what buys
+		// back the p50.
+		// DIAGNOSTIC ARM SELECTOR, so the three candidate designs run from ONE binary and can be
+		// interleaved. Comparing them as three separately-built executables measured in three
+		// sessions produced a 2x swing in the K=1 rows -- a configuration with no sibling, where
+		// hot->hot stealing provably cannot act -- which is machine drift, not a result. The branch
+		// costs the same in every arm, which is the property that matters here.
+		//
+		//   0  no lane hint, no hot->hot stealing (the shipped behaviour before this)
+		//   1  hint maintained at the DRAIN only, from a local count
+		//   2  hint maintained per pickup, from hiPri->size()  (touches the thief-written line)
+
+		void UpdateLaneHint(size_t w, size_t depth) noexcept {
+			if (w >= 64) return;
+			const unsigned long long bit = 1ull << w;
+			const bool want = depth >= (size_t)kLaneStealDepth;
+			if (want == ((stealHintLane.load(std::memory_order_relaxed) & bit) != 0)) return;
+			if (want) stealHintLane.fetch_or(bit, std::memory_order_release);
+			else      stealHintLane.fetch_and(~bit, std::memory_order_relaxed);
+		}
+		bool LaneStealable(size_t w) const noexcept {
+			if (w >= 64) return false;
+			return (stealHintLane.load(std::memory_order_acquire) & (1ull << w)) != 0;
+		}
+
 		std::atomic<int> nextWorker{ 0 };
+		// Separate cursor for the hot set, so lane traffic and ordinary traffic do not perturb each
+		// other's rotation -- and so the hot rotation stays over 0..K-1 rather than the whole pool.
+		std::atomic<size_t> nextHotWorker{ 0 };
 		// P/E routing (see PickNextWorker): worker qIndices split by efficiency class (from isPCore),
 		// each with its own round-robin cursor. Built in StartPool. Preference is a HINT -- PickNextWorker
 		// spills to the other class if the preferred one has no available worker, and an empty set (non-
@@ -1147,10 +1468,12 @@ namespace JLib {
 	// IT NO LONGER INHERITS PRIORITY, and the comment here claimed it did for a month. Boosting the
 	// holder on contention was added in 8555cbd ("implemented starvation prevention", 2026-07-15)
 	// and its single call site was removed five days later in 21719ac, the rewrite that turned this
-	// from a spinlock into the suspend-or-help lock described above. `BoostTaskPriority` still
-	// exists and still has no callers anywhere in the library or its consumers, so `priorityBoost`
-	// is permanently 0 and `UnboostTaskPriority` -- which Unlock() does still call -- always takes
-	// its false branch.
+	// from a spinlock into the suspend-or-help lock described above. Both functions are now DELETED
+	// (see the note where they lived in TaskScheduler.cpp): Boost had no callers, which made
+	// `priorityBoost` permanently 0 and Unboost a permanent no-op -- and once hiPri became the
+	// low-latency lane, a mechanism that promotes an aged ORDINARY task into it would have pushed
+	// bulk work onto the hot workers, which is precisely what the lane excludes. The packed
+	// `priorityBoost` bit is left in place so Task's layout fingerprint is unchanged.
 	//
 	// That removal was correct, and it is worth knowing WHY so nobody re-adds the boost as a fix for
 	// a hang it cannot cause. Classic priority inversion needs a high-priority waiter to starve the
