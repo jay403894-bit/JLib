@@ -5,8 +5,9 @@
 // `co_await` for asynchronous I/O. C++20 -- and the ONLY C++20 in the reactor.
 //
 //     JLib::Spawn([](JLib::IoSocket s, JLib::CancelToken tok) -> JLib::Coro {
+//         JLib::IoStream conn{ s };          // stream sockets go through IoStream; see RawAsync below
 //         char buf[4096];
-//         JLib::IoResult r = co_await JLib::RecvAsync(s, buf, sizeof buf, 0, tok);
+//         JLib::IoResult r = co_await JLib::RecvAsync(conn, buf, sizeof buf, 0, tok);
 //         if (r.status == JLib::IoStatus::Cancelled) co_return;   // buffer is ours again
 //         Consume(buf, r.bytes);
 //     }(sock, scope.Token()), &wg, 0, JLib::CorePref::Default, scope.Token().Raw());
@@ -126,8 +127,23 @@ namespace JLib {
     }
 
     // ---- sockets --------------------------------------------------------------------------------
+    //
+    // THE RAW CALLS. These DO NOT SERIALISE: two operations in the same direction on one stream
+    // socket may interleave their bytes, which is silent protocol corruption. The IoStream calls
+    // further down serialise and are what stream code should use. See the block comment above them
+    // for why the guarantee is needed.
+    //
+    // THEY CARRY `Raw` IN THE NAME BECAUSE THEY USED TO BE OVERLOADS. SendAsync(IoSocket) and
+    // SendAsync(IoStream&) differed only in the type of the first argument, so the unserialised one
+    // was reachable by accident: it compiled silently, passed every single-operation test, and
+    // corrupted the protocol only once two operations were genuinely in flight. Distinct names make
+    // the choice explicit at the call site and greppable across a codebase -- one search for
+    // `RawAsync` audits every unserialised stream operation, which the overloaded form made
+    // impossible without type-checking each call by hand.
+    //
+    // Correct uses: a datagram socket, or a caller that can name its own ordering guarantee.
 
-    [[nodiscard]] inline auto RecvAsync(IoSocket s, void* buf, std::uint32_t len,
+    [[nodiscard]] inline auto RecvRawAsync(IoSocket s, void* buf, std::uint32_t len,
                                         std::uint32_t flags = 0,
                                         CancelToken token = CancelToken{}) noexcept {
         return detail::MakeIoAwaiter([=](IoRequest* r, IoResult* o, Task* t) {
@@ -135,7 +151,7 @@ namespace JLib {
         });
     }
 
-    [[nodiscard]] inline auto SendAsync(IoSocket s, const void* buf, std::uint32_t len,
+    [[nodiscard]] inline auto SendRawAsync(IoSocket s, const void* buf, std::uint32_t len,
                                         std::uint32_t flags = 0,
                                         CancelToken token = CancelToken{}) noexcept {
         return detail::MakeIoAwaiter([=](IoRequest* r, IoResult* o, Task* t) {
@@ -165,8 +181,10 @@ namespace JLib {
 
     // Next ready connection from a pre-posted acceptor. Returns 0 if cancelled or shutting down.
     //
-    // The wait is an ORDINARY cancellable semaphore acquire, which is what makes scopes and
-    // deadlines work on "wait for a connection" without IoAcceptor knowing either exists.
+    // The wait is an ordinary cancellable I/O wait -- the waiter is a Task* parked in this awaiter's
+    // own frame, not a scheduler wait primitive. Scopes and deadlines work on "wait for a
+    // connection" because it carries a CancelToken like every other operation here, without
+    // IoAcceptor knowing either exists. See IoAcceptor::TakeOrQueue for why there is no semaphore.
     class AcceptAwaiter {
     public:
         AcceptAwaiter(IoAcceptor& a, CancelToken t) noexcept : acc_(a), token_(t) {}
@@ -202,11 +220,11 @@ namespace JLib {
     // A header and a body from separate allocations, in one syscall, with no copy to join them:
     //
     //     IoBuffer v[2] = { { hdr, hdrLen }, { body, bodyLen } };
-    //     IoResult r = co_await SendVAsync(s, v, 2);
+    //     IoResult r = co_await SendVRawAsync(s, v, 2);
     //
     // The ARRAY is copied during submit and may be a local. THE MEMORY IT POINTS AT MAY NOT -- that
     // is the transfer, and it belongs to the kernel until the completion.
-    [[nodiscard]] inline auto RecvVAsync(IoSocket s, const IoBuffer* bufs, std::uint32_t count,
+    [[nodiscard]] inline auto RecvVRawAsync(IoSocket s, const IoBuffer* bufs, std::uint32_t count,
                                          std::uint32_t flags = 0,
                                          CancelToken token = CancelToken{}) noexcept {
         return detail::MakeIoAwaiter([=](IoRequest* r, IoResult* o, Task* t) {
@@ -214,7 +232,7 @@ namespace JLib {
         });
     }
 
-    [[nodiscard]] inline auto SendVAsync(IoSocket s, const IoBuffer* bufs, std::uint32_t count,
+    [[nodiscard]] inline auto SendVRawAsync(IoSocket s, const IoBuffer* bufs, std::uint32_t count,
                                          std::uint32_t flags = 0,
                                          CancelToken token = CancelToken{}) noexcept {
         return detail::MakeIoAwaiter([=](IoRequest* r, IoResult* o, Task* t) {
@@ -301,13 +319,41 @@ namespace JLib {
         });
     }
 
+    // ADDED WITH THE RawAsync RENAME, to close a hole that rename would otherwise have opened. There
+    // was no serialised vectored RECV -- only the raw one -- so "use IoStream for stream sockets"
+    // had an unstated exception that pushed vectored readers onto exactly the overload the rename
+    // exists to flag. SubmitRecv was already vectored; the scalar form above just wraps one buffer.
+    [[nodiscard]] inline auto RecvVAsync(IoStream& s, const IoBuffer* bufs, std::uint32_t count,
+                                         std::uint32_t flags = 0,
+                                         CancelToken token = CancelToken{}) noexcept {
+        return detail::MakeIoAwaiter([&s, bufs, count, flags, token](IoRequest* r, IoResult* o, Task* t) {
+            return s.SubmitRecv(bufs, count, flags, r, o, t, token);
+        });
+    }
+
     // ================================================================================================
     // ONE OPERATION PER DIRECTION PER STREAM SOCKET -- WHICH IoStream ABOVE ENFORCES FOR YOU.
     //
-    // This note is about the RAW IoSocket overloads, which do not serialise. Use IoStream unless you
-    // have your own ordering guarantee; what follows is why the guarantee is needed at all.
+    //     SendAsync   (IoStream&, ...)   SERIALISES. Transfers queue; bytes cannot interleave.
+    //     SendRawAsync(IoSocket,  ...)   DOES NOT. Concurrent sends may interleave their bytes.
     //
-    // Two SendAsync calls in flight on the same TCP socket are two independent operations, and the
+    // THAT IS A SEMANTIC DIFFERENCE, NOT A PERFORMANCE ONE, which is why the two have different
+    // NAMES rather than being overloads of one. As overloads the dangerous one was selected by the
+    // type of the first argument -- silently, at compile time, with nothing at the call site
+    // recording that a choice had been made at all. The failure it produced was the worst kind:
+    // correct in every single-operation test, corrupt only once two operations were genuinely in
+    // flight, and therefore visible only under load, nondeterministically, looking like a peer or
+    // kernel bug rather than a call-site mistake.
+    //
+    // So: use IoStream for stream sockets. Reach for a Raw call only where you can name the
+    // guarantee that replaces the one you are giving up. (The datagram calls --
+    // SendToAsync/RecvFromAsync -- take a plain IoSocket and are CORRECT that way, which is why
+    // they are NOT named Raw: a datagram is atomic, so there is nothing to interleave. The hazard
+    // is specific to streams.)
+    //
+    // What follows is why the guarantee is needed at all.
+    //
+    // Two SendRawAsync calls in flight on the same TCP socket are two independent operations, and the
     // kernel does not promise to complete them in the order they were submitted. Their bytes can
     // INTERLEAVE, which for a stream protocol is silent corruption -- a header from one message
     // followed by the body of another, with nothing reporting an error anywhere.

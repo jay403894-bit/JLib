@@ -70,7 +70,7 @@ std::vector<std::array<char, 8>> g_brx;
 // enough together that the reactor actually has something to coalesce. The one-at-a-time pass
 // cannot exercise batching at all -- every batch there is size 1.
 JLib::Coro BurstOp(int slot, int sample) {
-    const JLib::IoResult r = co_await JLib::RecvAsync(g_bs[slot], g_brx[slot].data(), 8);
+    const JLib::IoResult r = co_await JLib::RecvRawAsync(g_bs[slot], g_brx[slot].data(), 8);
     const long long now = JLib::MonotonicNs();
     if (r.completedAtNs != 0) {
         const int k = sample * kBurst + slot;
@@ -81,7 +81,7 @@ JLib::Coro BurstOp(int slot, int sample) {
 }
 
 JLib::Coro OneOp(int i) {
-    const JLib::IoResult r = co_await JLib::RecvAsync(g_server, g_rx, sizeof g_rx);
+    const JLib::IoResult r = co_await JLib::RecvRawAsync(g_server, g_rx, sizeof g_rx);
     const long long now = JLib::MonotonicNs();
     if (r.completedAtNs != 0) {
         g_samples[i] = now - r.completedAtNs;
@@ -380,6 +380,32 @@ int main(int argc, char** argv) {
         } else {
             Report(cold ? "COLD" : "HOT", std::move(valid));
             ReportSplit();
+
+            // THE REACTOR'S OWN WAKE: MEASURED, AND IT IS NOT THERE. Every number above starts at
+            // completedAtNs, which the reactor stamps after it has already woken and dequeued -- so
+            // none of it can see the cost of waking the REACTOR. That looked like a hole worth a
+            // dedicated core, since the reactor blocks in an INFINITE GetQueuedCompletionStatus and
+            // pays a thread wake on the first completion after idle, one layer above the worker wake
+            // K-hot was built for.
+            //
+            // Instrumented 8-25 with a dequeue-time stamp and a no-sleep poll mode, arms alternating
+            // per sample. (sleep - poll) at p50, six arms over three reps:
+            //
+            //     +0.20  +0.40  -1.10  -0.70  +1.20  -0.50   us
+            //
+            // It flips sign. A 2-5us wake would be consistently positive; this is scatter around
+            // zero, so the wake is under a microsecond and there is nothing to buy. Both the stamp
+            // and the poll mode were REMOVED afterwards rather than left in: the stamp added 8 bytes
+            // to IoResult, which is a by-value member of every awaiter and therefore rides in every
+            // I/O coroutine frame, and the poll flag was an atomic load in the completion loop.
+            // Instrumentation for a settled question is pure cost.
+            //
+            // The signal-to-noise was poor and that bounds the claim: send->dequeue is 32-40us with
+            // ~20us of p90 spread, so this says the wake is SMALL, not that it is zero. Worth
+            // re-running if the transport ever gets faster than loopback TCP.
+            //
+            // Worth knowing separately: that 32-40us is the real end-to-end shape. The dispatch seam
+            // this whole file measures is ~3.6us of it. The kernel is most of the path.
         }
     }
 
