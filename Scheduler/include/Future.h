@@ -79,38 +79,35 @@
 // code does not expect. Removal happens under the lock, before the resume, and a waiter is in the
 // list exactly once -- so there is no double resume and no lost one.
 //
-// == WHY THE SHARED STATE IS `new` AND NOT A SLAB SLOT (measured 2026-08-25) ==
+// == THE SHARED STATE IS HEAP-ALLOCATED, AND THAT IS THE RULE RATHER THAN AN OVERSIGHT ==
 //
-// It fits -- that was the first question and the answer is yes:
+// THE EFFICIENT ALLOCATOR IS THE WRONG DEFAULT WHEN THE LIFETIME IS NOT YOURS.
 //
-//     std::mutex 80    FutureState<void> 96    <int> 104    <std::string> 128
+//   Task              slab. The scheduler creates it, runs it, frees it -- inside a frame. Lifetime
+//                     is the allocator owner`s, and the pool is sized for exactly that churn.
+//   coroutine frame   slab, when it fits. Destroy is PAIRED with the handle, so the lifetime is
+//                     still bounded by something the scheduler controls.
+//   Future            HEAP. Its lifetime belongs to whoever holds a copy, and that is a user
+//                     decision made outside this library.
 //
-// so every ordinary T lands in the existing 128-byte class and a large one lands in 256. The waiter
-// node is 32 bytes and costs nothing, because it lives in the awaiter's frame.
+// The slab`s capacity is a resource the SCHEDULER needs. Putting a user-lifetime object in it means
+// a user decision -- caching a resolved handle for the session, which is a perfectly reasonable
+// thing to write -- silently consumes slots that tasks require. The pool assumes churn; a handle
+// held indefinitely is the one shape it was not sized for. That is an occupancy problem, not a
+// capacity one: exhausting the 128-byte class takes ~131,000 concurrent Futures, so the danger was
+// never running out, it was never giving back.
 //
-// WHAT SLABBING WOULD ACTUALLY BUY, and it is not the size class. The slab exists to avoid the CRT
-// allocator's lock -- it is sharded, so concurrent creation from several workers does not serialise
-// -- and to keep objects contiguous. Size classes are how it is organised, not why it exists. So
-// the question is not "does it fit" (it does, at 128) but "are these created concurrently, often
-// enough for the allocator lock to matter".
+// THIS WAS BUILT AND REVERTED, 2026-08-25, so the work is not repeated. It fits (96 bytes for the
+// void form, 128 for an ordinary T), it cost nothing measurable, and the sizes did not even change
+// because the provenance flag rode in padding std::mutex already forced. None of that is the
+// question. The argument FOR it was consistency -- almost nothing else here touches the CRT
+// allocator at runtime -- and consistency is the weaker claim when the thing being made consistent
+// has a different lifetime shape from everything around it.
 //
-// NOT SLABBED FOR NOW, on the judgement that nothing has shown they are. Tasks are created at frame
-// rate by every worker at once, which is what justified the slab; a Future is created once per
-// asynchronous operation and outlives it. An asset load makes a handful. A per-request server might
-// make thousands a second -- and if one ever does, slab it at 128 rather than adding a class.
-//
-// THE COUNTERWEIGHT, which is why this is a judgement rather than an obvious yes: the 128-byte
-// class is shared with coroutine frames, and it is a FIXED capacity chosen by SlabSizes. Slabbing
-// Futures spends frame budget on them, so an app that makes many would hit the cap sooner and the
-// symptom would appear as frame-allocation failure somewhere unrelated. `new` has no cap. That
-// coupling is worth taking on for something allocated at frame rate; it is not obviously worth it
-// for something allocated once per operation.
-//
-// A SEPARATE AND LARGER OPTION, noted because it changes the arithmetic above: std::mutex is 80 of
-// these 96 bytes. A spinlock would take the void form to about 24 and drop everything into the
-// 64-byte class. The lock is held only for pointer surgery and two bools, never across a
-// suspension, so it is a candidate -- but a spinlock trades a bounded wait for burning a core when
-// the holder is preempted, which is a bigger decision than where the memory comes from.
+// IF A WORKLOAD EVER SHOWS FUTURE CREATION IS HOT, the answer is a pool of its own that cannot take
+// task classes -- not the shared slab. That keeps the allocator-lock saving without letting user
+// lifetime spend scheduler capacity. Nothing has shown that yet; a Future is created once per
+// asynchronous operation and outlives it.
 //
 // == WHAT THIS IS NOT ==
 //

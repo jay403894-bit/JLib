@@ -81,6 +81,26 @@ static JLib::Coro ScopedSignalled(JLib::Future<void> f, JLib::CancelToken tok) {
 
 int main() {
     std::setvbuf(stdout, nullptr, _IONBF, 0);
+
+    // ---- BEFORE Init(): a Promise works with no scheduler ---------------------------------------
+    //
+    // The producer side is documented as plain C++17, usable from a thread that has never heard of
+    // this scheduler -- so a Promise built before Init() has to work. It is also the property that
+    // decided where the shared state lives: slab allocation was built and reverted (see Future.h),
+    // because a Future's lifetime belongs to whoever holds a copy, and an allocator sized for the
+    // scheduler's own churn is the wrong home for an object the user decides how long to keep.
+    //
+    // RUN FIRST, DELIBERATELY: after Init() this section says nothing.
+    std::printf("before Init(): a Promise works with no scheduler at all\n");
+    {
+        JLib::Promise<std::string> p;
+        JLib::Future<std::string>  f = p.GetFuture();
+        Check(f.Valid() && !f.Ready(), "a Promise works with no scheduler at all");
+        p.Set(std::string("preinit"));
+        Check(f.Ready() && f.Get() == "preinit", "and carries its value");
+    }
+    Check(true, "and destructs cleanly with no scheduler ever started");
+
     JLib::TaskScheduler::Init(0);
     auto& sched = JLib::TaskScheduler::Instance();
     std::printf("Future<T> -- workers=%zu\n", sched.GetWorkerCount());
