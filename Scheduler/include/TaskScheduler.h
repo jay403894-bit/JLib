@@ -356,6 +356,95 @@ namespace JLib {
 		static void SetLaneHintMode(int m) noexcept { laneHintMode.store(m, std::memory_order_relaxed); }
 		static int  GetLaneHintMode() noexcept { return laneHintMode.load(std::memory_order_relaxed); }
 
+		// THE SAME HINT, READ BY A PRODUCER INSTEAD OF A THIEF.
+		//
+		// stealHintLane exists so an idle hot worker can find a buried sibling. But the I/O
+		// completion thread is choosing WHERE TO PUT work at exactly the moment that bit is set, and
+		// it was choosing blind: pushSteered rotates `w = steer++` across the hot set with no idea
+		// that worker w is 200us into a handler. Stealing then has to undo a placement the producer
+		// could simply not have made -- and stealing is the expensive repair (a probe, a contended
+		// CAS against the owner, a lost line) where not-aiming-there is free.
+		//
+		// One atomic load per flush, of a line the producer already shares with the hot set. The
+		// mask, not a per-worker query, so a flush pays for one load rather than K.
+		//
+		// Bit w == worker w (queue index, so PushBatch affinity w+1) is advertising a lane backlog
+		// at or past kLaneStealDepth. Only the first 64 workers can ever be represented; past that
+		// the bit is absent and the worker reads as available, which is the safe direction.
+		static unsigned long long LaneBacklogMask() noexcept {
+			return Instance().stealHintLane.load(std::memory_order_acquire);
+		}
+
+		// Runtime arm for the above, so the dispatch bench interleaves skip-on against skip-off
+		// INSIDE ONE PROCESS. Three separately-built binaries once moved the K=1 rows -- a
+		// configuration where the mechanism provably cannot act -- by 2x, which was machine drift
+		// presented as a result. Never compare arms across builds again.
+		static inline std::atomic<bool> steerSkipOn{ false };
+		static void SetSteerSkip(bool on) noexcept { steerSkipOn.store(on, std::memory_order_relaxed); }
+		static bool GetSteerSkip() noexcept { return steerSkipOn.load(std::memory_order_relaxed); }
+
+		// ============================ WAKING SLEEPERS FOR THE LANE ==================================
+		//
+		// How many PARKED ordinary workers to pull up when a hot worker publishes a lane backlog.
+		// 0 disables it, which is the behaviour before this existed.
+		//
+		// THE GAP THIS CLOSES. laneHintMode 4 lets an ordinary worker drain a backlogged lane, and
+		// under the default Sleep policy it is INERT -- an ordinary worker with no bulk work is
+		// parked exactly when the lane backs up, so the valve is welded shut in the configuration
+		// that ships. Everything mode 4 measured came from NoSleep runs. This is the missing half:
+		// the hint is already the one signal in the system that says "lane work is sitting still,"
+		// so let it also be a reason to wake somebody.
+		//
+		// WHY A BARE NOTIFY CANNOT WORK, since that is the obvious version. cv.wait re-evaluates the
+		// sleep predicate on every wake, and the predicate knows nothing about the lane: the worker
+		// would wake, re-check, still see an empty own-inbox and no hasQueuedWork, and park again
+		// WITHOUT EVER REACHING THE STEAL LOOP. The predicate change is the mechanism; the notify is
+		// only what delivers it. That is why this costs a fourth flag and a re-proof rather than one
+		// line at the publisher.
+		//
+		// AND WHY IT IS A FLAG AND NOT A READ OF stealHintLane -- see Thread::laneWake. Level
+		// triggering would leave a worker that lost the steal race unable to park at all.
+		//
+		// COST MODEL, which is what decides the default. A wake is ~90us of wall clock before the
+		// woken worker runs anything (measured 8-24). So this can only pay where the thing it is
+		// racing is LONGER than that -- a buried hot worker with a 200us handler and a queue behind
+		// it. Against a 20us handler the wake arrives after the backlog is already gone, and all it
+		// bought was a woken core. kLaneStealDepth (4) is the throttle: the hint only sets when a
+		// worker is genuinely buried, so this is a far narrower trigger than NoSleep's "never park".
+		static inline std::atomic<int> laneWakeCount{ 0 };
+		static void SetLaneWake(int n) noexcept { laneWakeCount.store(n, std::memory_order_relaxed); }
+		static int  GetLaneWake() noexcept { return laneWakeCount.load(std::memory_order_relaxed); }
+
+		// THE LOWER EDGE OF THE SCHMITT TRIGGER in UpdateLaneHint: once a worker is advertising a
+		// lane backlog, it keeps advertising until its depth drops to THIS, rather than until it
+		// drops below kLaneStealDepth.
+		//
+		// Default 3 == kLaneStealDepth - 1, which is exactly a single threshold and therefore the
+		// behaviour before hysteresis existed. Lower it to open the gap. It is a runtime knob and
+		// not a constant so the arms interleave INSIDE one process -- comparing them as two builds is
+		// how a 1.8x drift on a control arm got read as a result twice in two days.
+		//
+		// SET IT WITH SetLaneWake, NOT INDEPENDENTLY. The two are coupled, and measurement 8-26 says
+		// the wrong pairing is strictly worse than either default:
+		//
+		//     wake = 0  ->  clear = 3   widening doubles steal probes and buys nothing, because
+		//                               there is no woken helper for the wider window to serve
+		//     wake > 0  ->  clear = 0   probes rise 1.2-1.5x and p50 falls by up to 3.5x
+		//
+		// WHY THE GAP ONLY PAYS ALONGSIDE WAKES. The bit is a PERMISSION: an ordinary worker may
+		// touch the lane only while LaneStealable holds. A wake takes ~90us to land, and at clear=3
+		// the owner has usually drained below kLaneStealDepth by then -- so the helper that was
+		// summoned arrives to find itself no longer allowed to help, parks again, and delivered
+		// nothing for the price of a wake. The gap keeps the permission alive long enough for the
+		// helper to arrive. With no wakes there is nobody arriving, so all the wider window does is
+		// keep thieves probing.
+		//
+		// The recommended pair for a latency-sensitive lane on one hot core:
+		//     SetHotWorkers(1); SetLaneWake(2); SetLaneClearDepth(0);
+		static inline std::atomic<int> laneClearDepth{ 3 };
+		static void SetLaneClearDepth(int d) noexcept { laneClearDepth.store(d, std::memory_order_relaxed); }
+		static int  GetLaneClearDepth() noexcept { return laneClearDepth.load(std::memory_order_relaxed); }
+
 		// THE TWO PREDICATES THAT DEFINE THE LOW-LATENCY LANE. Everything -- push routing, inbox
 		// draining, deque popping, steal probes, the sleep predicate -- asks one of these rather than
 		// open-coding the condition. Nine sites read the hiPri lane; a copy of the rule at each is
@@ -1422,6 +1511,9 @@ namespace JLib {
 		// higher stakes, because here it also defeats the placement. Four is above the depth a
 		// keeping-up worker reaches and well below the 8-13 measured when one is buried.
 		static constexpr int kLaneStealDepth = 4;
+		// laneClearDepth`s default must BE the single-threshold behaviour, or the "no hysteresis" arm is
+		// not a control. Asserted rather than commented because the two live 100 lines apart.
+		static_assert(kLaneStealDepth == 4, "laneClearDepth defaults to 3 == kLaneStealDepth - 1; keep them in step");
 
 		std::atomic<unsigned long long> stealHintLane{ 0 };
 
@@ -1451,14 +1543,42 @@ namespace JLib {
 		//   1  hint maintained at the DRAIN only, from a local count
 		//   2  hint maintained per pickup, from hiPri->size()  (touches the thief-written line)
 
+		// A SCHMITT TRIGGER, not a threshold. Sets at kLaneStealDepth, clears at laneClearDepth, and
+		// the gap between them is the whole point.
+		//
+		// WHY, MEASURED 8-26. With one threshold the bit chatters: a helper drains the lane below the
+		// line, it refills, the line is crossed again -- and the crossing RATE rose from 6,934/s to
+		// 17,731/s once lane wakes were switched on, because the wakes are what does the draining.
+		// Positive feedback on the edge count. Each edge fires up to n wakes, so a mechanism designed
+		// as "one wake per burial" measured 3,600-92,000 wakes/s.
+		//
+		// The bit is read by THIEVES as well as by the wake path, so widening it changes both. A
+		// worker that was never buried never sets the bit and is untouched either way; a worker that
+		// WAS buried now keeps advertising down to laneClearDepth, so a thief may take its
+		// second-to-last task. That is the trade the gap buys, and it is measured rather than
+		// assumed -- see the bench's wake=0 rows, which vary the gap with the wake path switched off
+		// and therefore isolate the effect on stealing alone.
 		void UpdateLaneHint(size_t w, size_t depth) noexcept {
 			if (w >= 64) return;
 			const unsigned long long bit = 1ull << w;
-			const bool want = depth >= (size_t)kLaneStealDepth;
-			if (want == ((stealHintLane.load(std::memory_order_relaxed) & bit) != 0)) return;
-			if (want) stealHintLane.fetch_or(bit, std::memory_order_release);
+			const bool isSet = (stealHintLane.load(std::memory_order_relaxed) & bit) != 0;
+			const bool want  = isSet ? (depth > (size_t)laneClearDepth.load(std::memory_order_relaxed))
+			                         : (depth >= (size_t)kLaneStealDepth);
+			if (want == isSet) return;
+			if (want) {
+				stealHintLane.fetch_or(bit, std::memory_order_release);
+				// THE 0->1 EDGE IS THE EVENT, not the level, and only the owner writes this bit --
+				// so this fires once per burial rather than once per push. That rarity is what makes
+				// it affordable to do here, on the hot worker itself, microseconds before it
+				// disappears into a long handler.
+				WakeForLane(depth);
+			}
 			else      stealHintLane.fetch_and(~bit, std::memory_order_relaxed);
 		}
+
+		// Defined out of line in TaskScheduler.cpp: it touches Thread, which is only forward
+		// declared at this point.
+		void WakeForLane(size_t depth) noexcept;
 		bool LaneStealable(size_t w) const noexcept {
 			if (w >= 64) return false;
 			return (stealHintLane.load(std::memory_order_acquire) & (1ull << w)) != 0;
@@ -1468,6 +1588,9 @@ namespace JLib {
 		// Separate cursor for the hot set, so lane traffic and ordinary traffic do not perturb each
 		// other's rotation -- and so the hot rotation stays over 0..K-1 rather than the whole pool.
 		std::atomic<size_t> nextHotWorker{ 0 };
+		// Cursor for lane wakes, separate from both of the above so a burst of burials spreads over the
+		// ordinary workers instead of repeatedly waking the same one.
+		std::atomic<size_t> nextLaneWake{ 0 };
 		// P/E routing (see PickNextWorker): worker qIndices split by efficiency class (from isPCore),
 		// each with its own round-robin cursor. Built in StartPool. Preference is a HINT -- PickNextWorker
 		// spills to the other class if the preferred one has no available worker, and an empty set (non-

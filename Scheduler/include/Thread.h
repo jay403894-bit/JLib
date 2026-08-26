@@ -62,6 +62,49 @@ namespace JLib {
     inline constexpr bool kStealStatsEnabled = false;
 #endif
 
+    // ================================ LANE WAKE RATE (opt-in) ===================================
+    // Counts what TaskScheduler::WakeForLane actually does:
+    //     edges     0->1 transitions of a lane hint bit -- how often a worker gets buried
+    //     notifies  wakes actually SENT, which is what costs ~90us of core time each
+    //
+    // THIS IS THE COST SIDE, and it is measured by COUNTING rather than by an A/B, deliberately.
+    // The benefit was measured as latency and needed a 5-9% noise floor and two replications to
+    // read. The cost does not need any of that: a wake's price is already known, so the only open
+    // variable is the rate, and a count has no variance. It is also the only form of this question
+    // answerable in an application whose frame timing is unstable -- which is the normal case
+    // without vsync, and clamped to the refresh interval with it.
+    //
+    // Two counters and not one, because they answer different questions. `edges` says how often the
+    // pool reaches the buried state at all -- a property of the WORKLOAD, true even at wake=0.
+    // `notifies` says what this mechanism spent. Their ratio is the wake budget actually being used:
+    // far below the configured n means most burials found no parked worker to pull up, which is
+    // itself the finding that the mechanism is inert in that configuration.
+    //
+    // Enable with -DJLIBSCHED_LANE_WAKE_STATS=ON at configure time.
+#ifdef JLIBSCHED_LANE_WAKE_STATS
+    struct alignas(platform::kCacheLine) LaneWakeCounters {
+        std::atomic<long long> edges{ 0 };
+        std::atomic<long long> notifies{ 0 };
+    };
+    inline LaneWakeCounters g_laneWake;
+    #define JLIBSCHED_LANE_WAKE_STAT(field) \
+        ::JLib::g_laneWake.field.fetch_add(1, std::memory_order_relaxed)
+    inline void LaneWakeStatsReset() {
+        g_laneWake.edges.store(0, std::memory_order_relaxed);
+        g_laneWake.notifies.store(0, std::memory_order_relaxed);
+    }
+    inline void LaneWakeStatsRead(long long& edges, long long& notifies) {
+        edges    = g_laneWake.edges.load(std::memory_order_relaxed);
+        notifies = g_laneWake.notifies.load(std::memory_order_relaxed);
+    }
+    inline constexpr bool kLaneWakeStatsEnabled = true;
+#else
+    #define JLIBSCHED_LANE_WAKE_STAT(field) ((void)0)
+    inline void LaneWakeStatsReset() {}
+    inline void LaneWakeStatsRead(long long& e, long long& n) { e = n = 0; }
+    inline constexpr bool kLaneWakeStatsEnabled = false;
+#endif
+
     // ============================ HOT-WORKER OCCUPANCY WITNESS (opt-in) =========================
     // Answers exactly one question, and it is the question that decides whether hot->hot stealing
     // has a job at all: WHEN A HOT WORKER IS LATE, IS A SIBLING HOT WORKER IDLE AT THAT MOMENT?
@@ -237,6 +280,23 @@ namespace JLib {
         // seq_cst. Note it would still run correctly on x86 either way, because `lock cmpxchg`
         // incidentally drains the store buffer -- AArch64 is where the weaker version breaks.
         void MarkQueuedWork() { hasQueuedWork.store(true, std::memory_order_seq_cst); }
+
+        // THE FOURTH PREDICATE INPUT. Set by TaskScheduler::WakeForLane when a HOT worker publishes
+        // a lane backlog, to pull a parked ordinary worker up to come and steal it.
+        //
+        // seq_cst for exactly the reason MarkQueuedWork is, and the reason is not defensive: this
+        // store and NotifyWorker's load of workerState are a StoreLoad pair on DIFFERENT objects,
+        // and NotifyWorker's awake-skip is only sound for flags that sit in the single total order.
+        // The 1.2.0 hang was a predicate input left at release/acquire while its neighbour was
+        // promoted. tests/verify/sleepwake_model.c carries this flag and a -DWEAK_LANEWAKE negative
+        // control that MUST fail.
+        void MarkLaneWake() { laneWake.store(true, std::memory_order_seq_cst); }
+
+        // Is this worker parked or on its way there? Used to aim a lane wake at a worker that will
+        // actually pay for one -- NotifyWorker already skips an awake worker for free, but a wake
+        // budget of N should be spent on N SLEEPING workers, not burned on awake ones.
+        bool Parked() const { return workerState.load(std::memory_order_seq_cst) != WS_AWAKE; }
+
         bool Ready();
 
         // DIAGNOSTIC ONLY, for TaskScheduler::DumpPoolState(). Reads are relaxed and unsynchronised
@@ -287,6 +347,19 @@ namespace JLib {
         // OTHER workers' deques is already found for free by the unconditional steal-attempt
         // phase every awake worker runs each loop pass, with no predicate involved at all.
         std::atomic<bool> hasQueuedWork{ false };
+
+        // EDGE-TRIGGERED, and that is the whole safety argument for it. Cleared once per Worker()
+        // loop iteration in the same place as hasQueuedWork, so ONE wake buys ONE search pass and
+        // the worker parks again unless it actually found something.
+        //
+        // The level-triggered version -- reading TaskScheduler::stealHintLane straight from the
+        // sleep predicate -- is the obvious implementation and it is wrong twice over. It would put
+        // a line shared with every hot worker inside every parked worker's predicate, and worse, a
+        // worker that woke and lost the steal race would find the predicate STILL true and never
+        // park: N-K workers spinning for as long as one hot worker stays buried, which is NoSleep
+        // arrived at by accident and with none of NoSleep's bounds. A flag the worker consumes
+        // cannot do that.
+        std::atomic<bool> laneWake{ false };
 
         // Worker sleep state, so a push can skip the wake entirely when this worker is already
         // running. Three states rather than a bool because the interesting window is between
@@ -358,18 +431,38 @@ namespace JLib {
     // reclamation respects whichever readers exist. See EpochManager's counted-epoch block and
     // tests/verify/counted_epoch_model.c.
     //
-    // Returns by value into an `auto` at the call site; the two guards are different types and that
-    // is deliberate -- there is nothing a caller should ever want to do with one that is not RAII.
-    class CoroSafeEpochGuard {
+    // ------------------------------------------------------------------------------------------
+    // WHY THIS LIVES IN Thread.h AND NOT NEXT TO THE OTHER TWO GUARDS IN Epochs.h
+    //
+    // It cannot live there. The picking decision needs OnCoroutineTask(), which needs
+    // Thread::GetCurrent() and Task::type -- and Thread.h ALREADY INCLUDES Epochs.h. Moving this
+    // class down would invert that edge: Epochs.h would have to see Thread, which sees Epochs.
+    //
+    // A forward declaration would compile, and it is worse than the split, because it fails in
+    // exactly the wrong direction: the guard would pick correctly only in translation units that
+    // also happened to pull in Thread.h. Every other one would fail to link -- or, if someone
+    // "fixed" that with a fallback definition, would quietly hand a coroutine a borrowed slot,
+    // which is the use-after-free this class exists to prevent. The value of this type is that
+    // there is exactly ONE decision site and it can never be the wrong one.
+    //
+    // SO THE SPLIT IS: Epochs.h owns the two MECHANISMS (SlotEpochGuard, CountedEpochGuard) and
+    // knows nothing about who is running. Thread.h owns the CHOICE, because only Thread.h can see
+    // the caller. Both mechanism definitions in Epochs.h point back here.
+    //
+    // And this one has the plain name deliberately. Callers should essentially never name
+    // SlotEpochGuard or CountedEpochGuard directly; this spelling is the correct one everywhere,
+    // so it gets the obvious name and the two mechanisms get the qualified ones.
+    // ------------------------------------------------------------------------------------------
+    class EpochGuard {
     public:
-        CoroSafeEpochGuard() {
+        EpochGuard() {
             if (OnCoroutineTask() || EpochManager::ForceCountedEpochs()) counted_.emplace();
             else                                                        slotted_.emplace(CurrentEpochSlot());
         }
-        CoroSafeEpochGuard(const CoroSafeEpochGuard&) = delete;
-        CoroSafeEpochGuard& operator=(const CoroSafeEpochGuard&) = delete;
+        EpochGuard(const EpochGuard&) = delete;
+        EpochGuard& operator=(const EpochGuard&) = delete;
     private:
         std::optional<CountedEpochGuard> counted_;
-        std::optional<EpochGuard>        slotted_;
+        std::optional<SlotEpochGuard>    slotted_;
     };
 };

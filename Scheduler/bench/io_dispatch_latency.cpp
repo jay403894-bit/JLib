@@ -478,6 +478,339 @@ int main(int argc, char** argv) {
         }
     }
 
+    // ---- LANE WAKES: can a parked worker be pulled up in time to matter? ------------------------
+    //
+    // laneHintMode 4 lets an ordinary worker drain a backlogged lane, and under the DEFAULT Sleep
+    // policy it is inert -- the ordinary workers are parked exactly when the lane backs up. Every
+    // number that made mode 4 look good came from NoSleep runs. So this arm asks whether the hint
+    // can also be a reason to WAKE somebody, and get NoSleep's lane behaviour for the cost of a
+    // wake per burial instead of N cores never sleeping.
+    //
+    // THE THING THAT DECIDES IT IS THE ~90us WAKE. A woken worker runs nothing for about that long
+    // (measured 8-24), so this can only pay where the burial it is racing lasts LONGER than the
+    // wake. That is the whole reason burn is swept rather than fixed:
+    //
+    //     burn = 20us    the backlog is gone before the sleeper is running. Expect nothing, or
+    //                    worse than nothing -- a woken core that finds an empty lane.
+    //     burn = 200us   the sleeper can arrive with 100us of queue still in front of it.
+    //
+    // A result at 200us only is not a disappointment, it is the mechanism working exactly as its
+    // cost model says it must. A result at 20us would mean the wake is cheaper than 90us and the
+    // README is wrong about something.
+    //
+    // n = how many parked workers one burial pulls up. 0 is off. Above 1 is the thundering-herd
+    // question: they all steal from the SAME victim deque, so the second and third pay a wake to
+    // lose a CAS. Swept rather than argued.
+    //
+    // == MEASURED 8-25, Sleep policy, 29 workers, median of 3, TWO independent runs ==
+    //
+    //   200us burials, 1-in-8            p50            p90             p99
+    //     K=1  wake 0                284.3 / 273.8   757.5 / 756.2  1152.8 / 1089.6
+    //          wake 1                190.4 / 183.3   476.4 / 499.3   866.4 /  810.0
+    //          wake 2                131.2 / 134.2   415.8 / 359.6   683.2 /  598.5
+    //          wake 4                145.9 / 135.5   442.7 / 383.5   724.8 /  638.4
+    //     K=4  wake 0                 39.9 /  37.0   241.1 / 239.2   438.6 /  449.2
+    //          wake 2                 46.5 /  53.3   244.2 / 243.8   454.8 /  436.7
+    //
+    // BOTH RUNS AGREE INSIDE A FEW PERCENT, which is what makes this readable at all -- the earlier
+    // steering sweep found this row's noise floor at 5-9%, and the K=1 effect is five times that.
+    //
+    // AT K=1 IT IS THE LARGEST SINGLE WIN MEASURED ON THIS LANE: p50 -52%, p90 -49%, p99 -45% at
+    // wake=2. At K=4 it is a pure LOSS -- p50 +30%, replicated, with the tail unchanged.
+    //
+    // The split is not a tuning accident, it is the mechanism's own precondition. At K=1 there IS no
+    // hot sibling, so hot->hot stealing cannot exist and a parked ordinary worker is the only thing
+    // in the process that can help. By K=4 the hot set absorbs the backlog itself, so the wake buys
+    // nothing and still costs a notify on the hot worker plus a cold core arriving to contend for
+    // tasks that already had an owner.
+    //
+    // wake=2 beats wake=4 in both runs, so the herd is real above two: the third and fourth wake
+    // pay ~90us to lose a CAS on the same victim deque.
+    //
+    // NOTE WHAT THIS COMPLEMENTS. Hot->hot stealing needs K>=2 to mean anything and does nothing at
+    // K=1; this does everything at K=1 and nothing at K=4. They cover disjoint configurations. And
+    // K=1 is the configuration this project actually recommends -- one hot core carries NoSleep's
+    // p50 win without 29 cores spinning -- so the case with no other repair available is the case
+    // most likely to be running.
+    //
+    // SHIPS AT 0 ANYWAY, because a default that helps K=1 and costs K=4 is a policy decision and not
+    // a measurement. The obvious follow-up is to gate the wake on GetHotWorkers() == 1 inside
+    // WakeForLane, which is not a tuning knob but the precondition above written down.
+    //
+    // == 1 AND NOT <= 1. At K=0 nothing can enter a hiPri lane at all -- push routes hiPri to the
+    // ordinary lane, isHotWorker is false for every worker, so the hint is never set and the wake
+    // never fires. Writing <= would imply K=0 is a case being handled when it is a case that cannot
+    // occur.
+    {
+        const int n = 32, iters = 100;
+        std::printf("\n  lane wakes -- a buried hot worker pulls parked workers up to steal\n");
+        std::printf("    Sleep policy. wake=0 is today's behaviour (mode 4 inert while parked).\n");
+        std::printf("    K=1 is NOT a control here: one hot worker can bury itself, so wakes fire.\n");
+        // probes/s = remote deque touches. A hint held LONGER is a hint thieves keep acting on, so
+        // this is the one cost of widening the gap that the latency columns would not surface.
+        if (JLib::kLaneWakeStatsEnabled)
+            std::printf("      K    burn   skew   wake  clear      p50      p90      p99   edges/s  wakes/s   core%%%s\n",
+                        JLib::kStealStatsEnabled ? "    probes/s" : "");
+        else
+            std::printf("      K    burn   skew   wake  clear      p50      p90      p99\n");
+
+        constexpr int kReps = 3;
+        // THE 2x3. `clear` is the lower edge of the Schmitt trigger; 3 == kLaneStealDepth-1 is a
+        // single threshold, i.e. no hysteresis, i.e. the control.
+        //
+        // == MEASURED 8-26, and it refuted the reason the hysteresis was built ==
+        //
+        // THE HYPOTHESIS WAS CHATTER: that the bit oscillated across a single threshold, so widening
+        // the gap would cut the edge rate. IT DID NOT. Edges/s barely moved and if anything rose:
+        //
+        //   K=1  20us  wake=2   clear 3 -> 16814/s   clear 1 -> 17275/s   clear 0 -> 17557/s
+        //   K=1 200us  wake=2   clear 3 ->  5053/s   clear 1 ->  5159/s   clear 0 ->  5522/s
+        //
+        // So the deque is not hovering at the line. It swings from a full batch to EMPTY and back --
+        // UpdateLaneHint is called from the inbox->deque drain with depth = count-1, the worker then
+        // runs the deque dry, and the next batch re-arms it. A gap between 4 and 1 lives entirely
+        // inside that swing. The edge rate is the BATCH ARRIVAL RATE of the workload, not an
+        // artifact, and no threshold tuning will reduce it.
+        //
+        // BUT IT IS A LARGE WIN ANYWAY, for a different reason, with the wake COUNT unchanged:
+        //
+        //   K=1 200us wake=2      p50      p90      p99    wakes/s
+        //     clear 3           214.40   437.10   653.60     9998
+        //     clear 1           196.60   260.60   449.50    10210
+        //     clear 0            67.70   243.50   443.90    10777
+        //
+        // Same number of wakes, a third of the p50. So each wake is doing more, and the reason is
+        // the PERMISSION WINDOW: a wake takes ~90us to land, and an ordinary worker may only touch
+        // the lane while LaneStealable says so. With clear=3 the owner often drains below 4 during
+        // those 90us, the bit clears, and the worker that was woken specifically to help arrives to
+        // find itself no longer allowed to -- it parks again, having cost a wake and delivered
+        // nothing. Holding the bit until the deque is empty keeps the permission alive long enough
+        // for the helper it summoned to actually arrive. (Inference from equal wakes + better
+        // latency, not a direct count of productive wakes.)
+        //
+        // AND IT COSTS THIEVES NOTHING, which was the risk of widening a bit they also read. The
+        // wake=0 rows vary the gap with the wake path off, and they are flat in all four
+        // configurations -- 487/490/484 at K=1 200us, 25.7/25.6/25.1 at K=4 20us. No regression.
+        //
+        // == THE PROBE COST, added 8-26, and it decides the default ==
+        //
+        // A bit held longer is a bit thieves keep acting on, and that is the one cost latency alone
+        // would not surface -- remote deque touches are exactly the quantity the lane split exists to
+        // reduce. Counted per arm:
+        //
+        //   probes/s              clear 3    clear 1    clear 0
+        //     K=4  20us  wake=0     90625     166347     183750     2.0x
+        //     K=4 200us  wake=0     30312      62510      77837     2.6x
+        //     K=1 200us  wake=2     77173      88904      95272     1.2x
+        //
+        // THE wake=0 ROWS SETTLE IT. There the gap doubles probes and buys NOTHING -- latency is
+        // flat across all three (64.0/89.2/65.9 p50 at K=4 200us, inside its own noise). So in the
+        // SHIPPED configuration, where lane wakes are off, widening the hint is pure cost.
+        //
+        // The two knobs are therefore COUPLED and should be set together, not independently:
+        //
+        //     wake = 0   ->  clear = 3    widening pays for probes and gets nothing back
+        //     wake > 0   ->  clear = 0    the probe rise is 1.2-1.5x and the latency win is large
+        //
+        // which is why laneClearDepth's default stays 3: it is the correct partner for the wake
+        // default of 0. Enabling one without the other is the misconfiguration to warn about.
+        //
+        // THE FULL STACK, K=1, 200us burials, against the shipped default:
+        //
+        //     wake=0 clear=3    p50 510.60   p90 942.60   p99 1334.70
+        //     wake=2 clear=0    p50  57.70   p90 247.80   p99  449.00
+        //                           8.8x         3.8x          3.0x
+        //
+        // for an upper-bound 100% of one core in wakes, against NoSleep's 29 cores spinning. That is
+        // the original hypothesis -- NoSleep-like lane behaviour without the NoSleep tax -- and on
+        // this workload it holds by a factor of about thirty.
+        //
+        // THE wake=0 ROWS ARE NOT PADDING. The hint bit is read by thieves as well as by the wake
+        // path, so widening it changes hot->hot stealing too -- a mechanism that is default ON and
+        // already measured. With the wake path switched off, those three rows vary ONLY what thieves
+        // see, which is the one way to tell a stealing regression from a wake improvement.
+        const int wakeArms[]  = { 0, 0, 0, 2, 2, 2 };
+        const int clearArms[] = { 3, 1, 0, 3, 1, 0 };
+        constexpr int kNW = 6;
+
+        for (long long burn : { 20000LL, 200000LL }) {
+          for (std::size_t k : { (std::size_t)1, (std::size_t)4 }) {
+            std::vector<double> p50[kNW], p90[kNW], p99[kNW], eps[kNW], wps[kNW], prb[kNW];
+            for (int rep = 0; rep < kReps; ++rep) {
+              for (int a = 0; a < kNW; ++a) {
+                JLib::TaskScheduler::SetLaneHintMode(4);      // the wake is a no-op under any other
+                JLib::TaskScheduler::SetSteerSkip(false);
+                JLib::TaskScheduler::SetLaneWake(wakeArms[a]);
+                JLib::TaskScheduler::SetLaneClearDepth(clearArms[a]);
+                JLib::TaskScheduler::SetHotWorkers(k);
+                g_skewEveryNth = 8;
+                g_skewBurnNs   = burn;
+                JLib::LaneWakeStatsReset();
+                JLib::StealStatsReset();   // a bit held longer means thieves PROBE longer -- the one cost
+                                           // of widening the gap that latency alone would not surface
+
+                double secs = 0.0;
+                std::vector<long long> v = SoakRun(n, iters, secs);
+                if (v.empty()) continue;
+                const auto pk = [&](double p) {
+                    return v[std::min(v.size() - 1, size_t(v.size() * p))] / 1000.0;
+                };
+                p50[a].push_back(pk(0.50)); p90[a].push_back(pk(0.90)); p99[a].push_back(pk(0.99));
+
+                long long ed = 0, nf = 0;
+                JLib::LaneWakeStatsRead(ed, nf);
+                if (secs > 0.0) { eps[a].push_back(ed / secs); wps[a].push_back(nf / secs); }
+                long long pr = 0, ht = 0;
+                JLib::StealStatsRead(pr, ht);
+                if (secs > 0.0) prb[a].push_back(pr / secs);
+              }
+            }
+            const auto med = [](std::vector<double> x) {
+                if (x.empty()) return -1.0;
+                std::sort(x.begin(), x.end());
+                return x[x.size() / 2];
+            };
+            for (int a = 0; a < kNW; ++a) {
+                std::printf("    %3zu  %6.0f  %5d  %5d  %6d  %7.2f  %7.2f  %7.2f",
+                            k, burn / 1000.0, 8, wakeArms[a], clearArms[a],
+                            med(p50[a]), med(p90[a]), med(p99[a]));
+                if (JLib::kLaneWakeStatsEnabled) {
+                    // core% = wakes/sec x ~90us. An UPPER BOUND, not a measurement: 90us is the
+                    // cold-wake LATENCY, not CPU burn, and the woken worker goes on to do real work.
+                    // It is here for one comparison only -- against NoSleep's 29 spinning cores,
+                    // i.e. 2900% -- because that is what decides whether this is a bargain.
+                    const double w = med(wps[a]);
+                    std::printf("  %8.0f %8.0f  %6.2f", med(eps[a]), w, w * 90e-6 * 100.0);
+                    if (JLib::kStealStatsEnabled) std::printf("  %10.0f", med(prb[a]));
+                }
+                std::printf("\n");
+            }
+          }
+        }
+        g_skewEveryNth = 0;
+        JLib::TaskScheduler::SetLaneWake(0);
+        JLib::TaskScheduler::SetLaneClearDepth(3);
+        JLib::TaskScheduler::SetHotWorkers(hot);
+    }
+
+    // ---- STEERING: is it cheaper to AVOID a buried hot worker than to STEAL BACK OFF one? -------
+    //
+    // stealHintLane is published by the buried worker so an idle sibling can find it. The completion
+    // thread is choosing placement at that exact moment and was ignoring it -- pushSteered rotates
+    // blind. So the same backlog is discovered twice: once by the producer, who could simply not put
+    // work there, and once by a thief, who pays a probe, a contended CAS against the owner, and a
+    // lost cache line to take it back.
+    //
+    // FOUR ARMS, because "does skipping help" and "does skipping REPLACE stealing" are different
+    // questions and only the 2x2 separates them:
+    //
+    //     lane=off steer=off   neither mechanism -- the floor
+    //     lane=any steer=off   stealing repairs the placement (what ships today)
+    //     lane=off steer=on    the producer avoids it, nobody repairs
+    //     lane=any steer=on    both
+    //
+    // If (off,on) reaches (any,off), the repair was buying what a free load could have. If (any,on)
+    // beats both, they cover different windows -- steering can only act on tasks it is placing NOW,
+    // and nothing it does helps a task already sitting in a buried worker's deque.
+    //
+    // K=1 IS THE A/A CONTROL AND IT IS NOT DECORATION. With one hot worker there is nobody to skip
+    // to, so pushSteered falls back to the plain rotation and the steer arm is bit-identical to the
+    // control. Any K=1 separation is drift, and this project has already read drift as a result once
+    // (2x on exactly these rows, from measuring three arms as three executables).
+    //
+    // == MEASURED 8-25, Sleep policy, 29 workers, median of 3 interleaved reps ==
+    //
+    // READ THE CONTROL FIRST AND IT DISQUALIFIES MOST OF THE TABLE. The 20us rows carry a 77% p50
+    // spread across four identical K=1 arms; nothing under 2x is readable there. The 200us skewed
+    // rows are tight -- 5% at p50, 6% at p90, 9% at p99 -- and those are the only rows below that
+    // are worth reading. This is why the control is swept rather than assumed: the noise floor is
+    // not a property of the harness, it is a property of the ROW.
+    //
+    //   200us, skew 1-in-8            p50      p90      p99
+    //     K=2  neither               92.3    547.2   1120.8
+    //          steer only            73.2    476.6    850.1     p99 -24%
+    //          stealing only         97.1    395.8    689.2     p99 -38%
+    //          both                  79.5    382.5    660.8     p99 -41%
+    //     K=4  neither               33.6    392.4    868.1
+    //          steer only            31.1    280.4    683.7     p90 -29%, p99 -21%
+    //          stealing only         37.8    241.9    485.8     p90 -38%, p99 -44%
+    //          both                  36.4    248.1    458.4     p99 -47%
+    //
+    // THE SKIP IS REAL AND IT IS REDUNDANT. Against nothing it is worth 21-29% at the tail, far
+    // outside that 9% control -- so the producer genuinely was throwing work at a buried worker.
+    // But hot->hot stealing beats it on the same rows, and once stealing is on the skip adds
+    // 4-6%, which is INSIDE the control and therefore not a result.
+    //
+    // WHY THE REPAIR BEATS THE AVOIDANCE, which was not the expected direction: the producer can
+    // only act on the batch in its hand. The tasks that actually make the tail are the ones ALREADY
+    // in the buried worker's deque -- placed before it went dark, and by definition unreachable to
+    // anyone but a thief. Skipping stops the queue growing; stealing empties it. Those are
+    // different windows, and the second one is where the microseconds are.
+    //
+    // So it ships OFF: under the default laneHintMode 4 it buys nothing measurable, and a branch
+    // that buys nothing does not belong on by default. It stays in the tree because it is worth
+    // real time when hot->hot stealing is disabled (mode 0), and because deleting the measurement
+    // along with the code is how the same question gets asked a third time.
+    {
+        const int n = 32, iters = 100;
+        std::printf("\n  steering skip -- producer avoids hot workers advertising a backlog\n");
+        std::printf("    K=1 rows are the A/A control: no sibling to skip to, so both arms are the\n");
+        std::printf("    same code path. Separation there is noise and calibrates the rest.\n");
+        std::printf("      K    burn   skew   lane  steer      p50      p90      p99\n");
+
+        // REPEATED AND MEDIANED, and that is not caution -- a single interleaved pass ALREADY
+        // produced a 2.6x p50 spread across the four K=1 arms, which are the same code path. Arms
+        // adjacent in time is necessary and it is not sufficient; a run that lands on a background
+        // process is still a run. Median of REPS, arms still innermost.
+        constexpr int kReps = 3;
+        constexpr int kArms = 4;                     // (lane off/any) x (steer off/on)
+        const char* armLane[kArms] = { "off", "off", "any", "any" };
+        const char* armSteer[kArms] = { "off", "on",  "off", "on"  };
+
+        for (long long burn : { 20000LL, 200000LL }) {
+          for (int skew : { 0, 8 }) {
+            for (std::size_t k : { (std::size_t)1, (std::size_t)2, (std::size_t)4 }) {
+                if (skew == 0 && burn != 200000LL) continue;
+                std::vector<double> p50[kArms], p90[kArms], p99[kArms];
+
+                for (int rep = 0; rep < kReps; ++rep) {
+                  for (int a = 0; a < kArms; ++a) {
+                    JLib::TaskScheduler::SetLaneHintMode(a < 2 ? 0 : 4);
+                    JLib::TaskScheduler::SetSteerSkip((a & 1) != 0);
+                    JLib::TaskScheduler::SetHotWorkers(k);
+                    g_skewEveryNth = skew;
+                    g_skewBurnNs   = burn;
+
+                    double secs = 0.0;
+                    std::vector<long long> v = SoakRun(n, iters, secs);
+                    if (v.empty()) continue;
+                    const auto pk = [&](double p) {
+                        return v[std::min(v.size() - 1, size_t(v.size() * p))] / 1000.0;
+                    };
+                    p50[a].push_back(pk(0.50));
+                    p90[a].push_back(pk(0.90));
+                    p99[a].push_back(pk(0.99));
+                  }
+                }
+
+                const auto med = [](std::vector<double> x) {
+                    if (x.empty()) return -1.0;
+                    std::sort(x.begin(), x.end());
+                    return x[x.size() / 2];
+                };
+                for (int a = 0; a < kArms; ++a)
+                    std::printf("    %3zu  %6.0f  %5d   %4s  %5s  %7.2f  %7.2f  %7.2f\n",
+                                k, burn / 1000.0, skew, armLane[a], armSteer[a],
+                                med(p50[a]), med(p90[a]), med(p99[a]));
+            }
+          }
+        }
+        g_skewEveryNth = 0;
+        JLib::TaskScheduler::SetSteerSkip(false);
+        JLib::TaskScheduler::SetLaneHintMode(4);
+        JLib::TaskScheduler::SetHotWorkers(hot);
+    }
+
     // ---- SKEWED SOAK: is an idle hot worker sitting next to a backlogged one? ------------------
     //
     // THE QUESTION THIS EXISTS TO SETTLE. Hot->hot stealing was removed after measuring 20.6M probes
