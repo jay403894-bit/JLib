@@ -439,7 +439,12 @@ void Thread::Worker() {
 	// again when it stops -- it used to be one-way, which was correct only while the hot set was
 	// static. Dynamic K made "was hot once" permanent while K itself sheds; see the stand-down
 	// branch in the idle section for why that mattered under NoSleep.
+	// GUARDED, because every USE of it is. Both this and atCriticalPriority below exist only for the
+	// Windows priority path; leaving them unguarded left a POSIX build carrying two dead locals and
+	// gave a reader no hint that the feature is absent there rather than merely unused.
+#if defined(_WIN32)
 	bool hotPriorityRaised = false;
+#endif
 	// Sample counter for the dynamic-K controller; only worker 0 ever looks at it.
 	unsigned hotCtlTick = 0;
 	unsigned laneDutyTick = 0;
@@ -454,8 +459,10 @@ void Thread::Worker() {
 	bool ranLaneTaskLastPass = false;
 	long long laneStartNs = 0;
 	// Tracks what this thread's priority actually IS, so the per-task adjust below is a syscall only
-	// on a genuine change. Meaningless unless hotPriorityRaised.
+	// on a genuine change. Meaningless unless hotPriorityRaised. Windows-only, same as that flag.
+#if defined(_WIN32)
 	bool atCriticalPriority = false;
+#endif
 
 	// EXCLUSIVE MODE: an ORDINARY worker gets off the hot cores. The hot workers themselves are
 	// already pinned to them by StartWorker. Done here, at loop entry, because by now every worker's
@@ -688,7 +695,16 @@ void Thread::Worker() {
 				// holding an older arrival, or it was stolen from another worker whose slot holds
 				// it. Skipped rather than counted as zero wait, because a false ZERO is a false
 				// "nothing waited", which is the one direction that silently suppresses promotion.
-				const long long arrived = laneArrivalNs.exchange(0, std::memory_order_relaxed);
+				// POLICY-GATED, and it has to be. Under QueueLoad nothing ever stamps the slot, so
+				// this exchange could only ever return 0 -- but it is an atomic RMW on the lane's
+				// hottest path, executed for every lane task, by users who did not opt in. Worse
+				// than the cost: it lands microseconds from where laneStartNs is read, so it
+				// perturbs the very occupancy measurement the QueueLoad controller decides on.
+				// A default policy must pay nothing for a feature it cannot use.
+				const long long arrived =
+				    (TaskScheduler::GetHotWorkerPolicy() == TaskScheduler::KPolicy::WaitTime)
+				        ? laneArrivalNs.exchange(0, std::memory_order_relaxed)
+				        : 0;
 				if (arrived != 0) {
 					const long long waited = laneStartNs - arrived;
 					// THE COMPARISON HAPPENS HERE, not in the controller, because here is where the
@@ -1391,6 +1407,13 @@ void Thread::Worker() {
 				// spot that costs a pusher nothing, which is the actual hypothesis being tested.
 				const bool hot = TaskScheduler::GetHotWorkers() > (size_t)qIndex;
 
+				// ---- WINDOWS ONLY. There is no POSIX implementation of HotThreadPolicy. ----------
+				//
+				// Everything between here and the matching #endif is the thread-priority half of
+				// K-hot, and it exists on Windows alone. On POSIX SetHotThreadPolicy is a documented
+				// no-op -- see the header -- so a Linux build silently gets Normal whatever the
+				// caller asked for. That is deliberate (a no-op beats a lie), but it means the
+				// measured win below is a WINDOWS win and must not be quoted as a portable one.
 #if defined(_WIN32)
 				// TARGETED priority, and the targeting is the point. Raising the WHOLE PROCESS was
 				// measured 5x WORSE with K-hot: it elevates all N workers, so 29 spinning threads
@@ -1443,6 +1466,31 @@ void Thread::Worker() {
 					::SetThreadPriority(::GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
 					atCriticalPriority = true;
 				}
+#else
+				// ---- POSIX: NOT IMPLEMENTED, and not a one-line port --------------------------
+				//
+				// Deliberately empty rather than approximated. What it would take:
+				//
+				//   Elevated  Linux/BSD SCHED_RR on the hot threads only; macOS
+				//             QOS_CLASS_USER_INTERACTIVE. Needs RLIMIT_RTPRIO or CAP_SYS_NICE, so it
+				//             can fail at runtime in a way the Windows call never does -- the port
+				//             has to decide what a REFUSED elevation means and say so.
+				//   Realtime  SCHED_FIFO (CAP_SYS_NICE); macOS THREAD_TIME_CONSTRAINT_POLICY.
+				//
+				// THE TRAP, recorded so the port does not walk into it: SCHED_FIFO is NOT the
+				// analogue of Windows TIME_CRITICAL. TIME_CRITICAL is priority 15 inside a NORMAL
+				// process -- above the pool, below the OS. SCHED_FIFO is above almost everything and
+				// will not yield, which is far closer to the process-wide elevation this file
+				// records as measuring 5x WORSE: N runnable threads at a priority that preempts the
+				// completion thread feeding them. A naive "FIFO == TIME_CRITICAL" port regresses.
+				//
+				// nice() is not a substitute either: under SCHED_OTHER it biases the weighting, it
+				// does not guarantee preemption, and preemption is the entire mechanism here.
+				//
+				// SetHotWorkerPin is the PORTABLE half of this story and already works everywhere --
+				// though note it measured WORSE than doing nothing on a saturated pool, because
+				// pinning confines the hot worker without excluding anyone else from its core.
+				(void)hot;
 #endif
 #ifdef JLIBSCHED_HOT_OCCUPANCY_STATS
 				// THE WITNESS. Reaching here means this worker's whole search came up empty, so for
